@@ -124,9 +124,9 @@ This example is retained as a reference oracle for later implementation stages.
 
 **Status: COMPLETE AND VALIDATED**
 
-Stage 0 introduces only the representation of one cache entry.
+Stage 0 introduced the representation of one cache entry.
 
-No cache lookup, database access, eviction, ranking update, hash table, heap, or other cache-management logic is implemented at this checkpoint.
+That data model remains the foundation for the Stage 1 database abstraction.
 
 ### Type definitions
 
@@ -171,6 +171,101 @@ and prints its three fields.
 
 ---
 
+## Stage 1 — Database Abstraction
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 1 introduces a deterministic backing-database abstraction through:
+
+```c
+CacheEntry db_read_entry(CacheKey key);
+```
+
+The function accepts a cache key and returns a complete `CacheEntry`.
+
+### Deterministic database mapping
+
+The current Stage 1 implementation constructs the returned entry as:
+
+```c
+e.key = key;
+e.value = key * 100;
+e.rank = key * 10;
+```
+
+This is intentionally synthetic and deterministic. It provides a predictable stand-in for the later external/backing-store read while allowing the cache logic to be developed and tested independently.
+
+For example:
+
+```text
+input key = 5
+```
+
+produces:
+
+```text
+key   = 5
+value = 500
+rank  = 50
+```
+
+### Stage 1 test path
+
+`main()` now obtains the entry through the database abstraction:
+
+```c
+CacheEntry e = db_read_entry(5);
+```
+
+and prints the returned fields.
+
+The Stage 0 direct field assignments are no longer used by the active test path.
+
+### Stage 1 validation result
+
+Build:
+
+```bash
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache1
+```
+
+Run:
+
+```bash
+./ranked_cache1
+```
+
+Observed and expected output:
+
+```text
+key=5 value=500 rank=50
+```
+
+Stage 1 therefore validates that:
+
+- a key can be passed into the backing-store abstraction,
+- the abstraction constructs and returns a complete `CacheEntry`,
+- the returned key is preserved,
+- the value is derived deterministically,
+- the rank is derived deterministically, and
+- the caller receives the expected entry.
+
+No cache lookup, cache storage, hit/miss handling, capacity management, eviction, rank ordering, dynamic rank update, or performance optimization is implemented at this checkpoint.
+
+### Stage 1 complexity
+
+For the current synthetic implementation, `db_read_entry()` performs only a fixed number of assignments and arithmetic operations.
+
+```text
+Time:  O(1)
+Space: O(1)
+```
+
+This describes only the deterministic Stage 1 abstraction. It does not model the latency of a real database, file, network, or persistent-storage operation.
+
+
+---
+
 ## Build Environment
 
 Current target environment:
@@ -182,7 +277,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache0
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache1
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -198,18 +293,18 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache0
+./ranked_cache1
 ```
 
 ### Expected output
 
 ```text
-key=1 value=100 rank=50
+key=5 value=500 rank=50
 ```
 
 ### Validation result
 
-Stage 0 has been compiled and executed successfully with the expected output.
+Stages 0 and 1 have been compiled and executed successfully, with the active Stage 1 test producing the expected output.
 
 ---
 
@@ -220,15 +315,15 @@ At this commit, the program can:
 - define a cache-key type,
 - define a rank type,
 - represent one cache entry,
-- initialize one cache entry,
-- access its fields, and
-- print the expected key, value, and rank.
+- pass a key into `db_read_entry()`,
+- construct a deterministic `CacheEntry` inside the database abstraction,
+- return that entry by value to the caller, and
+- print and validate the returned key, value, and rank.
 
 At this commit, the program intentionally does **not** implement:
 
 - cache storage,
 - cache lookup,
-- backing-database access,
 - cache hit/miss handling,
 - capacity management,
 - eviction,
@@ -243,16 +338,16 @@ Those capabilities must only be documented here after their corresponding implem
 
 ## Complexity at the Current Checkpoint
 
-Stage 0 contains no cache algorithm yet.
+The active Stage 1 program performs a deterministic database-abstraction call followed by printing one returned entry.
 
-Creating and printing one fixed-size structure is constant work:
+For the current synthetic implementation:
 
 ```text
-Time:  O(1)
-Space: O(1)
+db_read_entry() time:  O(1)
+Stage 1 extra space:   O(1)
 ```
 
-These values describe only the Stage 0 validation program and are not yet the complexity of the final ranked-cache implementation.
+No cache data structure or cache-operation complexity is claimed yet.
 
 ---
 
@@ -289,5 +384,11 @@ COMPLETE
 BUILD PASS
 RUN PASS
 EXPECTED OUTPUT PASS
-```
 
+Stage 1
+Deterministic database abstraction
+COMPLETE
+BUILD PASS
+RUN PASS
+EXPECTED OUTPUT PASS
+```

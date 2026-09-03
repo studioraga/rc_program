@@ -119,13 +119,30 @@ typedef struct {
 	Rank rank;
 } CacheEntry;
 
-int main(void)
+/* database abstraction to make it deterministic */
+CacheEntry db_read_entry(CacheKey key);
+
+CacheEntry db_read_entry(CacheKey key)
 {
     CacheEntry e;
 
-    e.key = 1;
-    e.value = 100;
-    e.rank = 50;
+    e.key = key;
+    e.value = key * 100;
+    e.rank = key * 10;
+
+    //printf("key=%llu value=%llu rank=%lld\n", e.key, e.value, e.rank);
+
+    return e;
+	
+}	
+
+int main(void)
+{
+    CacheEntry e = db_read_entry(5);
+
+    //e.key = 1;
+    //e.value = 100;
+    //e.rank = 50;
 
     printf("key=%llu value=%llu rank=%lld\n", e.key, e.value, e.rank);
     
