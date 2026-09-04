@@ -157,17 +157,9 @@ The members are:
 | `value` | `unsigned long long` | Represents the entry payload for the Stage 0 test |
 | `rank` | `Rank` | Stores the entry's rank |
 
-### Stage 0 test object
+### Stage 0 validation
 
-The current `main()` creates one `CacheEntry`:
-
-```c
-e.key = 1;
-e.value = 100;
-e.rank = 50;
-```
-
-and prints its three fields.
+Stage 0 validated direct construction and printing of one `CacheEntry`. That data model remains unchanged and is now reused by the later completed stages.
 
 ---
 
@@ -209,30 +201,28 @@ value = 500
 rank  = 50
 ```
 
-### Stage 1 test path
+### Stage 1 validation path
 
-`main()` now obtains the entry through the database abstraction:
+Stage 1 validated obtaining an entry through the database abstraction:
 
 ```c
 CacheEntry e = db_read_entry(5);
 ```
 
-and prints the returned fields.
-
-The Stage 0 direct field assignments are no longer used by the active test path.
+and printing the returned fields. The `db_read_entry()` implementation remains unchanged in Stage 2.
 
 ### Stage 1 validation result
 
 Build:
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache1
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache2
 ```
 
 Run:
 
 ```bash
-./ranked_cache1
+./ranked_cache2
 ```
 
 Observed and expected output:
@@ -250,7 +240,7 @@ Stage 1 therefore validates that:
 - the rank is derived deterministically, and
 - the caller receives the expected entry.
 
-No cache lookup, cache storage, hit/miss handling, capacity management, eviction, rank ordering, dynamic rank update, or performance optimization is implemented at this checkpoint.
+At the Stage 1 checkpoint, no cache storage or cache-management logic had yet been implemented.
 
 ### Stage 1 complexity
 
@@ -266,6 +256,287 @@ This describes only the deterministic Stage 1 abstraction. It does not model the
 
 ---
 
+## Stage 2 — Simplest Linear Cache
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 2 introduces the first functioning cache representation using a fixed-size array.
+
+The objective at this checkpoint is correctness and observability, not optimization.
+
+### Cache representation
+
+```c
+#define MAX_CACHE_CAPACITY 100U
+
+typedef struct {
+    CacheEntry entries[MAX_CACHE_CAPACITY];
+    size_t size;
+    size_t capacity;
+} Cache;
+```
+
+The fields are:
+
+| Member | Purpose |
+|---|---|
+| `entries` | Fixed-size array containing resident cache entries |
+| `size` | Number of currently valid resident entries |
+| `capacity` | Configured maximum number of entries for this cache instance |
+
+The physical storage limit is `MAX_CACHE_CAPACITY`, while each initialized cache can use a smaller logical capacity.
+
+The Stage 2 validation uses:
+
+```text
+capacity = 3
+```
+
+### Functions introduced
+
+#### `cache_init()`
+
+```c
+int cache_init(Cache *cache, size_t capacity);
+```
+
+Initializes an empty cache and validates that the requested capacity is non-zero and does not exceed `MAX_CACHE_CAPACITY`.
+
+Current complexity:
+
+```text
+Time:  O(1)
+Space: O(1)
+```
+
+#### `cache_is_full()`
+
+```c
+int cache_is_full(const Cache *cache);
+```
+
+Checks whether:
+
+```text
+size >= capacity
+```
+
+Current complexity:
+
+```text
+Time: O(1)
+```
+
+#### `cache_lookup()`
+
+```c
+CacheEntry *cache_lookup(Cache *cache, CacheKey key);
+```
+
+Searches the resident entries from index `0` through `size - 1` and compares each key.
+
+Returns:
+
+- a pointer to the matching entry on a hit,
+- `NULL` on a miss.
+
+Current complexity:
+
+```text
+Best case:  O(1)
+Worst case: O(N)
+Average:    O(N) for this linear representation
+```
+
+#### `cache_insert()`
+
+```c
+int cache_insert(Cache *cache, CacheEntry entry);
+```
+
+The Stage 2 insertion policy:
+
+1. reject an invalid cache,
+2. reject insertion when capacity has already been reached,
+3. linearly check for a duplicate key,
+4. append the entry at `entries[size]`,
+5. increment `size`.
+
+Because duplicate detection uses the linear `cache_lookup()`:
+
+```text
+Time:  O(N)
+Space: O(1) additional space
+```
+
+#### `cache_find_min_rank_index()`
+
+```c
+int cache_find_min_rank_index(const Cache *cache,
+                              size_t *min_index);
+```
+
+Linearly scans the resident entries and records the index of the smallest rank.
+
+The current tie rule is deterministic:
+
+> If multiple entries have the same minimum rank, the first one encountered in the array is selected.
+
+Current complexity:
+
+```text
+Time:  O(N)
+Space: O(1)
+```
+
+#### `cache_evict_min()`
+
+```c
+int cache_evict_min(Cache *cache,
+                    CacheEntry *evicted_entry);
+```
+
+Eviction first calls the linear minimum-rank search.
+
+After finding the victim, the implementation copies the last valid array entry into the victim's slot and decrements `size`.
+
+This avoids shifting every later entry.
+
+Current complexity:
+
+```text
+minimum-rank search: O(N)
+victim replacement:  O(1)
+overall eviction:    O(N)
+```
+
+#### `cache_print()`
+
+Prints the current resident cache in compact `{key:rank}` form.
+
+This function exists for validation and visibility at the current checkpoint.
+
+#### `check()`
+
+A small test helper used by `main()` to print `[PASS]` or `[FAIL]` for each Stage 2 invariant.
+
+---
+
+## Stage 2 Validation
+
+The Stage 2 test intentionally uses the original manual-oracle entries:
+
+| Key | Value | Rank |
+|---:|---:|---:|
+| 1 | 100 | 50 |
+| 2 | 200 | 20 |
+| 3 | 300 | 80 |
+| 4 | 400 | 70 |
+
+The Stage 1 `db_read_entry()` abstraction remains in the source unchanged, but it is not yet connected to cache hit/miss processing in this checkpoint.
+
+### Operations tested
+
+The active `main()` validates:
+
+```text
+cache initialization
+insert
+capacity check
+lookup hit
+lookup miss
+minimum-rank search
+minimum-rank eviction
+post-eviction lookup
+insert after eviction
+final resident-set validation
+```
+
+### Expected cache progression
+
+After inserting keys `1`, `2`, and `3`:
+
+```text
+cache = {1:50, 2:20, 3:80}
+```
+
+The cache is full.
+
+A direct attempt to insert key `4` is rejected until eviction occurs.
+
+The minimum-rank search must identify:
+
+```text
+key  = 2
+rank = 20
+```
+
+After evicting key `2`, key `4` is inserted.
+
+Final expected resident set:
+
+```text
+cache = {1:50, 3:80, 4:70}
+```
+
+### Build
+
+```bash
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache2
+```
+
+### Run
+
+```bash
+./ranked_cache2
+```
+
+### Validated output
+
+```text
+=== Stage 2: simplest linear cache ===
+[PASS] initialize cache with capacity 3
+[PASS] cache starts empty
+[PASS] insert key 1
+[PASS] insert key 2
+[PASS] insert key 3
+cache = {1:50, 2:20, 3:80}
+[PASS] capacity check reports full
+[PASS] insert is rejected while cache is full
+[PASS] linear lookup finds key 1
+[PASS] linear lookup reports missing key
+[PASS] minimum-rank search succeeds
+[PASS] minimum rank is key 2 with rank 20
+[PASS] evict minimum-ranked entry
+[PASS] evicted entry is key 2 rank 20
+[PASS] evicted key 2 is no longer present
+[PASS] cache is no longer full after eviction
+[PASS] insert key 4 after eviction
+[PASS] cache size returns to capacity
+[PASS] final cache contains keys 1, 3, and 4
+cache = {1:50, 3:80, 4:70}
+Stage 2 validation: PASS
+```
+
+### Stage 2 operation complexity
+
+| Operation | Current Stage 2 complexity | Reason |
+|---|---:|---|
+| initialize cache | O(1) | fixed assignments |
+| capacity check | O(1) | compare `size` and `capacity` |
+| lookup | O(N) | linear key scan |
+| duplicate-aware insert | O(N) | calls linear lookup |
+| minimum-rank search | O(N) | linear rank scan |
+| eviction | O(N) | dominated by minimum-rank search |
+| remove known array slot | O(1) | replace with last resident entry |
+| cache storage | O(K) | fixed array capacity |
+
+This is intentionally the simple reference implementation for the current checkpoint.
+
+No hash table, heap, tree, dynamic-rank maintenance, performance benchmark, or other optimized cache structure is introduced here.
+
+---
+
 ## Build Environment
 
 Current target environment:
@@ -277,7 +548,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache1
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache2
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -293,18 +564,26 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache1
+./ranked_cache2
 ```
 
-### Expected output
+### Expected result
+
+The active Stage 2 test suite must end with:
 
 ```text
-key=5 value=500 rank=50
+Stage 2 validation: PASS
+```
+
+and the final cache must be:
+
+```text
+cache = {1:50, 3:80, 4:70}
 ```
 
 ### Validation result
 
-Stages 0 and 1 have been compiled and executed successfully, with the active Stage 1 test producing the expected output.
+Stages 0, 1, and 2 have been validated successfully. The active Stage 2 test returns exit status `0`.
 
 ---
 
@@ -312,42 +591,49 @@ Stages 0 and 1 have been compiled and executed successfully, with the active Sta
 
 At this commit, the program can:
 
-- define a cache-key type,
-- define a rank type,
-- represent one cache entry,
-- pass a key into `db_read_entry()`,
-- construct a deterministic `CacheEntry` inside the database abstraction,
-- return that entry by value to the caller, and
-- print and validate the returned key, value, and rank.
+- define the cache entry data model,
+- provide the deterministic Stage 1 database abstraction,
+- initialize a fixed-size array cache,
+- track current size and configured capacity,
+- detect when the cache is full,
+- find an entry by key using linear scanning,
+- insert a non-duplicate entry while capacity is available,
+- find the minimum-ranked resident entry using linear scanning,
+- evict that minimum-ranked entry,
+- verify that an evicted key is absent,
+- insert a new entry after capacity is freed, and
+- validate the complete Stage 2 manual oracle.
 
 At this commit, the program intentionally does **not** implement:
 
-- cache storage,
-- cache lookup,
-- cache hit/miss handling,
-- capacity management,
-- eviction,
-- rank ordering,
+- automatic database fetch on a cache miss,
+- a combined higher-level cache-get operation,
+- optimized key lookup,
+- optimized rank ordering,
 - dynamic rank updates,
-- performance optimization, or
-- benchmarking.
+- performance benchmarking, or
+- concurrent/thread-safe access.
 
-Those capabilities must only be documented here after their corresponding implementation stage has actually been completed and validated.
+Those capabilities must only be documented after their corresponding implementation stages have actually been completed and validated.
 
 ---
 
 ## Complexity at the Current Checkpoint
 
-The active Stage 1 program performs a deterministic database-abstraction call followed by printing one returned entry.
-
-For the current synthetic implementation:
+Stage 2 is intentionally array-based and linear.
 
 ```text
-db_read_entry() time:  O(1)
-Stage 1 extra space:   O(1)
+cache_init()                  O(1)
+cache_is_full()               O(1)
+cache_lookup()                O(N)
+cache_insert()                O(N)
+cache_find_min_rank_index()   O(N)
+cache_evict_min()             O(N)
+additional working space      O(1)
+resident cache storage        O(K)
 ```
 
-No cache data structure or cache-operation complexity is claimed yet.
+The `O(N)` operations are expected at this checkpoint and provide the simple correctness baseline against which later implementations can be reasoned about and measured.
 
 ---
 
@@ -391,4 +677,16 @@ COMPLETE
 BUILD PASS
 RUN PASS
 EXPECTED OUTPUT PASS
+
+Stage 2
+Simplest fixed-size linear cache
+COMPLETE
+BUILD PASS
+RUN PASS
+LOOKUP PASS
+INSERT PASS
+CAPACITY CHECK PASS
+MINIMUM-RANK SEARCH PASS
+EVICTION PASS
+MANUAL ORACLE PASS
 ```
