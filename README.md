@@ -216,13 +216,13 @@ and printing the returned fields. The `db_read_entry()` implementation remains u
 Build:
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache2
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache3
 ```
 
 Run:
 
 ```bash
-./ranked_cache2
+./ranked_cache3
 ```
 
 Observed and expected output:
@@ -482,13 +482,13 @@ cache = {1:50, 3:80, 4:70}
 ### Build
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache2
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache3
 ```
 
 ### Run
 
 ```bash
-./ranked_cache2
+./ranked_cache3
 ```
 
 ### Validated output
@@ -537,6 +537,75 @@ No hash table, heap, tree, dynamic-rank maintenance, performance benchmark, or o
 
 ---
 
+## Stage 3 — Linear Minimum-Rank Eviction
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 2 already proved that the minimum-ranked entry could be found and evicted with linear scanning. Stage 3 makes the eviction path explicit by separating victim selection from removal of a known array slot.
+
+### `cache_remove_at()`
+
+```c
+int cache_remove_at(Cache *cache,
+                    size_t index,
+                    CacheEntry *removed_entry);
+```
+
+When the victim index is already known, the function copies the last resident entry into the removed slot and decrements `size`.
+
+```text
+known-slot removal: O(1)
+```
+
+The function rejects null caches and out-of-range indexes.
+
+### `cache_evict_min()` composition
+
+Stage 3 now expresses eviction as two operations:
+
+```text
+cache_find_min_rank_index()   O(N)
+            ↓
+cache_remove_at()             O(1)
+```
+
+Therefore:
+
+```text
+minimum-rank eviction overall: O(N)
+```
+
+The linear minimum search remains the dominant cost.
+
+### Tie rule
+
+If multiple resident entries have the same minimum rank, the first one encountered by the array scan is selected.
+
+### Stage 3 validation
+
+The original Stage 2 oracle remains passing, and Stage 3 adds dedicated checks for:
+
+- eviction from an empty cache,
+- rejection of an out-of-range removal index,
+- equal-rank entries, and
+- deterministic first-encountered tie eviction.
+
+Build:
+
+```bash
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache3
+```
+
+The test must end with:
+
+```text
+Stage 3 validation: PASS
+```
+
+No automatic database-backed `cache_get()` path, assertion framework, optimized lookup structure, heap, tree, or dynamic-rank maintenance is introduced in Stage 3.
+
+---
+
 ## Build Environment
 
 Current target environment:
@@ -548,7 +617,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache2
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache3
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -564,15 +633,15 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache2
+./ranked_cache3
 ```
 
 ### Expected result
 
-The active Stage 2 test suite must end with:
+The active Stage 3 test suite must end with:
 
 ```text
-Stage 2 validation: PASS
+Stage 3 validation: PASS
 ```
 
 and the final cache must be:
@@ -583,7 +652,7 @@ cache = {1:50, 3:80, 4:70}
 
 ### Validation result
 
-Stages 0, 1, and 2 have been validated successfully. The active Stage 2 test returns exit status `0`.
+Stages 0 through 3 have been validated successfully. The active Stage 3 test returns exit status `0`.
 
 ---
 
@@ -599,7 +668,8 @@ At this commit, the program can:
 - find an entry by key using linear scanning,
 - insert a non-duplicate entry while capacity is available,
 - find the minimum-ranked resident entry using linear scanning,
-- evict that minimum-ranked entry,
+- remove a known array slot in O(1),
+- evict the minimum-ranked entry by composing linear selection with known-slot removal,
 - verify that an evicted key is absent,
 - insert a new entry after capacity is freed, and
 - validate the complete Stage 2 manual oracle.
@@ -628,6 +698,7 @@ cache_is_full()               O(1)
 cache_lookup()                O(N)
 cache_insert()                O(N)
 cache_find_min_rank_index()   O(N)
+cache_remove_at()             O(1)
 cache_evict_min()             O(N)
 additional working space      O(1)
 resident cache storage        O(K)
@@ -689,4 +760,14 @@ CAPACITY CHECK PASS
 MINIMUM-RANK SEARCH PASS
 EVICTION PASS
 MANUAL ORACLE PASS
+
+Stage 3
+Linear minimum-rank eviction
+COMPLETE
+BUILD PASS
+RUN PASS
+KNOWN-SLOT REMOVAL PASS
+EMPTY EVICTION GUARD PASS
+EQUAL-RANK TIE PASS
+EVICTION PASS
 ```

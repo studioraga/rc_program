@@ -6,13 +6,15 @@
  *   Stage 0 - basic CacheEntry data model
  *   Stage 1 - deterministic database abstraction
  *   Stage 2 - simplest fixed-size cache using a linear array
+ *   Stage 3 - explicit linear minimum-rank eviction path
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
  *   - duplicate detection before insert
  *   - minimum-rank search
  *
- * The goal at this checkpoint is functional correctness, not optimization.
+ * Stage 3 keeps the same linear-time eviction complexity while separating
+ * victim selection from removal of a known array slot.
  */
 
 #include <stdio.h>
@@ -178,42 +180,56 @@ int cache_find_min_rank_index(const Cache *cache, size_t *min_index)
     return 1;
 }
 
+/* ---------- Stage 3: explicit linear minimum-rank eviction ---------- */
+
+/*
+ * Remove an entry when its array index is already known.
+ *
+ * The last valid resident entry is copied into the removed slot, so no
+ * O(N) shift of the remaining array is required. Cache order has no
+ * semantic meaning at this checkpoint.
+ *
+ * Returns:
+ *   1 on successful removal
+ *   0 for an invalid cache/index
+ *
+ * Complexity:
+ *   O(1)
+ */
+int cache_remove_at(Cache *cache, size_t index, CacheEntry *removed_entry)
+{
+    if (cache == NULL || index >= cache->size) {
+        return 0;
+    }
+
+    if (removed_entry != NULL) {
+        *removed_entry = cache->entries[index];
+    }
+
+    cache->entries[index] = cache->entries[cache->size - 1U];
+    --cache->size;
+
+    return 1;
+}
+
 /*
  * Evict the minimum-ranked entry.
  *
- * After the minimum-rank index is found, the last valid array entry
- * is moved into the victim slot. This avoids shifting all later items.
- * Cache ordering is not semantically important at this stage.
+ * Stage 3 composes two explicit operations:
+ *   1. locate the minimum-ranked resident with a linear O(N) scan
+ *   2. remove that known array slot in O(1)
  *
- * Returns:
- *   1 on successful eviction
- *   0 if the cache is empty/invalid
- *
- * If evicted_entry is non-NULL, the removed entry is copied there.
- *
- * Complexity:
- *   O(N) because minimum-rank search is linear.
+ * Overall complexity remains O(N), dominated by victim selection.
  */
 int cache_evict_min(Cache *cache, CacheEntry *evicted_entry)
 {
     size_t min_index;
 
-    if (cache == NULL || cache->size == 0U) {
-        return 0;
-    }
-
     if (!cache_find_min_rank_index(cache, &min_index)) {
         return 0;
     }
 
-    if (evicted_entry != NULL) {
-        *evicted_entry = cache->entries[min_index];
-    }
-
-    cache->entries[min_index] = cache->entries[cache->size - 1U];
-    --cache->size;
-
-    return 1;
+    return cache_remove_at(cache, min_index, evicted_entry);
 }
 
 /*
@@ -242,7 +258,7 @@ void cache_print(const Cache *cache)
 }
 
 /*
- * Small PASS/FAIL helper for Stage 2 validation.
+ * Small PASS/FAIL helper for incremental validation.
  */
 int check(int condition, const char *name)
 {
@@ -275,7 +291,7 @@ int main(void)
     const CacheEntry e3 = {3ULL, 300ULL, 80LL};
     const CacheEntry e4 = {4ULL, 400ULL, 70LL};
 
-    printf("=== Stage 2: simplest linear cache ===\n");
+    printf("=== Stage 3: linear minimum-rank eviction ===\n");
 
     all_passed &= check(cache_init(&cache, 3U),
                         "initialize cache with capacity 3");
@@ -337,7 +353,34 @@ int main(void)
 
     cache_print(&cache);
 
-    printf("Stage 2 validation: %s\n",
+    /* Stage 3 dedicated eviction edge cases. */
+    {
+        Cache empty_cache;
+        Cache tie_cache;
+        CacheEntry tie_evicted;
+        const CacheEntry t1 = {10ULL, 1000ULL, 5LL};
+        const CacheEntry t2 = {11ULL, 1100ULL, 5LL};
+
+        all_passed &= check(cache_init(&empty_cache, 2U),
+                            "initialize empty eviction-test cache");
+        all_passed &= check(!cache_evict_min(&empty_cache, NULL),
+                            "eviction from empty cache is rejected");
+        all_passed &= check(!cache_remove_at(&cache, cache.size, NULL),
+                            "removal rejects out-of-range index");
+
+        all_passed &= check(cache_init(&tie_cache, 2U),
+                            "initialize equal-rank test cache");
+        all_passed &= check(cache_insert(&tie_cache, t1) &&
+                            cache_insert(&tie_cache, t2),
+                            "insert equal-rank entries");
+        all_passed &= check(cache_evict_min(&tie_cache, &tie_evicted),
+                            "evict from equal-rank cache");
+        all_passed &= check(tie_evicted.key == 10ULL &&
+                            tie_evicted.rank == 5LL,
+                            "equal-rank tie evicts first encountered entry");
+    }
+
+    printf("Stage 3 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;
