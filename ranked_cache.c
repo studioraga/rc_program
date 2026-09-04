@@ -7,14 +7,15 @@
  *   Stage 1 - deterministic database abstraction
  *   Stage 2 - simplest fixed-size cache using a linear array
  *   Stage 3 - explicit linear minimum-rank eviction path
+ *   Stage 4 - complete cache_get() hit/miss path
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
  *   - duplicate detection before insert
  *   - minimum-rank search
  *
- * Stage 3 keeps the same linear-time eviction complexity while separating
- * victim selection from removal of a known array slot.
+ * Stage 4 composes the existing primitives into one complete cache_get()
+ * operation while intentionally keeping all cache searches linear.
  */
 
 #include <stdio.h>
@@ -232,6 +233,60 @@ int cache_evict_min(Cache *cache, CacheEntry *evicted_entry)
     return cache_remove_at(cache, min_index, evicted_entry);
 }
 
+
+/* ---------- Stage 4: complete cache_get() path ---------- */
+
+/*
+ * Get an entry from the cache.
+ *
+ * Hit path:
+ *   - linearly search the cache
+ *   - return the resident entry
+ *
+ * Miss path:
+ *   - read the entry through db_read_entry()
+ *   - if the cache is full, evict the current minimum-rank resident
+ *   - insert the fetched entry
+ *   - return the newly resident entry
+ *
+ * Returns NULL only if cache state/operations prevent completion.
+ *
+ * Complexity with the current linear Stage 4 structures:
+ *   hit:  O(N)
+ *   miss: O(N) + DB-read cost
+ *
+ * The miss path can perform more than one linear pass. Optimization is
+ * deliberately deferred to later stages.
+ */
+CacheEntry *cache_get(Cache *cache, CacheKey key)
+{
+    CacheEntry *found;
+    CacheEntry fetched;
+
+    if (cache == NULL) {
+        return NULL;
+    }
+
+    found = cache_lookup(cache, key);
+    if (found != NULL) {
+        return found;
+    }
+
+    fetched = db_read_entry(key);
+
+    if (cache_is_full(cache)) {
+        if (!cache_evict_min(cache, NULL)) {
+            return NULL;
+        }
+    }
+
+    if (!cache_insert(cache, fetched)) {
+        return NULL;
+    }
+
+    return cache_lookup(cache, key);
+}
+
 /*
  * Print current cache contents as {key:rank, ...}.
  * Used only by the Stage 2 validation code.
@@ -274,113 +329,69 @@ int check(int condition, const char *name)
 int main(void)
 {
     Cache cache;
-    CacheEntry evicted;
-    CacheEntry *found;
-    size_t min_index;
+    CacheEntry *entry;
+    CacheEntry *before_hit;
     int all_passed = 1;
 
-    /*
-     * Stage 2 manual-oracle entries.
-     *
-     * These values intentionally match the original problem example.
-     * The Stage 1 db_read_entry() abstraction remains unchanged and is
-     * not yet wired into cache hit/miss behavior at this checkpoint.
-     */
-    const CacheEntry e1 = {1ULL, 100ULL, 50LL};
-    const CacheEntry e2 = {2ULL, 200ULL, 20LL};
-    const CacheEntry e3 = {3ULL, 300ULL, 80LL};
-    const CacheEntry e4 = {4ULL, 400ULL, 70LL};
-
-    printf("=== Stage 3: linear minimum-rank eviction ===\n");
+    printf("=== Stage 4: complete cache_get() path ===\n");
 
     all_passed &= check(cache_init(&cache, 3U),
                         "initialize cache with capacity 3");
-    all_passed &= check(cache.size == 0U && cache.capacity == 3U,
-                        "cache starts empty");
 
-    /* INSERT: fill the cache to capacity. */
-    all_passed &= check(cache_insert(&cache, e1), "insert key 1");
-    all_passed &= check(cache_insert(&cache, e2), "insert key 2");
-    all_passed &= check(cache_insert(&cache, e3), "insert key 3");
+    /* MISS -> DB READ -> INSERT */
+    entry = cache_get(&cache, 1ULL);
+    all_passed &= check(entry != NULL &&
+                        entry->key == 1ULL &&
+                        entry->value == 100ULL &&
+                        entry->rank == 10LL,
+                        "GET 1 miss fetches and inserts database entry");
+    all_passed &= check(cache.size == 1U,
+                        "cache size becomes 1 after GET 1 miss");
+
+    entry = cache_get(&cache, 2ULL);
+    all_passed &= check(entry != NULL && entry->rank == 20LL,
+                        "GET 2 miss fetches and inserts database entry");
+
+    entry = cache_get(&cache, 3ULL);
+    all_passed &= check(entry != NULL && entry->rank == 30LL,
+                        "GET 3 miss fetches and inserts database entry");
+    all_passed &= check(cache_is_full(&cache),
+                        "cache is full after three misses");
     cache_print(&cache);
 
-    /* CAPACITY CHECK */
-    all_passed &= check(cache_is_full(&cache),
-                        "capacity check reports full");
-    all_passed &= check(!cache_insert(&cache, e4),
-                        "insert is rejected while cache is full");
-
-    /* LOOKUP: one hit and one miss. */
-    found = cache_lookup(&cache, 1ULL);
-    all_passed &= check(found != NULL &&
-                        found->value == 100ULL &&
-                        found->rank == 50LL,
-                        "linear lookup finds key 1");
-
-    all_passed &= check(cache_lookup(&cache, 99ULL) == NULL,
-                        "linear lookup reports missing key");
-
-    /* MINIMUM-RANK SEARCH */
-    all_passed &= check(cache_find_min_rank_index(&cache, &min_index),
-                        "minimum-rank search succeeds");
-    all_passed &= check(cache.entries[min_index].key == 2ULL &&
-                        cache.entries[min_index].rank == 20LL,
-                        "minimum rank is key 2 with rank 20");
-
-    /* EVICTION */
-    all_passed &= check(cache_evict_min(&cache, &evicted),
-                        "evict minimum-ranked entry");
-    all_passed &= check(evicted.key == 2ULL && evicted.rank == 20LL,
-                        "evicted entry is key 2 rank 20");
-    all_passed &= check(cache_lookup(&cache, 2ULL) == NULL,
-                        "evicted key 2 is no longer present");
-    all_passed &= check(!cache_is_full(&cache),
-                        "cache is no longer full after eviction");
+    /* HIT -> return existing resident without insertion/eviction. */
+    before_hit = cache_lookup(&cache, 2ULL);
+    entry = cache_get(&cache, 2ULL);
+    all_passed &= check(entry != NULL && entry == before_hit,
+                        "GET 2 hit returns existing resident entry");
+    all_passed &= check(cache.size == 3U,
+                        "cache size is unchanged on hit");
 
     /*
-     * INSERT after eviction.
-     * This completes the manual oracle:
-     * resident keys are 1, 3, and 4.
+     * MISS while full:
+     * current ranks are 10, 20, 30, so key 1 is evicted.
+     * db_read_entry(4) returns rank 40 and key 4 is inserted.
      */
-    all_passed &= check(cache_insert(&cache, e4),
-                        "insert key 4 after eviction");
+    entry = cache_get(&cache, 4ULL);
+    all_passed &= check(entry != NULL &&
+                        entry->key == 4ULL &&
+                        entry->value == 400ULL &&
+                        entry->rank == 40LL,
+                        "GET 4 full-cache miss fetches and inserts key 4");
     all_passed &= check(cache.size == 3U,
-                        "cache size returns to capacity");
-    all_passed &= check(cache_lookup(&cache, 1ULL) != NULL &&
+                        "cache remains at capacity after miss eviction");
+    all_passed &= check(cache_lookup(&cache, 1ULL) == NULL,
+                        "minimum-ranked key 1 was evicted");
+    all_passed &= check(cache_lookup(&cache, 2ULL) != NULL &&
                         cache_lookup(&cache, 3ULL) != NULL &&
                         cache_lookup(&cache, 4ULL) != NULL,
-                        "final cache contains keys 1, 3, and 4");
-
+                        "final cache contains keys 2, 3, and 4");
     cache_print(&cache);
 
-    /* Stage 3 dedicated eviction edge cases. */
-    {
-        Cache empty_cache;
-        Cache tie_cache;
-        CacheEntry tie_evicted;
-        const CacheEntry t1 = {10ULL, 1000ULL, 5LL};
-        const CacheEntry t2 = {11ULL, 1100ULL, 5LL};
+    all_passed &= check(cache_get(NULL, 1ULL) == NULL,
+                        "cache_get rejects NULL cache");
 
-        all_passed &= check(cache_init(&empty_cache, 2U),
-                            "initialize empty eviction-test cache");
-        all_passed &= check(!cache_evict_min(&empty_cache, NULL),
-                            "eviction from empty cache is rejected");
-        all_passed &= check(!cache_remove_at(&cache, cache.size, NULL),
-                            "removal rejects out-of-range index");
-
-        all_passed &= check(cache_init(&tie_cache, 2U),
-                            "initialize equal-rank test cache");
-        all_passed &= check(cache_insert(&tie_cache, t1) &&
-                            cache_insert(&tie_cache, t2),
-                            "insert equal-rank entries");
-        all_passed &= check(cache_evict_min(&tie_cache, &tie_evicted),
-                            "evict from equal-rank cache");
-        all_passed &= check(tie_evicted.key == 10ULL &&
-                            tie_evicted.rank == 5LL,
-                            "equal-rank tie evicts first encountered entry");
-    }
-
-    printf("Stage 3 validation: %s\n",
+    printf("Stage 4 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;

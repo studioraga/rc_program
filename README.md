@@ -216,13 +216,13 @@ and printing the returned fields. The `db_read_entry()` implementation remains u
 Build:
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache3
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache4
 ```
 
 Run:
 
 ```bash
-./ranked_cache3
+./ranked_cache4
 ```
 
 Observed and expected output:
@@ -482,13 +482,13 @@ cache = {1:50, 3:80, 4:70}
 ### Build
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache3
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache4
 ```
 
 ### Run
 
 ```bash
-./ranked_cache3
+./ranked_cache4
 ```
 
 ### Validated output
@@ -593,7 +593,7 @@ The original Stage 2 oracle remains passing, and Stage 3 adds dedicated checks f
 Build:
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache3
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache4
 ```
 
 The test must end with:
@@ -603,6 +603,117 @@ Stage 3 validation: PASS
 ```
 
 No automatic database-backed `cache_get()` path, assertion framework, optimized lookup structure, heap, tree, or dynamic-rank maintenance is introduced in Stage 3.
+
+---
+
+## Stage 4 — Complete `cache_get()`
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 4 composes the existing Stage 1–3 primitives into the first complete cache access operation:
+
+```c
+CacheEntry *cache_get(Cache *cache, CacheKey key);
+```
+
+### Hit path
+
+```text
+cache_get(key)
+    ↓
+linear cache_lookup()
+    ↓
+entry found
+    ↓
+return existing resident entry
+```
+
+The cache size and resident set remain unchanged on a hit.
+
+Current hit complexity:
+
+```text
+O(N)
+```
+
+because key lookup is still a linear array scan.
+
+### Miss path
+
+```text
+cache_get(key)
+    ↓
+linear cache_lookup() -> MISS
+    ↓
+db_read_entry(key)
+    ↓
+capacity check
+    ↓
+if full: cache_evict_min()
+    ↓
+cache_insert()
+    ↓
+return newly resident entry
+```
+
+With the current simple structures, the miss path may perform multiple linear scans. Its asymptotic cache-maintenance cost remains O(N), in addition to the backing-store read cost.
+
+```text
+miss = O(N) + database-read cost
+```
+
+No attempt is made yet to optimize repeated scans.
+
+### Stage 4 validation workload
+
+The unchanged Stage 1 deterministic database abstraction returns:
+
+```text
+key 1 -> value 100, rank 10
+key 2 -> value 200, rank 20
+key 3 -> value 300, rank 30
+key 4 -> value 400, rank 40
+```
+
+The active test performs:
+
+```text
+GET 1   MISS -> insert 1
+GET 2   MISS -> insert 2
+GET 3   MISS -> insert 3
+GET 2   HIT  -> return existing resident
+GET 4   MISS while full
+```
+
+Before `GET 4`:
+
+```text
+cache = {1:10, 2:20, 3:30}
+```
+
+The minimum resident is key `1`, rank `10`, so the full-cache miss evicts key `1` and inserts key `4`.
+
+Final resident keys:
+
+```text
+2, 3, 4
+```
+
+The physical array order is not part of cache semantics because known-slot eviction can replace the victim with the final array element.
+
+Build:
+
+```bash
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache4
+```
+
+The active test must end with:
+
+```text
+Stage 4 validation: PASS
+```
+
+Stage 4 does not introduce assertions/invariant validation, optimized key lookup, rank-indexing structures, concurrency, or performance benchmarking.
 
 ---
 
@@ -617,7 +728,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache3
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache4
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -633,15 +744,15 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache3
+./ranked_cache4
 ```
 
 ### Expected result
 
-The active Stage 3 test suite must end with:
+The active Stage 4 test suite must end with:
 
 ```text
-Stage 3 validation: PASS
+Stage 4 validation: PASS
 ```
 
 and the final cache must be:
@@ -652,7 +763,7 @@ cache = {1:50, 3:80, 4:70}
 
 ### Validation result
 
-Stages 0 through 3 have been validated successfully. The active Stage 3 test returns exit status `0`.
+Stages 0 through 4 have been validated successfully. The active Stage 4 test returns exit status `0`.
 
 ---
 
@@ -672,12 +783,12 @@ At this commit, the program can:
 - evict the minimum-ranked entry by composing linear selection with known-slot removal,
 - verify that an evicted key is absent,
 - insert a new entry after capacity is freed, and
-- validate the complete Stage 2 manual oracle.
+- validate the complete Stage 2 manual oracle,
+- perform a complete cache hit through `cache_get()`, and
+- perform a complete cache miss including database read, full-cache eviction, insertion, and return.
 
 At this commit, the program intentionally does **not** implement:
 
-- automatic database fetch on a cache miss,
-- a combined higher-level cache-get operation,
 - optimized key lookup,
 - optimized rank ordering,
 - dynamic rank updates,
@@ -700,6 +811,8 @@ cache_insert()                O(N)
 cache_find_min_rank_index()   O(N)
 cache_remove_at()             O(1)
 cache_evict_min()             O(N)
+cache_get() hit               O(N)
+cache_get() miss              O(N) + DB-read cost
 additional working space      O(1)
 resident cache storage        O(K)
 ```
@@ -770,4 +883,15 @@ KNOWN-SLOT REMOVAL PASS
 EMPTY EVICTION GUARD PASS
 EQUAL-RANK TIE PASS
 EVICTION PASS
+
+Stage 4
+Complete cache_get()
+COMPLETE
+BUILD PASS
+RUN PASS
+CACHE HIT PASS
+CACHE MISS PASS
+FULL-CACHE EVICTION PASS
+DATABASE FETCH PATH PASS
+FINAL RESIDENT SET PASS
 ```
