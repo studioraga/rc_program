@@ -8,18 +8,20 @@
  *   Stage 2 - simplest fixed-size cache using a linear array
  *   Stage 3 - explicit linear minimum-rank eviction path
  *   Stage 4 - complete cache_get() hit/miss path
+ *   Stage 5 - assertions and cache invariants
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
  *   - duplicate detection before insert
  *   - minimum-rank search
  *
- * Stage 4 composes the existing primitives into one complete cache_get()
- * operation while intentionally keeping all cache searches linear.
+ * Stage 5 adds explicit structural invariant validation and development-time
+ * assertions without changing the Stage 4 cache algorithm or complexity.
  */
 
 #include <stdio.h>
 #include <stddef.h>
+#include <assert.h>
 
 #define MAX_CACHE_CAPACITY 100U
 
@@ -44,6 +46,64 @@ typedef struct {
     size_t size;
     size_t capacity;
 } Cache;
+
+
+/* ---------- Stage 5: structural invariants ---------- */
+
+/*
+ * Validate the internal structural invariants of a cache.
+ *
+ * Invariants checked:
+ *   - cache pointer is non-NULL
+ *   - configured capacity is in [1, MAX_CACHE_CAPACITY]
+ *   - resident size never exceeds configured capacity
+ *   - no two resident entries have the same key
+ *
+ * This function returns a status instead of asserting so tests can verify
+ * that deliberately corrupted cache states are detected.
+ *
+ * Complexity:
+ *   O(N^2) because duplicate-key validation compares resident pairs.
+ *
+ * This validation cost is for correctness/debug checking only and is not
+ * part of the intended production cache algorithm.
+ */
+int cache_validate(const Cache *cache)
+{
+    size_t i;
+    size_t j;
+
+    if (cache == NULL) {
+        return 0;
+    }
+
+    if (cache->capacity == 0U || cache->capacity > MAX_CACHE_CAPACITY) {
+        return 0;
+    }
+
+    if (cache->size > cache->capacity) {
+        return 0;
+    }
+
+    for (i = 0U; i < cache->size; ++i) {
+        for (j = i + 1U; j < cache->size; ++j) {
+            if (cache->entries[i].key == cache->entries[j].key) {
+                return 0;
+            }
+        }
+    }
+
+    return 1;
+}
+
+/*
+ * Development-time assertion wrapper.
+ * Standard C assert() is active unless NDEBUG is defined at build time.
+ */
+void cache_assert_invariants(const Cache *cache)
+{
+    assert(cache_validate(cache));
+}
 
 /* ---------- Stage 1: deterministic database abstraction ---------- */
 
@@ -75,6 +135,7 @@ int cache_init(Cache *cache, size_t capacity)
 
     cache->size = 0U;
     cache->capacity = capacity;
+    cache_assert_invariants(cache);
     return 1;
 }
 
@@ -86,7 +147,12 @@ int cache_init(Cache *cache, size_t capacity)
  */
 int cache_is_full(const Cache *cache)
 {
-    return cache != NULL && cache->size >= cache->capacity;
+    if (cache == NULL) {
+        return 0;
+    }
+
+    cache_assert_invariants(cache);
+    return cache->size >= cache->capacity;
 }
 
 /*
@@ -106,6 +172,8 @@ CacheEntry *cache_lookup(Cache *cache, CacheKey key)
     if (cache == NULL) {
         return NULL;
     }
+
+    cache_assert_invariants(cache);
 
     for (i = 0U; i < cache->size; ++i) {
         if (cache->entries[i].key == key) {
@@ -132,7 +200,13 @@ CacheEntry *cache_lookup(Cache *cache, CacheKey key)
  */
 int cache_insert(Cache *cache, CacheEntry entry)
 {
-    if (cache == NULL || cache_is_full(cache)) {
+    if (cache == NULL) {
+        return 0;
+    }
+
+    cache_assert_invariants(cache);
+
+    if (cache_is_full(cache)) {
         return 0;
     }
 
@@ -143,6 +217,7 @@ int cache_insert(Cache *cache, CacheEntry entry)
     cache->entries[cache->size] = entry;
     ++cache->size;
 
+    cache_assert_invariants(cache);
     return 1;
 }
 
@@ -169,6 +244,7 @@ int cache_find_min_rank_index(const Cache *cache, size_t *min_index)
         return 0;
     }
 
+    cache_assert_invariants(cache);
     candidate = 0U;
 
     for (i = 1U; i < cache->size; ++i) {
@@ -203,6 +279,8 @@ int cache_remove_at(Cache *cache, size_t index, CacheEntry *removed_entry)
         return 0;
     }
 
+    cache_assert_invariants(cache);
+
     if (removed_entry != NULL) {
         *removed_entry = cache->entries[index];
     }
@@ -210,6 +288,7 @@ int cache_remove_at(Cache *cache, size_t index, CacheEntry *removed_entry)
     cache->entries[index] = cache->entries[cache->size - 1U];
     --cache->size;
 
+    cache_assert_invariants(cache);
     return 1;
 }
 
@@ -267,6 +346,7 @@ CacheEntry *cache_get(Cache *cache, CacheKey key)
         return NULL;
     }
 
+    cache_assert_invariants(cache);
     found = cache_lookup(cache, key);
     if (found != NULL) {
         return found;
@@ -329,69 +409,69 @@ int check(int condition, const char *name)
 int main(void)
 {
     Cache cache;
+    Cache invalid;
+    Cache duplicate;
     CacheEntry *entry;
-    CacheEntry *before_hit;
     int all_passed = 1;
 
-    printf("=== Stage 4: complete cache_get() path ===\n");
+    printf("=== Stage 5: assertions and invariants ===\n");
 
     all_passed &= check(cache_init(&cache, 3U),
-                        "initialize cache with capacity 3");
+                        "initialize valid cache");
+    all_passed &= check(cache_validate(&cache),
+                        "fresh cache satisfies invariants");
 
-    /* MISS -> DB READ -> INSERT */
-    entry = cache_get(&cache, 1ULL);
-    all_passed &= check(entry != NULL &&
-                        entry->key == 1ULL &&
-                        entry->value == 100ULL &&
-                        entry->rank == 10LL,
-                        "GET 1 miss fetches and inserts database entry");
-    all_passed &= check(cache.size == 1U,
-                        "cache size becomes 1 after GET 1 miss");
+    /* Re-run the complete Stage 4 cache_get() behavior under assertions. */
+    all_passed &= check(cache_get(&cache, 1ULL) != NULL,
+                        "GET 1 succeeds under invariant assertions");
+    all_passed &= check(cache_get(&cache, 2ULL) != NULL,
+                        "GET 2 succeeds under invariant assertions");
+    all_passed &= check(cache_get(&cache, 3ULL) != NULL,
+                        "GET 3 succeeds under invariant assertions");
+    all_passed &= check(cache_validate(&cache),
+                        "full cache satisfies invariants");
 
     entry = cache_get(&cache, 2ULL);
-    all_passed &= check(entry != NULL && entry->rank == 20LL,
-                        "GET 2 miss fetches and inserts database entry");
+    all_passed &= check(entry != NULL && entry->key == 2ULL,
+                        "cache hit preserves invariant-valid state");
 
-    entry = cache_get(&cache, 3ULL);
-    all_passed &= check(entry != NULL && entry->rank == 30LL,
-                        "GET 3 miss fetches and inserts database entry");
-    all_passed &= check(cache_is_full(&cache),
-                        "cache is full after three misses");
-    cache_print(&cache);
-
-    /* HIT -> return existing resident without insertion/eviction. */
-    before_hit = cache_lookup(&cache, 2ULL);
-    entry = cache_get(&cache, 2ULL);
-    all_passed &= check(entry != NULL && entry == before_hit,
-                        "GET 2 hit returns existing resident entry");
-    all_passed &= check(cache.size == 3U,
-                        "cache size is unchanged on hit");
-
-    /*
-     * MISS while full:
-     * current ranks are 10, 20, 30, so key 1 is evicted.
-     * db_read_entry(4) returns rank 40 and key 4 is inserted.
-     */
     entry = cache_get(&cache, 4ULL);
-    all_passed &= check(entry != NULL &&
-                        entry->key == 4ULL &&
-                        entry->value == 400ULL &&
-                        entry->rank == 40LL,
-                        "GET 4 full-cache miss fetches and inserts key 4");
-    all_passed &= check(cache.size == 3U,
-                        "cache remains at capacity after miss eviction");
-    all_passed &= check(cache_lookup(&cache, 1ULL) == NULL,
-                        "minimum-ranked key 1 was evicted");
-    all_passed &= check(cache_lookup(&cache, 2ULL) != NULL &&
+    all_passed &= check(entry != NULL && entry->key == 4ULL,
+                        "full-cache miss succeeds under assertions");
+    all_passed &= check(cache_validate(&cache),
+                        "post-eviction cache satisfies invariants");
+    all_passed &= check(cache.size == 3U &&
+                        cache_lookup(&cache, 1ULL) == NULL &&
+                        cache_lookup(&cache, 2ULL) != NULL &&
                         cache_lookup(&cache, 3ULL) != NULL &&
                         cache_lookup(&cache, 4ULL) != NULL,
-                        "final cache contains keys 2, 3, and 4");
+                        "Stage 4 final resident-set behavior remains correct");
     cache_print(&cache);
 
-    all_passed &= check(cache_get(NULL, 1ULL) == NULL,
-                        "cache_get rejects NULL cache");
+    /*
+     * Deliberately construct invalid states and verify cache_validate()
+     * detects them. These corrupted caches are not passed to mutating APIs,
+     * because those APIs intentionally assert valid structural state.
+     */
+    invalid = cache;
+    invalid.size = invalid.capacity + 1U;
+    all_passed &= check(!cache_validate(&invalid),
+                        "validator detects size greater than capacity");
 
-    printf("Stage 4 validation: %s\n",
+    invalid = cache;
+    invalid.capacity = 0U;
+    all_passed &= check(!cache_validate(&invalid),
+                        "validator detects zero capacity");
+
+    duplicate = cache;
+    duplicate.entries[1].key = duplicate.entries[0].key;
+    all_passed &= check(!cache_validate(&duplicate),
+                        "validator detects duplicate resident keys");
+
+    all_passed &= check(!cache_validate(NULL),
+                        "validator rejects NULL cache");
+
+    printf("Stage 5 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;

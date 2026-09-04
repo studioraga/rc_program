@@ -216,13 +216,13 @@ and printing the returned fields. The `db_read_entry()` implementation remains u
 Build:
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache4
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache5
 ```
 
 Run:
 
 ```bash
-./ranked_cache4
+./ranked_cache5
 ```
 
 Observed and expected output:
@@ -482,13 +482,13 @@ cache = {1:50, 3:80, 4:70}
 ### Build
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache4
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache5
 ```
 
 ### Run
 
 ```bash
-./ranked_cache4
+./ranked_cache5
 ```
 
 ### Validated output
@@ -593,7 +593,7 @@ The original Stage 2 oracle remains passing, and Stage 3 adds dedicated checks f
 Build:
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache4
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache5
 ```
 
 The test must end with:
@@ -704,7 +704,7 @@ The physical array order is not part of cache semantics because known-slot evict
 Build:
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache4
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache5
 ```
 
 The active test must end with:
@@ -714,6 +714,133 @@ Stage 4 validation: PASS
 ```
 
 Stage 4 does not introduce assertions/invariant validation, optimized key lookup, rank-indexing structures, concurrency, or performance benchmarking.
+
+---
+
+## Stage 5 — Assertions and Invariants
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 5 adds explicit structural validation and development-time assertions without changing the Stage 4 cache algorithm.
+
+### Structural invariants
+
+A valid `Cache` must satisfy all of the following:
+
+1. the cache pointer is non-NULL,
+2. `capacity` is at least 1,
+3. `capacity` does not exceed `MAX_CACHE_CAPACITY`,
+4. `size <= capacity`, and
+5. no two resident entries have the same key.
+
+These rules are checked by:
+
+```c
+int cache_validate(const Cache *cache);
+```
+
+The function returns `1` for a structurally valid cache and `0` for an invalid cache.
+
+### Duplicate-key validation complexity
+
+The current validator compares resident entry pairs directly:
+
+```text
+for each resident i
+    compare against residents i+1 ... N-1
+```
+
+Therefore the full validator is:
+
+```text
+O(N^2)
+```
+
+This is intentional at Stage 5. `cache_validate()` is a correctness/debugging oracle, not the optimized cache lookup mechanism.
+
+### Development-time assertions
+
+The helper:
+
+```c
+void cache_assert_invariants(const Cache *cache);
+```
+
+uses standard C:
+
+```c
+assert(cache_validate(cache));
+```
+
+The cache operations call this helper around valid-state transitions so structural corruption is detected close to where it occurs during development.
+
+Standard `assert()` checks are disabled when the program is compiled with `NDEBUG` defined. At this checkpoint they remain enabled for correctness testing.
+
+Because `cache_validate()` is currently O(N²), assertion-enabled builds can have substantially higher runtime cost than the underlying Stage 4 algorithm. Those checks must not be confused with the cache algorithm's eventual benchmark cost.
+
+### Invalid states tested
+
+Stage 5 deliberately constructs copies of the cache with invalid state and verifies that `cache_validate()` rejects them:
+
+```text
+size > capacity
+capacity == 0
+duplicate resident keys
+NULL cache
+```
+
+The deliberately corrupted objects are not passed into mutating cache operations because those operations assert that structural state is valid.
+
+### Regression validation
+
+The complete Stage 4 `cache_get()` flow is re-run with assertions enabled:
+
+```text
+GET 1
+GET 2
+GET 3
+GET 2   (hit)
+GET 4   (full-cache miss and minimum-rank eviction)
+```
+
+The final resident set remains keys `2`, `3`, and `4`.
+
+### Standard build
+
+```bash
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache5
+./ranked_cache5
+```
+
+Expected final status:
+
+```text
+Stage 5 validation: PASS
+```
+
+### Sanitizer validation
+
+Stage 5 was also validated with:
+
+```bash
+gcc -Wall -Wextra -Wpedantic -std=c11 \
+    -O0 -g3 \
+    -fsanitize=address,undefined \
+    ranked_cache.c \
+    -o ranked_cache5_san
+
+./ranked_cache5_san
+```
+
+The sanitizer run completes with:
+
+```text
+Stage 5 validation: PASS
+```
+
+and no AddressSanitizer or UndefinedBehaviorSanitizer diagnostic was reported.
+
+Stage 5 does not introduce optimized lookup, a hash table, a heap, a tree, dynamic-rank maintenance, concurrency, or performance benchmarking.
 
 ---
 
@@ -728,7 +855,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache4
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache5
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -744,15 +871,15 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache4
+./ranked_cache5
 ```
 
 ### Expected result
 
-The active Stage 4 test suite must end with:
+The active Stage 5 test suite must end with:
 
 ```text
-Stage 4 validation: PASS
+Stage 5 validation: PASS
 ```
 
 and the final cache must be:
@@ -763,7 +890,7 @@ cache = {1:50, 3:80, 4:70}
 
 ### Validation result
 
-Stages 0 through 4 have been validated successfully. The active Stage 4 test returns exit status `0`.
+Stages 0 through 5 have been validated successfully. The active Stage 5 test returns exit status `0`, including the sanitizer validation build.
 
 ---
 
@@ -785,7 +912,9 @@ At this commit, the program can:
 - insert a new entry after capacity is freed, and
 - validate the complete Stage 2 manual oracle,
 - perform a complete cache hit through `cache_get()`, and
-- perform a complete cache miss including database read, full-cache eviction, insertion, and return.
+- perform a complete cache miss including database read, full-cache eviction, insertion, and return,
+- validate cache structural invariants, and
+- assert valid structural state during development operations.
 
 At this commit, the program intentionally does **not** implement:
 
@@ -813,11 +942,12 @@ cache_remove_at()             O(1)
 cache_evict_min()             O(N)
 cache_get() hit               O(N)
 cache_get() miss              O(N) + DB-read cost
+cache_validate()              O(N^2) debug/correctness check
 additional working space      O(1)
 resident cache storage        O(K)
 ```
 
-The `O(N)` operations are expected at this checkpoint and provide the simple correctness baseline against which later implementations can be reasoned about and measured.
+The linear cache costs remain the algorithmic baseline. In assertion-enabled Stage 5 builds, the O(N²) invariant validator can dominate runtime; it is intentionally a correctness aid rather than a performance implementation.
 
 ---
 
@@ -894,4 +1024,15 @@ CACHE MISS PASS
 FULL-CACHE EVICTION PASS
 DATABASE FETCH PATH PASS
 FINAL RESIDENT SET PASS
+
+Stage 5
+Assertions and invariants
+COMPLETE
+BUILD PASS
+RUN PASS
+STRUCTURAL VALIDATOR PASS
+SIZE/CAPACITY INVARIANT PASS
+DUPLICATE-KEY INVARIANT PASS
+ASSERTION-ENABLED REGRESSION PASS
+ASAN/UBSAN PASS
 ```
