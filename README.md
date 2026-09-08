@@ -216,13 +216,13 @@ and printing the returned fields. The `db_read_entry()` implementation remains u
 Build:
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache5
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache6
 ```
 
 Run:
 
 ```bash
-./ranked_cache5
+./ranked_cache6
 ```
 
 Observed and expected output:
@@ -482,13 +482,13 @@ cache = {1:50, 3:80, 4:70}
 ### Build
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache5
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache6
 ```
 
 ### Run
 
 ```bash
-./ranked_cache5
+./ranked_cache6
 ```
 
 ### Validated output
@@ -593,7 +593,7 @@ The original Stage 2 oracle remains passing, and Stage 3 adds dedicated checks f
 Build:
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache5
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache6
 ```
 
 The test must end with:
@@ -704,7 +704,7 @@ The physical array order is not part of cache semantics because known-slot evict
 Build:
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache5
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache6
 ```
 
 The active test must end with:
@@ -808,8 +808,8 @@ The final resident set remains keys `2`, `3`, and `4`.
 ### Standard build
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache5
-./ranked_cache5
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache6
+./ranked_cache6
 ```
 
 Expected final status:
@@ -842,6 +842,186 @@ and no AddressSanitizer or UndefinedBehaviorSanitizer diagnostic was reported.
 
 Stage 5 does not introduce optimized lookup, a hash table, a heap, a tree, dynamic-rank maintenance, concurrency, or performance benchmarking.
 
+
+---
+
+## Stage 6 — Identify the First Bottleneck
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 6 does **not** optimize the cache. Its purpose is to identify and prove the first algorithmic bottleneck in the current Stage 5 implementation before any data-structure replacement is attempted.
+
+The current cache still stores resident entries in a fixed array, and `cache_lookup()` still scans that array from index `0` until it either finds the requested key or reaches the end.
+
+### Why Stage 6 uses operation counts instead of timing
+
+Stage 5 intentionally enables `cache_validate()`, whose duplicate-key invariant check is O(N²). Wall-clock timing of the assertion-enabled program would therefore mix together:
+
+- linear lookup work,
+- O(N²) debug invariant checking,
+- printing and test-harness overhead, and
+- machine/OS timing noise.
+
+Stage 6 therefore identifies the bottleneck using deterministic **key-comparison counts** inside the existing `cache_lookup()` implementation. This gives a platform-independent measurement of how lookup work grows with resident cache size without changing the lookup algorithm.
+
+### Lookup instrumentation
+
+Stage 6 adds a diagnostic structure:
+
+```c
+typedef struct {
+    uint64_t lookup_calls;
+    uint64_t key_comparisons;
+    uint64_t lookup_hits;
+    uint64_t lookup_misses;
+} LookupStats;
+```
+
+The counters are reset and sampled using:
+
+```c
+void lookup_stats_reset(void);
+LookupStats lookup_stats_snapshot(void);
+```
+
+`cache_lookup()` now increments these counters while executing the same linear scan used in Stage 5.
+
+The instrumentation does not change:
+
+- cache storage,
+- lookup order,
+- eviction policy,
+- insertion policy,
+- rank handling, or
+- asymptotic complexity.
+
+### Experiment 1 — position within a 100-entry cache
+
+A valid 100-entry cache is populated with unique keys `1..100`, then four lookups are profiled.
+
+| Probe | Expected result | Key comparisons |
+|---|---|---:|
+| key `1` | hit at first element | 1 |
+| key `50` | hit in the middle | 50 |
+| key `100` | hit at last element | 100 |
+| key `1000` | miss | 100 |
+
+Validated output:
+
+```text
+[PROFILE] first-entry lookup           size=100 comparisons=1 result=HIT
+[PROFILE] middle-entry lookup          size=100 comparisons=50 result=HIT
+[PROFILE] last-entry lookup            size=100 comparisons=100 result=HIT
+[PROFILE] missing-entry lookup         size=100 comparisons=100 result=MISS
+```
+
+This demonstrates that lookup cost depends directly on where the key is found. A miss and a last-element hit both require scanning the complete resident set.
+
+### Experiment 2 — scaling resident size
+
+Stage 6 then performs the same missing-key lookup while increasing resident cache size.
+
+Validated results:
+
+```text
+size    key-comparisons
+   1    1
+  10    10
+  25    25
+  50    50
+ 100    100
+```
+
+For a missing key:
+
+```text
+key comparisons = resident cache size = N
+```
+
+Therefore the measured lookup work grows linearly with `N`.
+
+### First bottleneck identified
+
+The first bottleneck is:
+
+```text
+cache_lookup() = O(N)
+```
+
+This affects not only direct cache hits. The current `cache_get()` miss path can invoke linear lookup more than once through its composed operations, including duplicate detection during insertion and the final lookup used to return the newly inserted entry.
+
+At this checkpoint the important conclusion is only:
+
+> Key lookup is the first operation to target because the existing implementation requires a linear scan of resident entries.
+
+Stage 6 deliberately stops after identifying and measuring this bottleneck. It does not introduce a replacement lookup structure.
+
+### Stage 6 helper
+
+For controlled lookup profiling, Stage 6 adds:
+
+```c
+int stage6_fill_profile_cache(Cache *cache, size_t count);
+```
+
+This helper directly fills a structurally valid cache with deterministic unique entries. It intentionally avoids `cache_insert()` so the experiment measures `cache_lookup()` itself instead of insertion's additional duplicate-check lookup.
+
+### Stage 6 validation
+
+Normal build:
+
+```bash
+gcc -Wall -Wextra -Wpedantic -std=c11 \
+    ranked_cache.c \
+    -o ranked_cache6
+
+./ranked_cache6
+```
+
+The run must end with:
+
+```text
+Stage 6 finding: cache_lookup() grows linearly with resident size.
+First bottleneck identified: O(N) key lookup.
+Stage 6 validation: PASS
+```
+
+Sanitizer validation:
+
+```bash
+gcc -Wall -Wextra -Wpedantic -std=c11 \
+    -O0 -g3 \
+    -fsanitize=address,undefined \
+    ranked_cache.c \
+    -o ranked_cache6_san
+
+./ranked_cache6_san
+```
+
+The sanitizer build also completes with:
+
+```text
+Stage 6 validation: PASS
+```
+
+with no AddressSanitizer or UndefinedBehaviorSanitizer diagnostics.
+
+### Stage 6 complexity
+
+No production algorithm has changed.
+
+```text
+cache_lookup() best-case hit       O(1)
+cache_lookup() average/worst       O(N)
+cache_lookup() miss                O(N)
+lookup instrumentation update      O(1) per comparison
+cache_validate()                   O(N²) debug/correctness check
+```
+
+The Stage 6 measurement confirms the existing linear lookup complexity rather than replacing it.
+
+No hash table, heap, tree, dynamic-rank update mechanism, concurrency support, or optimized cache lookup is introduced in Stage 6.
+
 ---
 
 ## Build Environment
@@ -855,7 +1035,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache5
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache6
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -871,15 +1051,15 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache5
+./ranked_cache6
 ```
 
 ### Expected result
 
-The active Stage 5 test suite must end with:
+The active Stage 6 test suite must end with:
 
 ```text
-Stage 5 validation: PASS
+Stage 6 validation: PASS
 ```
 
 and the final cache must be:
@@ -890,7 +1070,7 @@ cache = {1:50, 3:80, 4:70}
 
 ### Validation result
 
-Stages 0 through 5 have been validated successfully. The active Stage 5 test returns exit status `0`, including the sanitizer validation build.
+Stages 0 through 6 have been validated successfully. The active Stage 6 test returns exit status `0`, including the sanitizer validation build.
 
 ---
 
@@ -914,14 +1094,16 @@ At this commit, the program can:
 - perform a complete cache hit through `cache_get()`, and
 - perform a complete cache miss including database read, full-cache eviction, insertion, and return,
 - validate cache structural invariants, and
-- assert valid structural state during development operations.
+- assert valid structural state during development operations,
+- count linear lookup calls, hits, misses, and key comparisons, and
+- demonstrate lookup work growing linearly with resident cache size.
 
 At this commit, the program intentionally does **not** implement:
 
 - optimized key lookup,
 - optimized rank ordering,
 - dynamic rank updates,
-- performance benchmarking, or
+- optimized lookup implementation, or
 - concurrent/thread-safe access.
 
 Those capabilities must only be documented after their corresponding implementation stages have actually been completed and validated.
@@ -943,11 +1125,12 @@ cache_evict_min()             O(N)
 cache_get() hit               O(N)
 cache_get() miss              O(N) + DB-read cost
 cache_validate()              O(N^2) debug/correctness check
+lookup-stat counter update    O(1) per comparison
 additional working space      O(1)
 resident cache storage        O(K)
 ```
 
-The linear cache costs remain the algorithmic baseline. In assertion-enabled Stage 5 builds, the O(N²) invariant validator can dominate runtime; it is intentionally a correctness aid rather than a performance implementation.
+Stage 6 directly confirms that a missing lookup performs exactly N key comparisons for N resident entries. The first algorithmic bottleneck is therefore the O(N) linear key lookup. In assertion-enabled builds, the O(N²) invariant validator can still dominate wall-clock runtime; it remains a correctness aid rather than a production lookup mechanism.
 
 ---
 
@@ -1034,5 +1217,16 @@ STRUCTURAL VALIDATOR PASS
 SIZE/CAPACITY INVARIANT PASS
 DUPLICATE-KEY INVARIANT PASS
 ASSERTION-ENABLED REGRESSION PASS
+ASAN/UBSAN PASS
+
+Stage 6
+First bottleneck identification
+COMPLETE
+BUILD PASS
+RUN PASS
+LOOKUP INSTRUMENTATION PASS
+FIRST/MIDDLE/LAST LOOKUP PROFILE PASS
+MISSING-LOOKUP SCALING PASS
+O(N) LOOKUP BOTTLENECK CONFIRMED
 ASAN/UBSAN PASS
 ```

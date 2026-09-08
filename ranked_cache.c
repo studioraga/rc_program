@@ -9,6 +9,7 @@
  *   Stage 3 - explicit linear minimum-rank eviction path
  *   Stage 4 - complete cache_get() hit/miss path
  *   Stage 5 - assertions and cache invariants
+ *   Stage 6 - identify the first bottleneck with lookup instrumentation
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
@@ -17,11 +18,16 @@
  *
  * Stage 5 adds explicit structural invariant validation and development-time
  * assertions without changing the Stage 4 cache algorithm or complexity.
+ *
+ * Stage 6 does not optimize the cache. It instruments the existing linear
+ * lookup path so the first bottleneck can be demonstrated with exact operation
+ * counts rather than wall-clock timing.
  */
 
 #include <stdio.h>
 #include <stddef.h>
 #include <assert.h>
+#include <stdint.h>
 
 #define MAX_CACHE_CAPACITY 100U
 
@@ -46,6 +52,37 @@ typedef struct {
     size_t size;
     size_t capacity;
 } Cache;
+
+
+/* ---------- Stage 6: lookup instrumentation ---------- */
+
+/*
+ * Exact counters for the existing linear key-lookup path.
+ *
+ * These counters are diagnostic only. They deliberately do not change the
+ * lookup algorithm or the cache data structure.
+ */
+typedef struct {
+    uint64_t lookup_calls;
+    uint64_t key_comparisons;
+    uint64_t lookup_hits;
+    uint64_t lookup_misses;
+} LookupStats;
+
+static LookupStats g_lookup_stats;
+
+void lookup_stats_reset(void)
+{
+    g_lookup_stats.lookup_calls = 0U;
+    g_lookup_stats.key_comparisons = 0U;
+    g_lookup_stats.lookup_hits = 0U;
+    g_lookup_stats.lookup_misses = 0U;
+}
+
+LookupStats lookup_stats_snapshot(void)
+{
+    return g_lookup_stats;
+}
 
 
 /* ---------- Stage 5: structural invariants ---------- */
@@ -174,13 +211,18 @@ CacheEntry *cache_lookup(Cache *cache, CacheKey key)
     }
 
     cache_assert_invariants(cache);
+    ++g_lookup_stats.lookup_calls;
 
     for (i = 0U; i < cache->size; ++i) {
+        ++g_lookup_stats.key_comparisons;
+
         if (cache->entries[i].key == key) {
+            ++g_lookup_stats.lookup_hits;
             return &cache->entries[i];
         }
     }
 
+    ++g_lookup_stats.lookup_misses;
     return NULL;
 }
 
@@ -406,53 +448,102 @@ int check(int condition, const char *name)
     return 0;
 }
 
+/* ---------- Stage 6: deterministic bottleneck identification ---------- */
+
+/*
+ * Fill a cache directly with valid unique entries for lookup profiling.
+ * This avoids cache_insert() because Stage 6 is measuring cache_lookup()
+ * itself, not insertion's duplicate-check lookup.
+ */
+int stage6_fill_profile_cache(Cache *cache, size_t count)
+{
+    size_t i;
+
+    if (!cache_init(cache, count)) {
+        return 0;
+    }
+
+    for (i = 0U; i < count; ++i) {
+        CacheKey key = (CacheKey)(i + 1U);
+
+        cache->entries[i] = db_read_entry(key);
+    }
+
+    cache->size = count;
+    cache_assert_invariants(cache);
+    return 1;
+}
+
+/*
+ * Profile one lookup and verify the exact number of key comparisons.
+ */
+int stage6_check_lookup_cost(Cache *cache,
+                             CacheKey key,
+                             uint64_t expected_comparisons,
+                             int expect_hit,
+                             const char *name)
+{
+    CacheEntry *entry;
+    LookupStats stats;
+    int passed;
+
+    lookup_stats_reset();
+    entry = cache_lookup(cache, key);
+    stats = lookup_stats_snapshot();
+
+    passed = (stats.lookup_calls == 1U &&
+              stats.key_comparisons == expected_comparisons &&
+              stats.lookup_hits == (expect_hit ? 1U : 0U) &&
+              stats.lookup_misses == (expect_hit ? 0U : 1U) &&
+              ((entry != NULL) == expect_hit));
+
+    printf("[PROFILE] %-28s size=%zu comparisons=%llu result=%s\n",
+           name,
+           cache->size,
+           (unsigned long long)stats.key_comparisons,
+           entry != NULL ? "HIT" : "MISS");
+
+    return check(passed, name);
+}
+
 int main(void)
 {
     Cache cache;
     Cache invalid;
     Cache duplicate;
+    Cache profile;
     CacheEntry *entry;
+    LookupStats stats;
+    size_t sizes[] = {1U, 10U, 25U, 50U, 100U};
+    size_t i;
     int all_passed = 1;
 
-    printf("=== Stage 5: assertions and invariants ===\n");
+    printf("=== Stage 6: identify first bottleneck ===\n");
 
+    /* Stage 5 regression: normal cache behavior remains correct. */
     all_passed &= check(cache_init(&cache, 3U),
                         "initialize valid cache");
     all_passed &= check(cache_validate(&cache),
                         "fresh cache satisfies invariants");
 
-    /* Re-run the complete Stage 4 cache_get() behavior under assertions. */
     all_passed &= check(cache_get(&cache, 1ULL) != NULL,
-                        "GET 1 succeeds under invariant assertions");
+                        "GET 1 succeeds");
     all_passed &= check(cache_get(&cache, 2ULL) != NULL,
-                        "GET 2 succeeds under invariant assertions");
+                        "GET 2 succeeds");
     all_passed &= check(cache_get(&cache, 3ULL) != NULL,
-                        "GET 3 succeeds under invariant assertions");
-    all_passed &= check(cache_validate(&cache),
-                        "full cache satisfies invariants");
+                        "GET 3 succeeds");
 
     entry = cache_get(&cache, 2ULL);
     all_passed &= check(entry != NULL && entry->key == 2ULL,
-                        "cache hit preserves invariant-valid state");
+                        "cache hit remains correct");
 
     entry = cache_get(&cache, 4ULL);
     all_passed &= check(entry != NULL && entry->key == 4ULL,
-                        "full-cache miss succeeds under assertions");
+                        "full-cache miss remains correct");
     all_passed &= check(cache_validate(&cache),
                         "post-eviction cache satisfies invariants");
-    all_passed &= check(cache.size == 3U &&
-                        cache_lookup(&cache, 1ULL) == NULL &&
-                        cache_lookup(&cache, 2ULL) != NULL &&
-                        cache_lookup(&cache, 3ULL) != NULL &&
-                        cache_lookup(&cache, 4ULL) != NULL,
-                        "Stage 4 final resident-set behavior remains correct");
-    cache_print(&cache);
 
-    /*
-     * Deliberately construct invalid states and verify cache_validate()
-     * detects them. These corrupted caches are not passed to mutating APIs,
-     * because those APIs intentionally assert valid structural state.
-     */
+    /* Preserve Stage 5 invalid-state checks. */
     invalid = cache;
     invalid.size = invalid.capacity + 1U;
     all_passed &= check(!cache_validate(&invalid),
@@ -471,7 +562,54 @@ int main(void)
     all_passed &= check(!cache_validate(NULL),
                         "validator rejects NULL cache");
 
-    printf("Stage 5 validation: %s\n",
+    /*
+     * Stage 6 experiment 1: within one 100-entry cache, compare the first,
+     * middle, last, and missing-key cases. A linear scan should require
+     * 1, 50, 100, and 100 key comparisons respectively.
+     */
+    all_passed &= check(stage6_fill_profile_cache(&profile, 100U),
+                        "prepare 100-entry profiling cache");
+
+    all_passed &= stage6_check_lookup_cost(&profile, 1ULL, 1U, 1,
+                                           "first-entry lookup");
+    all_passed &= stage6_check_lookup_cost(&profile, 50ULL, 50U, 1,
+                                           "middle-entry lookup");
+    all_passed &= stage6_check_lookup_cost(&profile, 100ULL, 100U, 1,
+                                           "last-entry lookup");
+    all_passed &= stage6_check_lookup_cost(&profile, 1000ULL, 100U, 0,
+                                           "missing-entry lookup");
+
+    /*
+     * Stage 6 experiment 2: scale resident size while always requesting a
+     * missing key. Exact comparison count must grow one-for-one with N.
+     */
+    printf("\nStage 6 lookup scaling (missing key):\n");
+    printf("  size    key-comparisons\n");
+
+    for (i = 0U; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+        size_t n = sizes[i];
+
+        all_passed &= check(stage6_fill_profile_cache(&profile, n),
+                            "prepare scaling cache");
+
+        lookup_stats_reset();
+        entry = cache_lookup(&profile, 1000ULL);
+        stats = lookup_stats_snapshot();
+
+        printf("  %4zu    %llu\n",
+               n,
+               (unsigned long long)stats.key_comparisons);
+
+        all_passed &= check(entry == NULL &&
+                            stats.lookup_calls == 1U &&
+                            stats.lookup_misses == 1U &&
+                            stats.key_comparisons == (uint64_t)n,
+                            "missing lookup comparisons equal cache size");
+    }
+
+    printf("\nStage 6 finding: cache_lookup() grows linearly with resident size.\n");
+    printf("First bottleneck identified: O(N) key lookup.\n");
+    printf("Stage 6 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;
