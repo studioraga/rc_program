@@ -10,6 +10,7 @@
  *   Stage 4 - complete cache_get() hit/miss path
  *   Stage 5 - assertions and cache invariants
  *   Stage 6 - identify the first bottleneck with lookup instrumentation
+ *   Stage 7 - standalone hash-table lookup validation
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
@@ -22,6 +23,10 @@
  * Stage 6 does not optimize the cache. It instruments the existing linear
  * lookup path so the first bottleneck can be demonstrated with exact operation
  * counts rather than wall-clock timing.
+ *
+ * Stage 7 introduces a standalone hash table and validates its lookup, insert,
+ * collision, deletion, and tombstone behavior independently. The hash table is
+ * deliberately not connected to Cache or cache_get() yet.
  */
 
 #include <stdio.h>
@@ -30,6 +35,7 @@
 #include <stdint.h>
 
 #define MAX_CACHE_CAPACITY 100U
+#define HASH_TABLE_CAPACITY 211U
 
 typedef unsigned long long CacheKey;
 typedef long long Rank;
@@ -82,6 +88,250 @@ void lookup_stats_reset(void)
 LookupStats lookup_stats_snapshot(void)
 {
     return g_lookup_stats;
+}
+
+
+/* ---------- Stage 7: standalone hash table ---------- */
+
+/*
+ * Stage 7 uses open addressing with linear probing.
+ *
+ * The table stores key -> CacheEntry * mappings. It is tested independently
+ * from Cache and cache_get() so hash-table correctness can be established
+ * before any cache integration takes place.
+ */
+typedef enum {
+    HASH_SLOT_EMPTY = 0,
+    HASH_SLOT_OCCUPIED,
+    HASH_SLOT_DELETED
+} HashSlotState;
+
+typedef struct {
+    CacheKey key;
+    CacheEntry *entry;
+    HashSlotState state;
+} HashSlot;
+
+typedef struct {
+    HashSlot slots[HASH_TABLE_CAPACITY];
+    size_t size;
+} HashTable;
+
+/*
+ * Pedagogical Stage 7 hash function.
+ *
+ * A modulo hash keeps collision tests deterministic and easy to explain.
+ * Keys K and K + HASH_TABLE_CAPACITY intentionally collide.
+ */
+size_t hash_table_bucket(CacheKey key)
+{
+    return (size_t)(key % (CacheKey)HASH_TABLE_CAPACITY);
+}
+
+/* Initialize every slot as empty. Complexity: O(M), M = table capacity. */
+void hash_table_init(HashTable *table)
+{
+    size_t i;
+
+    if (table == NULL) {
+        return;
+    }
+
+    table->size = 0U;
+
+    for (i = 0U; i < HASH_TABLE_CAPACITY; ++i) {
+        table->slots[i].key = 0ULL;
+        table->slots[i].entry = NULL;
+        table->slots[i].state = HASH_SLOT_EMPTY;
+    }
+}
+
+/*
+ * Look up a key with open addressing and linear probing.
+ *
+ * Stop at an EMPTY slot because the key cannot occur later in that probe
+ * chain. A DELETED slot is a tombstone, so probing must continue through it.
+ *
+ * Expected/average complexity at controlled load: O(1)
+ * Worst case: O(M)
+ */
+CacheEntry *hash_table_lookup(const HashTable *table, CacheKey key)
+{
+    size_t start;
+    size_t probe;
+
+    if (table == NULL) {
+        return NULL;
+    }
+
+    start = hash_table_bucket(key);
+
+    for (probe = 0U; probe < HASH_TABLE_CAPACITY; ++probe) {
+        size_t index = (start + probe) % HASH_TABLE_CAPACITY;
+        const HashSlot *slot = &table->slots[index];
+
+        if (slot->state == HASH_SLOT_EMPTY) {
+            return NULL;
+        }
+
+        if (slot->state == HASH_SLOT_OCCUPIED && slot->key == key) {
+            return slot->entry;
+        }
+    }
+
+    return NULL;
+}
+
+/*
+ * Insert a key -> CacheEntry * mapping.
+ *
+ * Duplicate keys are rejected. The first tombstone encountered is remembered
+ * and reused if the key is not already present.
+ *
+ * Expected/average complexity at controlled load: O(1)
+ * Worst case: O(M)
+ */
+int hash_table_insert(HashTable *table, CacheEntry *entry)
+{
+    size_t start;
+    size_t probe;
+    size_t first_deleted = 0U;
+    int have_deleted = 0;
+
+    if (table == NULL || entry == NULL || table->size >= HASH_TABLE_CAPACITY) {
+        return 0;
+    }
+
+    start = hash_table_bucket(entry->key);
+
+    for (probe = 0U; probe < HASH_TABLE_CAPACITY; ++probe) {
+        size_t index = (start + probe) % HASH_TABLE_CAPACITY;
+        HashSlot *slot = &table->slots[index];
+
+        if (slot->state == HASH_SLOT_OCCUPIED) {
+            if (slot->key == entry->key) {
+                return 0;
+            }
+            continue;
+        }
+
+        if (slot->state == HASH_SLOT_DELETED) {
+            if (!have_deleted) {
+                first_deleted = index;
+                have_deleted = 1;
+            }
+            continue;
+        }
+
+        /* HASH_SLOT_EMPTY */
+        if (have_deleted) {
+            slot = &table->slots[first_deleted];
+        }
+
+        slot->key = entry->key;
+        slot->entry = entry;
+        slot->state = HASH_SLOT_OCCUPIED;
+        ++table->size;
+        return 1;
+    }
+
+    if (have_deleted) {
+        HashSlot *slot = &table->slots[first_deleted];
+
+        slot->key = entry->key;
+        slot->entry = entry;
+        slot->state = HASH_SLOT_OCCUPIED;
+        ++table->size;
+        return 1;
+    }
+
+    return 0;
+}
+
+/*
+ * Remove a mapping while preserving the probe chain with a tombstone.
+ *
+ * Expected/average complexity at controlled load: O(1)
+ * Worst case: O(M)
+ */
+int hash_table_remove(HashTable *table,
+                      CacheKey key,
+                      CacheEntry **removed_entry)
+{
+    size_t start;
+    size_t probe;
+
+    if (table == NULL) {
+        return 0;
+    }
+
+    start = hash_table_bucket(key);
+
+    for (probe = 0U; probe < HASH_TABLE_CAPACITY; ++probe) {
+        size_t index = (start + probe) % HASH_TABLE_CAPACITY;
+        HashSlot *slot = &table->slots[index];
+
+        if (slot->state == HASH_SLOT_EMPTY) {
+            return 0;
+        }
+
+        if (slot->state == HASH_SLOT_OCCUPIED && slot->key == key) {
+            if (removed_entry != NULL) {
+                *removed_entry = slot->entry;
+            }
+
+            slot->entry = NULL;
+            slot->state = HASH_SLOT_DELETED;
+            --table->size;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * Validate the standalone hash table without connecting it to Cache.
+ *
+ * The validator checks slot accounting and verifies that every occupied
+ * mapping can be found through the table's own lookup function.
+ */
+int hash_table_validate(const HashTable *table)
+{
+    size_t i;
+    size_t occupied = 0U;
+
+    if (table == NULL || table->size > HASH_TABLE_CAPACITY) {
+        return 0;
+    }
+
+    for (i = 0U; i < HASH_TABLE_CAPACITY; ++i) {
+        const HashSlot *slot = &table->slots[i];
+
+        if (slot->state == HASH_SLOT_OCCUPIED) {
+            if (slot->entry == NULL || slot->entry->key != slot->key) {
+                return 0;
+            }
+
+            if (hash_table_lookup(table, slot->key) != slot->entry) {
+                return 0;
+            }
+
+            ++occupied;
+        } else if (slot->state == HASH_SLOT_EMPTY) {
+            if (slot->entry != NULL) {
+                return 0;
+            }
+        } else if (slot->state == HASH_SLOT_DELETED) {
+            if (slot->entry != NULL) {
+                return 0;
+            }
+        } else {
+            return 0;
+        }
+    }
+
+    return occupied == table->size;
 }
 
 
@@ -506,6 +756,92 @@ int stage6_check_lookup_cost(Cache *cache,
     return check(passed, name);
 }
 
+
+/* ---------- Stage 7: independent hash-table validation ---------- */
+
+int stage7_run_hash_table_tests(void)
+{
+    HashTable table;
+    CacheEntry entries[7];
+    CacheEntry *found;
+    CacheEntry *removed = NULL;
+    size_t bucket_1;
+    size_t bucket_collision;
+    int passed = 1;
+
+    /*
+     * 1 and 1 + HASH_TABLE_CAPACITY deliberately collide under the Stage 7
+     * modulo hash. A third colliding key exercises tombstone reuse.
+     */
+    entries[0] = db_read_entry(10ULL);
+    entries[1] = db_read_entry(20ULL);
+    entries[2] = db_read_entry(30ULL);
+    entries[3] = db_read_entry(1ULL);
+    entries[4] = db_read_entry(1ULL + (CacheKey)HASH_TABLE_CAPACITY);
+    entries[5] = db_read_entry(1ULL + (2ULL * (CacheKey)HASH_TABLE_CAPACITY));
+    entries[6] = db_read_entry(20ULL); /* duplicate-key insertion attempt */
+
+    printf("\n=== Stage 7: standalone hash-table lookup ===\n");
+
+    hash_table_init(&table);
+    passed &= check(table.size == 0U && hash_table_validate(&table),
+                    "initialize empty hash table");
+
+    passed &= check(hash_table_insert(&table, &entries[0]),
+                    "hash insert key 10");
+    passed &= check(hash_table_insert(&table, &entries[1]),
+                    "hash insert key 20");
+    passed &= check(hash_table_insert(&table, &entries[2]),
+                    "hash insert key 30");
+    passed &= check(table.size == 3U && hash_table_validate(&table),
+                    "three hash mappings validate");
+
+    found = hash_table_lookup(&table, 20ULL);
+    passed &= check(found == &entries[1] && found->value == 2000ULL,
+                    "hash lookup finds key 20");
+    passed &= check(hash_table_lookup(&table, 99ULL) == NULL,
+                    "hash lookup reports missing key 99");
+
+    passed &= check(!hash_table_insert(&table, &entries[6]) &&
+                    table.size == 3U,
+                    "duplicate hash key is rejected");
+
+    /* Collision path: both keys begin at the same bucket. */
+    bucket_1 = hash_table_bucket(entries[3].key);
+    bucket_collision = hash_table_bucket(entries[4].key);
+    passed &= check(bucket_1 == bucket_collision,
+                    "collision test keys share initial bucket");
+    passed &= check(hash_table_insert(&table, &entries[3]),
+                    "insert first collision key");
+    passed &= check(hash_table_insert(&table, &entries[4]),
+                    "linear probing inserts colliding key");
+    passed &= check(hash_table_lookup(&table, entries[3].key) == &entries[3] &&
+                    hash_table_lookup(&table, entries[4].key) == &entries[4],
+                    "collision-chain lookups succeed");
+
+    /* Delete the first colliding key; lookup must continue through tombstone. */
+    passed &= check(hash_table_remove(&table, entries[3].key, &removed) &&
+                    removed == &entries[3],
+                    "remove first collision key");
+    passed &= check(hash_table_lookup(&table, entries[3].key) == NULL,
+                    "deleted hash key is absent");
+    passed &= check(hash_table_lookup(&table, entries[4].key) == &entries[4],
+                    "lookup crosses tombstone to colliding key");
+
+    /* A new key in the same collision family should reuse the tombstone. */
+    passed &= check(hash_table_insert(&table, &entries[5]),
+                    "insert reuses deleted collision slot");
+    passed &= check(hash_table_lookup(&table, entries[5].key) == &entries[5],
+                    "lookup finds tombstone-reuse entry");
+    passed &= check(hash_table_validate(&table),
+                    "final standalone hash table validates");
+
+    printf("Stage 7 hash-table validation: %s\n",
+           passed ? "PASS" : "FAIL");
+
+    return passed;
+}
+
 int main(void)
 {
     Cache cache;
@@ -518,7 +854,7 @@ int main(void)
     size_t i;
     int all_passed = 1;
 
-    printf("=== Stage 6: identify first bottleneck ===\n");
+    printf("=== Stage 6 regression: identified linear lookup bottleneck ===\n");
 
     /* Stage 5 regression: normal cache behavior remains correct. */
     all_passed &= check(cache_init(&cache, 3U),
@@ -609,7 +945,12 @@ int main(void)
 
     printf("\nStage 6 finding: cache_lookup() grows linearly with resident size.\n");
     printf("First bottleneck identified: O(N) key lookup.\n");
-    printf("Stage 6 validation: %s\n",
+    printf("Stage 6 regression validation: %s\n",
+           all_passed ? "PASS" : "FAIL");
+
+    all_passed &= stage7_run_hash_table_tests();
+
+    printf("\nStage 7 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;

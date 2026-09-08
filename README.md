@@ -1024,6 +1024,316 @@ No hash table, heap, tree, dynamic-rank update mechanism, concurrency support, o
 
 ---
 
+## Stage 7 — Test Hash-Table Lookup Independently
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 7 introduces a standalone hash table solely to validate key-based lookup behavior before changing the existing cache implementation.
+
+The important rule for this checkpoint is:
+
+> The hash table is **not connected to `Cache`, `cache_lookup()`, `cache_insert()`, or `cache_get()` yet**.
+
+Stage 6 proved that the current array-backed cache lookup is O(N). Stage 7 therefore tests the candidate O(1)-average lookup structure independently so hash-table correctness can be established before cache integration.
+
+### Standalone hash-table representation
+
+```c
+#define HASH_TABLE_CAPACITY 211U
+
+typedef enum {
+    HASH_SLOT_EMPTY = 0,
+    HASH_SLOT_OCCUPIED,
+    HASH_SLOT_DELETED
+} HashSlotState;
+
+typedef struct {
+    CacheKey key;
+    CacheEntry *entry;
+    HashSlotState state;
+} HashSlot;
+
+typedef struct {
+    HashSlot slots[HASH_TABLE_CAPACITY];
+    size_t size;
+} HashTable;
+```
+
+The table stores:
+
+```text
+key -> CacheEntry *
+```
+
+It uses **open addressing with linear probing**.
+
+The three slot states are required because deletion cannot simply turn a slot back into `EMPTY`. Doing so could break a collision probe chain and make later colliding keys unreachable.
+
+`HASH_SLOT_DELETED` therefore acts as a tombstone.
+
+### Hash function used at this checkpoint
+
+```c
+size_t hash_table_bucket(CacheKey key)
+{
+    return (size_t)(key % (CacheKey)HASH_TABLE_CAPACITY);
+}
+```
+
+This modulo hash is intentionally simple and deterministic for Stage 7.
+
+It makes collision tests easy to construct because:
+
+```text
+K
+K + HASH_TABLE_CAPACITY
+K + 2 * HASH_TABLE_CAPACITY
+```
+
+all begin at the same initial bucket.
+
+This is a correctness-oriented test hash, not a claim that this is the final production-quality hash function.
+
+### Functions introduced
+
+#### `hash_table_init()`
+
+```c
+void hash_table_init(HashTable *table);
+```
+
+Initializes every hash slot as `HASH_SLOT_EMPTY` and resets the table size to zero.
+
+Complexity:
+
+```text
+Time:  O(M)
+Space: O(1) additional
+```
+
+where `M` is the fixed hash-table capacity.
+
+#### `hash_table_bucket()`
+
+```c
+size_t hash_table_bucket(CacheKey key);
+```
+
+Calculates the starting bucket for a key.
+
+Complexity:
+
+```text
+O(1)
+```
+
+#### `hash_table_lookup()`
+
+```c
+CacheEntry *hash_table_lookup(const HashTable *table,
+                              CacheKey key);
+```
+
+Lookup behavior:
+
+1. compute the initial bucket,
+2. inspect the current slot,
+3. return the entry when the key matches,
+4. continue through `HASH_SLOT_DELETED` tombstones,
+5. continue probing on an occupied non-matching slot,
+6. stop on `HASH_SLOT_EMPTY`, because the key cannot occur later in that probe chain.
+
+Complexity at a controlled load factor:
+
+```text
+Expected/average: O(1)
+Worst case:       O(M)
+```
+
+The worst case occurs when clustering or high occupancy forces probing across much of the table.
+
+#### `hash_table_insert()`
+
+```c
+int hash_table_insert(HashTable *table,
+                      CacheEntry *entry);
+```
+
+Insertion:
+
+- rejects invalid arguments,
+- rejects duplicate keys,
+- uses linear probing on collisions,
+- remembers the first tombstone encountered,
+- reuses that tombstone when the key is not already present.
+
+Complexity:
+
+```text
+Expected/average: O(1)
+Worst case:       O(M)
+```
+
+#### `hash_table_remove()`
+
+```c
+int hash_table_remove(HashTable *table,
+                      CacheKey key,
+                      CacheEntry **removed_entry);
+```
+
+Deletion marks the slot as:
+
+```text
+HASH_SLOT_DELETED
+```
+
+rather than `HASH_SLOT_EMPTY` so later members of the same collision chain remain reachable.
+
+Complexity:
+
+```text
+Expected/average: O(1)
+Worst case:       O(M)
+```
+
+#### `hash_table_validate()`
+
+```c
+int hash_table_validate(const HashTable *table);
+```
+
+The standalone validator checks:
+
+- table size does not exceed capacity,
+- every occupied slot contains a non-NULL entry,
+- slot key matches the referenced entry key,
+- every occupied mapping can be found through `hash_table_lookup()`,
+- empty and deleted slots do not retain entry pointers,
+- counted occupied slots equal `table->size`.
+
+This validator exists for correctness testing only.
+
+---
+
+## Stage 7 Independent Validation
+
+The test intentionally begins with ordinary, non-colliding entries:
+
+```text
+key 10
+key 20
+key 30
+```
+
+It validates:
+
+```text
+insert 10
+insert 20
+insert 30
+lookup 20 -> HIT
+lookup 99 -> MISS
+duplicate insert 20 -> rejected
+```
+
+### Collision test
+
+With:
+
+```text
+HASH_TABLE_CAPACITY = 211
+```
+
+the keys:
+
+```text
+1
+212
+423
+```
+
+share the same initial bucket because:
+
+```text
+1   % 211 = 1
+212 % 211 = 1
+423 % 211 = 1
+```
+
+Stage 7 verifies:
+
+```text
+insert key 1
+insert key 212 through linear probing
+lookup key 1 succeeds
+lookup key 212 succeeds
+```
+
+### Tombstone test
+
+After deleting key `1`, the first collision slot becomes a tombstone.
+
+The important correctness test is:
+
+```text
+lookup key 212 still succeeds
+```
+
+If deletion incorrectly changed the slot to `EMPTY`, that lookup could terminate too early.
+
+Stage 7 then inserts key `423` and validates tombstone reuse.
+
+### Expected Stage 7 result
+
+```text
+=== Stage 7: standalone hash-table lookup ===
+[PASS] initialize empty hash table
+[PASS] hash insert key 10
+[PASS] hash insert key 20
+[PASS] hash insert key 30
+[PASS] three hash mappings validate
+[PASS] hash lookup finds key 20
+[PASS] hash lookup reports missing key 99
+[PASS] duplicate hash key is rejected
+[PASS] collision test keys share initial bucket
+[PASS] insert first collision key
+[PASS] linear probing inserts colliding key
+[PASS] collision-chain lookups succeed
+[PASS] remove first collision key
+[PASS] deleted hash key is absent
+[PASS] lookup crosses tombstone to colliding key
+[PASS] insert reuses deleted collision slot
+[PASS] lookup finds tombstone-reuse entry
+[PASS] final standalone hash table validates
+Stage 7 hash-table validation: PASS
+
+Stage 7 validation: PASS
+```
+
+### Stage 7 boundary
+
+At this checkpoint:
+
+```text
+existing Cache implementation
+        |
+        +--> still uses linear array lookup
+
+standalone HashTable
+        |
+        +--> independently tested
+        +--> NOT integrated into Cache
+```
+
+Therefore Stage 7 proves the candidate data structure but does not yet claim that cache lookup itself is O(1).
+
+No hash-table lookup is used by `cache_get()` in this stage.
+
+
+
+---
+
 ## Build Environment
 
 Current target environment:
@@ -1035,7 +1345,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache6
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache7
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -1051,26 +1361,22 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache6
+./ranked_cache7
 ```
 
 ### Expected result
 
-The active Stage 6 test suite must end with:
+The active Stage 7 test suite must end with:
 
 ```text
-Stage 6 validation: PASS
+Stage 7 validation: PASS
 ```
 
-and the final cache must be:
-
-```text
-cache = {1:50, 3:80, 4:70}
-```
+The Stage 7 hash table is standalone, so this checkpoint does not define a new cache-resident-set result.
 
 ### Validation result
 
-Stages 0 through 6 have been validated successfully. The active Stage 6 test returns exit status `0`, including the sanitizer validation build.
+Stages 0 through 7 have been validated successfully. The active Stage 7 test returns exit status `0`, including the sanitizer validation build.
 
 ---
 
@@ -1096,11 +1402,17 @@ At this commit, the program can:
 - validate cache structural invariants, and
 - assert valid structural state during development operations,
 - count linear lookup calls, hits, misses, and key comparisons, and
-- demonstrate lookup work growing linearly with resident cache size.
+- demonstrate lookup work growing linearly with resident cache size,
+- initialize and validate a standalone open-addressed hash table,
+- insert standalone key-to-entry mappings,
+- perform standalone hash-table hit/miss lookup,
+- resolve collisions with linear probing,
+- delete mappings using tombstones, and
+- preserve collision-chain lookup across deleted slots.
 
 At this commit, the program intentionally does **not** implement:
 
-- optimized key lookup,
+- hash-table integration with the cache lookup path,
 - optimized rank ordering,
 - dynamic rank updates,
 - optimized lookup implementation, or
@@ -1126,11 +1438,18 @@ cache_get() hit               O(N)
 cache_get() miss              O(N) + DB-read cost
 cache_validate()              O(N^2) debug/correctness check
 lookup-stat counter update    O(1) per comparison
+hash_table_bucket()           O(1)
+hash_table_lookup()           O(1) expected, O(M) worst case
+hash_table_insert()           O(1) expected, O(M) worst case
+hash_table_remove()           O(1) expected, O(M) worst case
+hash table storage            O(M)
 additional working space      O(1)
 resident cache storage        O(K)
 ```
 
-Stage 6 directly confirms that a missing lookup performs exactly N key comparisons for N resident entries. The first algorithmic bottleneck is therefore the O(N) linear key lookup. In assertion-enabled builds, the O(N²) invariant validator can still dominate wall-clock runtime; it remains a correctness aid rather than a production lookup mechanism.
+Stage 6 directly confirms that a missing cache lookup performs exactly N key comparisons for N resident entries. The first algorithmic bottleneck is therefore the O(N) linear cache lookup.
+
+Stage 7 independently validates a hash table whose expected lookup complexity is O(1) at a controlled load factor, but the cache itself still uses the Stage 6 linear lookup. Therefore the cache complexity has not changed yet. In assertion-enabled builds, the O(N²) invariant validator can still dominate wall-clock runtime; it remains a correctness aid rather than a production lookup mechanism.
 
 ---
 
@@ -1228,5 +1547,20 @@ LOOKUP INSTRUMENTATION PASS
 FIRST/MIDDLE/LAST LOOKUP PROFILE PASS
 MISSING-LOOKUP SCALING PASS
 O(N) LOOKUP BOTTLENECK CONFIRMED
+ASAN/UBSAN PASS
+
+Stage 7
+Standalone hash-table lookup validation
+COMPLETE
+BUILD PASS
+RUN PASS
+HASH INSERT PASS
+HASH HIT/MISS LOOKUP PASS
+DUPLICATE-KEY REJECTION PASS
+COLLISION/LINEAR-PROBING PASS
+TOMBSTONE DELETE PASS
+TOMBSTONE-CHAIN LOOKUP PASS
+TOMBSTONE REUSE PASS
+HASH-TABLE VALIDATOR PASS
 ASAN/UBSAN PASS
 ```
