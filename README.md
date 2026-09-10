@@ -1332,6 +1332,145 @@ No hash-table lookup is used by `cache_get()` in this stage.
 
 
 
+
+---
+
+## Stage 8 — Identify the Second Bottleneck
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 8 does not change the cache algorithm. It instruments the existing
+minimum-rank victim-selection path so its cost can be measured exactly.
+
+After Stage 6 identified O(N) key lookup as the first bottleneck and Stage 7
+validated a standalone hash table independently, the next remaining linear
+operation in the current cache is:
+
+```c
+cache_find_min_rank_index()
+```
+
+This function selects the eviction victim by scanning every resident entry's
+rank.
+
+### Stage 8 instrumentation
+
+Stage 8 adds diagnostic counters:
+
+```c
+typedef struct {
+    uint64_t min_scan_calls;
+    uint64_t rank_comparisons;
+} MinRankStats;
+```
+
+with:
+
+```c
+void min_rank_stats_reset(void);
+MinRankStats min_rank_stats_snapshot(void);
+```
+
+The counters do not alter rank ordering, eviction policy, or the cache data
+structure.
+
+### Why the expected comparison count is N - 1
+
+For a non-empty cache containing `N` resident entries, index `0` becomes the
+initial candidate. The function then compares entries `1` through `N - 1`
+against the current candidate.
+
+Therefore:
+
+```text
+rank comparisons = N - 1
+```
+
+regardless of whether the true minimum is located at the beginning, middle,
+or end of the resident array.
+
+### Victim-position experiment
+
+For a 100-entry cache, Stage 8 explicitly moves the unique minimum rank to
+three different positions.
+
+Expected result:
+
+| Minimum location | Resident entries | Rank comparisons |
+|---|---:|---:|
+| first | 100 | 99 |
+| middle | 100 | 99 |
+| last | 100 | 99 |
+
+This demonstrates that finding the minimum cannot terminate early in the
+current representation.
+
+### Scaling experiment
+
+Stage 8 measures minimum-rank selection with resident sizes:
+
+```text
+1
+10
+25
+50
+100
+```
+
+Expected exact counts:
+
+| N | Rank comparisons |
+|---:|---:|
+| 1 | 0 |
+| 10 | 9 |
+| 25 | 24 |
+| 50 | 49 |
+| 100 | 99 |
+
+The measured work grows directly with resident size.
+
+### Stage 8 finding
+
+The second algorithmic bottleneck is therefore:
+
+```text
+cache_find_min_rank_index() = O(N)
+```
+
+The eviction path remains:
+
+```text
+minimum-rank victim selection    O(N)
+known-slot removal               O(1)
+-------------------------------------
+overall minimum-rank eviction    O(N)
+```
+
+This stage identifies the bottleneck only. It does not introduce a heap,
+tree, ordered structure, hash-table/cache integration, or any replacement
+victim-selection algorithm.
+
+### Build
+
+```bash
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache8
+```
+
+### Sanitizer build
+
+```bash
+gcc -Wall -Wextra -Wpedantic -std=c11 -O0 -g3 \
+    -fsanitize=address,undefined ranked_cache.c -o ranked_cache8_san
+```
+
+### Expected checkpoint result
+
+```text
+Second bottleneck identified: O(N) minimum-rank victim selection.
+Known-slot removal remains O(1); eviction overall remains O(N).
+Stage 8 validation: PASS
+```
+
 ---
 
 ## Build Environment
@@ -1449,7 +1588,7 @@ resident cache storage        O(K)
 
 Stage 6 directly confirms that a missing cache lookup performs exactly N key comparisons for N resident entries. The first algorithmic bottleneck is therefore the O(N) linear cache lookup.
 
-Stage 7 independently validates a hash table whose expected lookup complexity is O(1) at a controlled load factor, but the cache itself still uses the Stage 6 linear lookup. Therefore the cache complexity has not changed yet. In assertion-enabled builds, the O(N²) invariant validator can still dominate wall-clock runtime; it remains a correctness aid rather than a production lookup mechanism.
+Stage 7 independently validates a hash table whose expected lookup complexity is O(1) at a controlled load factor, but the cache itself still uses the Stage 6 linear lookup. Stage 8 additionally proves that minimum-rank victim selection performs N-1 rank comparisons for N residents, so the current eviction path remains O(N). No optimization has been integrated yet. In assertion-enabled builds, the O(N²) invariant validator can still dominate wall-clock runtime; it remains a correctness aid rather than a production lookup mechanism.
 
 ---
 
@@ -1562,5 +1701,17 @@ TOMBSTONE DELETE PASS
 TOMBSTONE-CHAIN LOOKUP PASS
 TOMBSTONE REUSE PASS
 HASH-TABLE VALIDATOR PASS
+ASAN/UBSAN PASS
+
+
+Stage 8
+Second bottleneck identification
+COMPLETE
+BUILD PASS
+RUN PASS
+MINIMUM-POSITION PROFILE PASS
+MINIMUM-RANK SCALING PASS
+O(N) VICTIM-SELECTION BOTTLENECK CONFIRMED
+KNOWN-SLOT REMOVAL REMAINS O(1)
 ASAN/UBSAN PASS
 ```

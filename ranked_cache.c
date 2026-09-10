@@ -11,6 +11,7 @@
  *   Stage 5 - assertions and cache invariants
  *   Stage 6 - identify the first bottleneck with lookup instrumentation
  *   Stage 7 - standalone hash-table lookup validation
+ *   Stage 8 - identify the second bottleneck with rank-scan instrumentation
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
@@ -27,6 +28,10 @@
  * Stage 7 introduces a standalone hash table and validates its lookup, insert,
  * collision, deletion, and tombstone behavior independently. The hash table is
  * deliberately not connected to Cache or cache_get() yet.
+ *
+ * Stage 8 does not optimize eviction. It instruments the existing linear
+ * minimum-rank scan so the second bottleneck can be demonstrated with exact
+ * rank-comparison counts.
  */
 
 #include <stdio.h>
@@ -88,6 +93,27 @@ void lookup_stats_reset(void)
 LookupStats lookup_stats_snapshot(void)
 {
     return g_lookup_stats;
+}
+
+
+/* ---------- Stage 8: minimum-rank scan instrumentation ---------- */
+
+typedef struct {
+    uint64_t min_scan_calls;
+    uint64_t rank_comparisons;
+} MinRankStats;
+
+static MinRankStats g_min_rank_stats;
+
+void min_rank_stats_reset(void)
+{
+    g_min_rank_stats.min_scan_calls = 0U;
+    g_min_rank_stats.rank_comparisons = 0U;
+}
+
+MinRankStats min_rank_stats_snapshot(void)
+{
+    return g_min_rank_stats;
 }
 
 
@@ -537,9 +563,11 @@ int cache_find_min_rank_index(const Cache *cache, size_t *min_index)
     }
 
     cache_assert_invariants(cache);
+    ++g_min_rank_stats.min_scan_calls;
     candidate = 0U;
 
     for (i = 1U; i < cache->size; ++i) {
+        ++g_min_rank_stats.rank_comparisons;
         if (cache->entries[i].rank < cache->entries[candidate].rank) {
             candidate = i;
         }
@@ -842,6 +870,139 @@ int stage7_run_hash_table_tests(void)
     return passed;
 }
 
+
+/* ---------- Stage 8: identify second bottleneck ---------- */
+
+/*
+ * Prepare a valid cache whose minimum rank appears at a chosen array index.
+ * Every other rank is intentionally larger. This lets Stage 8 prove that
+ * minimum-rank search still scans the full resident set regardless of where
+ * the minimum happens to reside.
+ */
+int stage8_prepare_rank_profile(Cache *cache,
+                                size_t count,
+                                size_t min_position)
+{
+    size_t i;
+
+    if (cache == NULL || count == 0U || count > MAX_CACHE_CAPACITY ||
+        min_position >= count) {
+        return 0;
+    }
+
+    if (!cache_init(cache, count)) {
+        return 0;
+    }
+
+    for (i = 0U; i < count; ++i) {
+        CacheKey key = (CacheKey)(i + 1U);
+
+        cache->entries[i].key = key;
+        cache->entries[i].value = key * 100ULL;
+        cache->entries[i].rank = (Rank)(1000LL + (long long)i);
+    }
+
+    cache->entries[min_position].rank = -1LL;
+    cache->size = count;
+    cache_assert_invariants(cache);
+    return 1;
+}
+
+/*
+ * Run one minimum-rank search and verify both the selected victim and the
+ * exact number of rank comparisons. A linear scan over N residents compares
+ * entries 1..N-1 against the current candidate, so it performs N-1 rank
+ * comparisons for every non-empty cache regardless of victim position.
+ */
+int stage8_check_min_scan(Cache *cache,
+                          size_t expected_min_position,
+                          uint64_t expected_comparisons,
+                          const char *name)
+{
+    size_t min_index = 0U;
+    MinRankStats stats;
+    int found;
+    int passed;
+
+    min_rank_stats_reset();
+    found = cache_find_min_rank_index(cache, &min_index);
+    stats = min_rank_stats_snapshot();
+
+    passed = (found &&
+              min_index == expected_min_position &&
+              stats.min_scan_calls == 1U &&
+              stats.rank_comparisons == expected_comparisons);
+
+    printf("[PROFILE] %-30s size=%zu comparisons=%llu min-index=%zu\n",
+           name,
+           cache->size,
+           (unsigned long long)stats.rank_comparisons,
+           min_index);
+
+    return check(passed, name);
+}
+
+int stage8_run_min_rank_bottleneck_tests(void)
+{
+    Cache profile;
+    MinRankStats stats;
+    size_t min_index;
+    size_t sizes[] = {1U, 10U, 25U, 50U, 100U};
+    size_t i;
+    int passed = 1;
+
+    printf("\n=== Stage 8: identify second bottleneck ===\n");
+
+    /* Same N, different victim positions: scan cost must stay N-1. */
+    passed &= check(stage8_prepare_rank_profile(&profile, 100U, 0U),
+                    "prepare minimum-at-first profile");
+    passed &= stage8_check_min_scan(&profile, 0U, 99U,
+                                    "minimum at first entry");
+
+    passed &= check(stage8_prepare_rank_profile(&profile, 100U, 49U),
+                    "prepare minimum-at-middle profile");
+    passed &= stage8_check_min_scan(&profile, 49U, 99U,
+                                    "minimum at middle entry");
+
+    passed &= check(stage8_prepare_rank_profile(&profile, 100U, 99U),
+                    "prepare minimum-at-last profile");
+    passed &= stage8_check_min_scan(&profile, 99U, 99U,
+                                    "minimum at last entry");
+
+    /* Scale N while keeping a valid unique cache. */
+    printf("\nStage 8 minimum-rank scaling:\n");
+    printf("  size    rank-comparisons\n");
+
+    for (i = 0U; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+        size_t n = sizes[i];
+
+        passed &= check(stage8_prepare_rank_profile(&profile, n, n - 1U),
+                        "prepare rank-scaling cache");
+
+        min_rank_stats_reset();
+        min_index = 0U;
+        passed &= cache_find_min_rank_index(&profile, &min_index);
+        stats = min_rank_stats_snapshot();
+
+        printf("  %4zu    %llu\n",
+               n,
+               (unsigned long long)stats.rank_comparisons);
+
+        passed &= check(min_index == n - 1U &&
+                        stats.min_scan_calls == 1U &&
+                        stats.rank_comparisons == (uint64_t)(n - 1U),
+                        "minimum-rank comparisons equal N-1");
+    }
+
+    printf("\nStage 8 finding: cache_find_min_rank_index() scans all residents.\n");
+    printf("Second bottleneck identified: O(N) minimum-rank victim selection.\n");
+    printf("Known-slot removal remains O(1); eviction overall remains O(N).\n");
+    printf("Stage 8 minimum-rank validation: %s\n",
+           passed ? "PASS" : "FAIL");
+
+    return passed;
+}
+
 int main(void)
 {
     Cache cache;
@@ -950,7 +1111,12 @@ int main(void)
 
     all_passed &= stage7_run_hash_table_tests();
 
-    printf("\nStage 7 validation: %s\n",
+    printf("\nStage 7 regression validation: %s\n",
+           all_passed ? "PASS" : "FAIL");
+
+    all_passed &= stage8_run_min_rank_bottleneck_tests();
+
+    printf("\nStage 8 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;
