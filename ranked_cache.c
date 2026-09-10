@@ -12,6 +12,7 @@
  *   Stage 6 - identify the first bottleneck with lookup instrumentation
  *   Stage 7 - standalone hash-table lookup validation
  *   Stage 8 - identify the second bottleneck with rank-scan instrumentation
+ *   Stage 9 - standalone binary min-heap validation
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
@@ -32,6 +33,9 @@
  * Stage 8 does not optimize eviction. It instruments the existing linear
  * minimum-rank scan so the second bottleneck can be demonstrated with exact
  * rank-comparison counts.
+ *
+ * Stage 9 introduces and tests a standalone array-backed binary min-heap.
+ * The heap is deliberately not connected to Cache, cache_get(), or eviction.
  */
 
 #include <stdio.h>
@@ -871,6 +875,271 @@ int stage7_run_hash_table_tests(void)
 }
 
 
+/* ---------- Stage 9: standalone binary min-heap ---------- */
+
+/*
+ * Stage 9 validates a binary min-heap independently before any cache
+ * integration. The heap stores pointers to CacheEntry objects and orders them
+ * by rank. Equal ranks are broken deterministically by key.
+ */
+typedef struct {
+    CacheEntry *items[MAX_CACHE_CAPACITY];
+    size_t size;
+} MinHeap;
+
+/* Return non-zero when a should appear before b in the min-heap. */
+int min_heap_entry_less(const CacheEntry *a, const CacheEntry *b)
+{
+    if (a->rank != b->rank) {
+        return a->rank < b->rank;
+    }
+
+    return a->key < b->key;
+}
+
+void min_heap_init(MinHeap *heap)
+{
+    size_t i;
+
+    if (heap == NULL) {
+        return;
+    }
+
+    heap->size = 0U;
+    for (i = 0U; i < MAX_CACHE_CAPACITY; ++i) {
+        heap->items[i] = NULL;
+    }
+}
+
+void min_heap_swap(MinHeap *heap, size_t a, size_t b)
+{
+    CacheEntry *tmp = heap->items[a];
+    heap->items[a] = heap->items[b];
+    heap->items[b] = tmp;
+}
+
+void min_heap_sift_up(MinHeap *heap, size_t index)
+{
+    while (index > 0U) {
+        size_t parent = (index - 1U) / 2U;
+
+        if (!min_heap_entry_less(heap->items[index], heap->items[parent])) {
+            break;
+        }
+
+        min_heap_swap(heap, index, parent);
+        index = parent;
+    }
+}
+
+void min_heap_sift_down(MinHeap *heap, size_t index)
+{
+    for (;;) {
+        size_t left = 2U * index + 1U;
+        size_t right = left + 1U;
+        size_t smallest = index;
+
+        if (left < heap->size &&
+            min_heap_entry_less(heap->items[left], heap->items[smallest])) {
+            smallest = left;
+        }
+
+        if (right < heap->size &&
+            min_heap_entry_less(heap->items[right], heap->items[smallest])) {
+            smallest = right;
+        }
+
+        if (smallest == index) {
+            break;
+        }
+
+        min_heap_swap(heap, index, smallest);
+        index = smallest;
+    }
+}
+
+/*
+ * Insert one entry pointer and restore heap order by bubbling upward.
+ * Complexity: O(log N) worst case.
+ */
+int min_heap_push(MinHeap *heap, CacheEntry *entry)
+{
+    size_t index;
+
+    if (heap == NULL || entry == NULL || heap->size >= MAX_CACHE_CAPACITY) {
+        return 0;
+    }
+
+    index = heap->size;
+    heap->items[index] = entry;
+    ++heap->size;
+    min_heap_sift_up(heap, index);
+    return 1;
+}
+
+/*
+ * Return the minimum-ranked entry without removing it.
+ * Complexity: O(1).
+ */
+CacheEntry *min_heap_peek(const MinHeap *heap)
+{
+    if (heap == NULL || heap->size == 0U) {
+        return NULL;
+    }
+
+    return heap->items[0];
+}
+
+/*
+ * Remove and return the root. Move the last item to the root and repair the
+ * heap downward. Complexity: O(log N) worst case.
+ */
+CacheEntry *min_heap_pop_min(MinHeap *heap)
+{
+    CacheEntry *minimum;
+
+    if (heap == NULL || heap->size == 0U) {
+        return NULL;
+    }
+
+    minimum = heap->items[0];
+    --heap->size;
+
+    if (heap->size > 0U) {
+        heap->items[0] = heap->items[heap->size];
+        heap->items[heap->size] = NULL;
+        min_heap_sift_down(heap, 0U);
+    } else {
+        heap->items[0] = NULL;
+    }
+
+    return minimum;
+}
+
+/*
+ * Verify the binary min-heap invariant:
+ * every parent is <= each existing child according to rank/key ordering.
+ * Used only by Stage 9 tests.
+ */
+int min_heap_validate(const MinHeap *heap)
+{
+    size_t i;
+
+    if (heap == NULL || heap->size > MAX_CACHE_CAPACITY) {
+        return 0;
+    }
+
+    for (i = 0U; i < heap->size; ++i) {
+        size_t left = 2U * i + 1U;
+        size_t right = left + 1U;
+
+        if (heap->items[i] == NULL) {
+            return 0;
+        }
+
+        if (left < heap->size &&
+            min_heap_entry_less(heap->items[left], heap->items[i])) {
+            return 0;
+        }
+
+        if (right < heap->size &&
+            min_heap_entry_less(heap->items[right], heap->items[i])) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+int stage9_run_min_heap_tests(void)
+{
+    MinHeap heap;
+    CacheEntry entries[] = {
+        {1ULL, 100ULL, 50LL},
+        {2ULL, 200ULL, 20LL},
+        {3ULL, 300ULL, 80LL},
+        {4ULL, 400ULL, 10LL},
+        {5ULL, 500ULL, 60LL},
+        {6ULL, 600ULL, 20LL}
+    };
+    const Rank expected_ranks[] = {10LL, 20LL, 20LL, 50LL, 60LL, 80LL};
+    const CacheKey expected_keys[] = {4ULL, 2ULL, 6ULL, 1ULL, 5ULL, 3ULL};
+    size_t i;
+    int passed = 1;
+
+    printf("\n=== Stage 9: standalone binary min-heap ===\n");
+
+    min_heap_init(&heap);
+    passed &= check(heap.size == 0U && min_heap_peek(&heap) == NULL,
+                    "initialize empty min-heap");
+    passed &= check(min_heap_pop_min(&heap) == NULL,
+                    "pop from empty min-heap returns NULL");
+    passed &= check(min_heap_validate(&heap),
+                    "empty min-heap validates");
+
+    /* Insert ranks 50,20,80,10,60 plus an equal-rank tie at rank 20. */
+    for (i = 0U; i < sizeof(entries) / sizeof(entries[0]); ++i) {
+        passed &= check(min_heap_push(&heap, &entries[i]),
+                        "push entry into min-heap");
+        passed &= check(min_heap_validate(&heap),
+                        "heap invariant holds after push");
+    }
+
+    passed &= check(min_heap_peek(&heap) == &entries[3] &&
+                    min_heap_peek(&heap)->rank == 10LL,
+                    "peek returns minimum rank 10");
+
+    printf("Stage 9 pop order:\n");
+    for (i = 0U; i < sizeof(expected_ranks) / sizeof(expected_ranks[0]); ++i) {
+        CacheEntry *entry = min_heap_pop_min(&heap);
+
+        if (entry != NULL) {
+            printf("  pop %zu -> key=%llu rank=%lld\n",
+                   i + 1U,
+                   entry->key,
+                   entry->rank);
+        }
+
+        passed &= check(entry != NULL &&
+                        entry->rank == expected_ranks[i] &&
+                        entry->key == expected_keys[i],
+                        "pop order is ascending rank/key");
+        passed &= check(min_heap_validate(&heap),
+                        "heap invariant holds after pop");
+    }
+
+    passed &= check(heap.size == 0U && min_heap_peek(&heap) == NULL,
+                    "heap is empty after all pops");
+
+    /* Capacity guard: fill the heap, then reject one additional insertion. */
+    min_heap_init(&heap);
+    {
+        CacheEntry full_entries[MAX_CACHE_CAPACITY];
+        CacheEntry extra = {9999ULL, 999900ULL, -9999LL};
+
+        for (i = 0U; i < MAX_CACHE_CAPACITY; ++i) {
+            full_entries[i].key = (CacheKey)(1000U + i);
+            full_entries[i].value = full_entries[i].key * 100ULL;
+            full_entries[i].rank = (Rank)(1000LL - (long long)i);
+            passed &= min_heap_push(&heap, &full_entries[i]);
+        }
+
+        passed &= check(heap.size == MAX_CACHE_CAPACITY &&
+                        min_heap_validate(&heap),
+                        "heap accepts exactly MAX_CACHE_CAPACITY entries");
+        passed &= check(!min_heap_push(&heap, &extra),
+                        "heap rejects insertion beyond capacity");
+    }
+
+    printf("Stage 9 heap finding: minimum is heap[0] in O(1); push/pop are O(log N).\n");
+    printf("Stage 9 heap remains standalone and is not used by cache eviction.\n");
+    printf("Stage 9 min-heap validation: %s\n",
+           passed ? "PASS" : "FAIL");
+
+    return passed;
+}
+
+
 /* ---------- Stage 8: identify second bottleneck ---------- */
 
 /*
@@ -1116,7 +1385,12 @@ int main(void)
 
     all_passed &= stage8_run_min_rank_bottleneck_tests();
 
-    printf("\nStage 8 validation: %s\n",
+    printf("\nStage 8 regression validation: %s\n",
+           all_passed ? "PASS" : "FAIL");
+
+    all_passed &= stage9_run_min_heap_tests();
+
+    printf("\nStage 9 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;

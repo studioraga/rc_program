@@ -1473,6 +1473,228 @@ Stage 8 validation: PASS
 
 ---
 
+## Stage 9 — Standalone Binary Min-Heap
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 9 introduces an array-backed binary min-heap and tests it independently.
+The heap is deliberately **not connected** to `Cache`, `cache_get()`,
+`cache_evict_min()`, or the Stage 7 hash table at this checkpoint.
+
+The purpose is to validate the candidate data structure for efficient
+minimum-rank access before any cache integration is attempted.
+
+### Heap representation
+
+```c
+typedef struct {
+    CacheEntry *items[MAX_CACHE_CAPACITY];
+    size_t size;
+} MinHeap;
+```
+
+The heap stores pointers to existing `CacheEntry` objects. Index `0` is the
+minimum-ranked entry whenever the heap invariant holds.
+
+For array index `i`:
+
+```text
+parent = (i - 1) / 2
+left   = 2*i + 1
+right  = 2*i + 2
+```
+
+### Ordering rule
+
+Entries are primarily ordered by ascending rank.
+
+For deterministic equal-rank behavior, key is used as a secondary ordering
+field:
+
+```text
+(rank_a < rank_b)
+    or
+(rank_a == rank_b and key_a < key_b)
+```
+
+This does not change the original cache policy; it only gives the standalone
+heap test a deterministic tie result.
+
+### Functions introduced
+
+#### `min_heap_init()`
+
+Initializes an empty heap.
+
+```text
+Time:  O(M)
+```
+
+where `M = MAX_CACHE_CAPACITY`, because the current educational
+implementation clears every pointer slot.
+
+#### `min_heap_entry_less()`
+
+Compares two entries by rank and then key.
+
+```text
+Time: O(1)
+```
+
+#### `min_heap_swap()`
+
+Swaps two heap pointers.
+
+```text
+Time: O(1)
+```
+
+#### `min_heap_sift_up()`
+
+Repairs heap order after insertion by repeatedly comparing a node with its
+parent and moving it upward when necessary.
+
+```text
+Worst case: O(log N)
+```
+
+#### `min_heap_sift_down()`
+
+Repairs heap order after root replacement by repeatedly selecting the smaller
+child and moving downward when necessary.
+
+```text
+Worst case: O(log N)
+```
+
+#### `min_heap_push()`
+
+Appends an entry pointer at the end of the heap and restores ordering with
+`sift_up`.
+
+```text
+Worst case: O(log N)
+```
+
+#### `min_heap_peek()`
+
+Returns `items[0]` without removing it.
+
+```text
+Time: O(1)
+```
+
+This is the key property Stage 9 is intended to validate: the minimum-ranked
+entry is directly accessible at the heap root.
+
+#### `min_heap_pop_min()`
+
+Removes the root, moves the final heap element to index `0`, and restores heap
+order using `sift_down`.
+
+```text
+Worst case: O(log N)
+```
+
+#### `min_heap_validate()`
+
+Checks the standalone heap invariant: no child may compare smaller than its
+parent.
+
+```text
+Time: O(N)
+```
+
+This validator is test/debug logic and is not part of the heap operation's
+production complexity.
+
+---
+
+## Stage 9 Independent Validation
+
+The focused ordering test inserts entries with ranks:
+
+```text
+50, 20, 80, 10, 60, 20
+```
+
+The second rank `20` is intentional so equal-rank tie behavior is also tested.
+
+After all insertions:
+
+```text
+min_heap_peek() -> key=4 rank=10
+```
+
+Repeated `min_heap_pop_min()` calls must produce:
+
+```text
+key=4 rank=10
+key=2 rank=20
+key=6 rank=20
+key=1 rank=50
+key=5 rank=60
+key=3 rank=80
+```
+
+The heap invariant is checked after every push and every pop.
+
+Stage 9 additionally validates:
+
+- empty heap initialization,
+- `peek` on an empty heap,
+- `pop` on an empty heap,
+- heap invariant after every insertion,
+- heap invariant after every removal,
+- deterministic equal-rank ordering,
+- complete ascending pop order,
+- empty state after all removals,
+- accepting exactly `MAX_CACHE_CAPACITY` entries, and
+- rejecting insertion beyond capacity.
+
+### Stage 9 finding
+
+The standalone heap demonstrates:
+
+```text
+minimum access     O(1)
+insert             O(log N)
+remove minimum     O(log N)
+heap storage       O(K)
+```
+
+This directly addresses the data-structure capability that was missing when
+Stage 8 proved the existing array-based victim selection was O(N).
+
+However, **Stage 9 does not replace the existing eviction path**.
+`cache_find_min_rank_index()` and `cache_evict_min()` continue to behave exactly
+as they did in Stage 8.
+
+### Build
+
+```bash
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache9
+```
+
+### Sanitizer build
+
+```bash
+gcc -Wall -Wextra -Wpedantic -std=c11 \
+    -O0 -g3 -fsanitize=address,undefined \
+    ranked_cache.c -o ranked_cache9_san
+```
+
+### Expected checkpoint result
+
+```text
+Stage 8 regression validation: PASS
+Stage 9 min-heap validation: PASS
+Stage 9 validation: PASS
+```
+
+
+---
+
 ## Build Environment
 
 Current target environment:
@@ -1484,7 +1706,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache7
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache9
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -1500,22 +1722,22 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache7
+./ranked_cache9
 ```
 
 ### Expected result
 
-The active Stage 7 test suite must end with:
+The active Stage 9 test suite must end with:
 
 ```text
-Stage 7 validation: PASS
+Stage 9 validation: PASS
 ```
 
-The Stage 7 hash table is standalone, so this checkpoint does not define a new cache-resident-set result.
+The Stage 9 heap is standalone, so this checkpoint does not replace the existing cache eviction path.
 
 ### Validation result
 
-Stages 0 through 7 have been validated successfully. The active Stage 7 test returns exit status `0`, including the sanitizer validation build.
+Stages 0 through 9 have been validated successfully. The active Stage 9 test returns exit status `0`, including the sanitizer validation build.
 
 ---
 
@@ -1582,13 +1804,18 @@ hash_table_lookup()           O(1) expected, O(M) worst case
 hash_table_insert()           O(1) expected, O(M) worst case
 hash_table_remove()           O(1) expected, O(M) worst case
 hash table storage            O(M)
+min_heap_peek()               O(1)
+min_heap_push()               O(log N) worst case
+min_heap_pop_min()            O(log N) worst case
+min_heap_validate()           O(N) test/debug check
+standalone heap storage       O(K)
 additional working space      O(1)
 resident cache storage        O(K)
 ```
 
 Stage 6 directly confirms that a missing cache lookup performs exactly N key comparisons for N resident entries. The first algorithmic bottleneck is therefore the O(N) linear cache lookup.
 
-Stage 7 independently validates a hash table whose expected lookup complexity is O(1) at a controlled load factor, but the cache itself still uses the Stage 6 linear lookup. Stage 8 additionally proves that minimum-rank victim selection performs N-1 rank comparisons for N residents, so the current eviction path remains O(N). No optimization has been integrated yet. In assertion-enabled builds, the O(N²) invariant validator can still dominate wall-clock runtime; it remains a correctness aid rather than a production lookup mechanism.
+Stage 7 independently validates a hash table whose expected lookup complexity is O(1) at a controlled load factor, but the cache itself still uses the Stage 6 linear lookup. Stage 8 proves that minimum-rank victim selection performs N-1 rank comparisons for N residents, so the current eviction path remains O(N). Stage 9 now independently validates an array-backed binary min-heap with O(1) minimum access and O(log N) push/pop, but that heap is not yet integrated with the cache. In assertion-enabled builds, the O(N²) invariant validator can still dominate wall-clock runtime; it remains a correctness aid rather than a production lookup mechanism.
 
 ---
 
@@ -1713,5 +1940,20 @@ MINIMUM-POSITION PROFILE PASS
 MINIMUM-RANK SCALING PASS
 O(N) VICTIM-SELECTION BOTTLENECK CONFIRMED
 KNOWN-SLOT REMOVAL REMAINS O(1)
+ASAN/UBSAN PASS
+
+Stage 9
+Standalone binary min-heap validation
+COMPLETE
+BUILD PASS
+RUN PASS
+EMPTY-HEAP GUARDS PASS
+HEAP PUSH PASS
+HEAP PEEK-MIN PASS
+HEAP POP-MIN PASS
+HEAP INVARIANT PASS
+EQUAL-RANK TIE PASS
+ASCENDING POP ORDER PASS
+CAPACITY GUARD PASS
 ASAN/UBSAN PASS
 ```
