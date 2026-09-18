@@ -1673,7 +1673,7 @@ as they did in Stage 8.
 ### Build
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache9
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache10
 ```
 
 ### Sanitizer build
@@ -1695,6 +1695,292 @@ Stage 9 validation: PASS
 
 ---
 
+## Stage 10 — Combine Hash Table + Min-Heap for Part 1
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 10 combines the independently validated Stage 7 hash table and Stage 9 binary min-heap into a new fixed-rank Part 1 cache path.
+
+The earlier linear `Cache` implementation remains in the program as a regression/reference implementation. Stage 10 does not rewrite or remove the previous stages.
+
+### Part 1 requirement
+
+For Part 1, an entry's rank does not change while it remains cached.
+
+That allows the integrated structure to use:
+
+```text
+HashTable
+    key -> CacheEntry *
+
+MinHeap
+    minimum rank at heap[0]
+
+Stable resident storage
+    CacheEntry entries[MAX_CACHE_CAPACITY]
+```
+
+A cache hit therefore needs only a hash lookup. Because rank is fixed, no heap repair is required on a hit.
+
+### Integrated representation
+
+```c
+typedef struct {
+    CacheEntry entries[MAX_CACHE_CAPACITY];
+    unsigned char active[MAX_CACHE_CAPACITY];
+    size_t free_stack[MAX_CACHE_CAPACITY];
+    size_t free_count;
+    size_t size;
+    size_t capacity;
+    HashTable index;
+    MinHeap min_heap;
+} Part1Cache;
+```
+
+The roles are:
+
+| Field | Purpose |
+|---|---|
+| `entries` | stable storage for resident `CacheEntry` objects |
+| `active` | marks live resident slots |
+| `free_stack` | reusable slot indices |
+| `free_count` | number of currently available resident slots |
+| `size` | number of resident entries |
+| `capacity` | logical cache capacity |
+| `index` | hash-based key lookup |
+| `min_heap` | rank-ordered eviction structure |
+
+Stable entry addresses are important because both the hash table and heap store `CacheEntry *` pointers.
+
+### Free-slot stack
+
+Stage 10 does not compact or move live entries after eviction.
+
+Instead:
+
+```text
+insert
+  -> pop one free slot
+  -> construct resident entry there
+
+ evict
+  -> mark victim slot inactive
+  -> push its slot index back onto free_stack
+```
+
+This preserves pointer stability and makes resident-slot allocation/recycling O(1).
+
+### Functions introduced
+
+#### `part1_cache_init()`
+
+Initializes:
+
+- resident storage,
+- active flags,
+- free-slot stack,
+- hash table,
+- min-heap.
+
+#### `part1_cache_is_full()`
+
+Checks whether `size >= capacity`.
+
+```text
+Complexity: O(1)
+```
+
+#### `part1_cache_lookup()`
+
+Uses the integrated hash table instead of the earlier linear resident scan.
+
+```text
+Expected/average: O(1)
+Worst case:       O(M)
+```
+
+where `M` is the fixed hash-table capacity.
+
+#### `part1_cache_insert()`
+
+Insertion performs:
+
+```text
+free-slot allocation      O(1)
+hash-table insertion      expected O(1)
+min-heap insertion        O(log N)
+```
+
+Therefore:
+
+```text
+overall expected insertion: O(log N)
+```
+
+The heap is the dominant operation.
+
+#### `part1_cache_evict_min()`
+
+Eviction now uses:
+
+```text
+min_heap_pop_min()        O(log N)
+hash_table_remove()       expected O(1)
+free-slot recycle         O(1)
+```
+
+The previous O(N) linear minimum-rank scan is not used by the integrated Part 1 path.
+
+Therefore:
+
+```text
+overall expected eviction: O(log N)
+```
+
+#### `part1_cache_get()`
+
+Part 1 hit path:
+
+```text
+hash lookup
+    |
+    +--> HIT -> return resident entry
+```
+
+Expected hit complexity:
+
+```text
+O(1)
+```
+
+No rank recalculation or heap update occurs because Part 1 ranks remain fixed.
+
+Part 1 miss path:
+
+```text
+hash lookup
+    |
+    +--> MISS
+           |
+           +--> db_read_entry()
+           |
+           +--> if full: pop heap minimum
+           |
+           +--> insert into hash table + heap
+           |
+           +--> return resident entry
+```
+
+Ignoring backing-store latency, expected cache-maintenance complexity is:
+
+```text
+O(log N)
+```
+
+when eviction/insertion is required.
+
+#### `part1_cache_validate()`
+
+The Stage 10 validator verifies synchronization across all integrated structures:
+
+- resident size is within capacity,
+- `size + free_count == capacity`,
+- hash-table size equals resident size,
+- heap size equals resident size,
+- each active resident is found through the hash table,
+- each active resident appears exactly once in the heap,
+- free slots are inactive and unique,
+- every heap pointer refers to a live resident slot,
+- hash-table and heap validators both pass.
+
+This function is a correctness/debug aid and is intentionally more expensive than the cache operations themselves.
+
+## Stage 10 Validation
+
+The first integrated Part 1 validation uses capacity 3 and the existing deterministic database abstraction:
+
+```text
+GET 1 -> miss -> rank 10
+GET 2 -> miss -> rank 20
+GET 3 -> miss -> rank 30
+GET 2 -> hit, rank remains 20
+GET 4 -> miss while full
+         heap minimum = key 1 / rank 10
+         evict key 1
+         insert key 4 / rank 40
+```
+
+After filling the cache:
+
+```text
+resident size = 3
+hash size     = 3
+heap size     = 3
+```
+
+Before `GET 4`:
+
+```text
+heap root = key 1, rank 10
+```
+
+After `GET 4`:
+
+```text
+key 1 absent
+keys 2, 3, 4 resident
+heap root = key 2, rank 20
+```
+
+The integrated validator passes after insertion, hit handling, and eviction.
+
+### Build
+
+```bash
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache10
+```
+
+### Sanitizer build
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fsanitize=address,undefined \
+    ranked_cache.c \
+    -o ranked_cache10_san
+```
+
+### Expected checkpoint result
+
+```text
+Stage 10 Part 1 finding: hash lookup replaces the O(N) key scan.
+Stage 10 Part 1 finding: heap root replaces the O(N) minimum-rank scan.
+Stage 10 Part 1 validation: PASS
+
+Stage 10 validation: PASS
+```
+
+### Stage 10 boundary
+
+Stage 10 supports **fixed ranks only**.
+
+It intentionally does **not** implement:
+
+- rank recalculation on lookup,
+- arbitrary heap priority update,
+- indexed heap positions,
+- Part 2 dynamic-rank behavior,
+- concurrency or thread safety.
+
+Those remain outside this checkpoint.
+
+---
+
 ## Build Environment
 
 Current target environment:
@@ -1706,7 +1992,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache9
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache10
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -1722,22 +2008,22 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache9
+./ranked_cache10
 ```
 
 ### Expected result
 
-The active Stage 9 test suite must end with:
+The active Stage 10 test suite must end with:
 
 ```text
-Stage 9 validation: PASS
+Stage 10 validation: PASS
 ```
 
-The Stage 9 heap is standalone, so this checkpoint does not replace the existing cache eviction path.
+The Stage 10 Part 1 path combines the hash table and min-heap while preserving the earlier linear cache as a regression/reference implementation.
 
 ### Validation result
 
-Stages 0 through 9 have been validated successfully. The active Stage 9 test returns exit status `0`, including the sanitizer validation build.
+Stages 0 through 10 have been validated successfully. The active Stage 10 test returns exit status `0`, including the sanitizer validation build.
 
 ---
 
@@ -1745,39 +2031,29 @@ Stages 0 through 9 have been validated successfully. The active Stage 9 test ret
 
 At this commit, the program can:
 
-- define the cache entry data model,
-- provide the deterministic Stage 1 database abstraction,
-- initialize a fixed-size array cache,
-- track current size and configured capacity,
-- detect when the cache is full,
-- find an entry by key using linear scanning,
-- insert a non-duplicate entry while capacity is available,
-- find the minimum-ranked resident entry using linear scanning,
-- remove a known array slot in O(1),
-- evict the minimum-ranked entry by composing linear selection with known-slot removal,
-- verify that an evicted key is absent,
-- insert a new entry after capacity is freed, and
-- validate the complete Stage 2 manual oracle,
-- perform a complete cache hit through `cache_get()`, and
-- perform a complete cache miss including database read, full-cache eviction, insertion, and return,
-- validate cache structural invariants, and
-- assert valid structural state during development operations,
-- count linear lookup calls, hits, misses, and key comparisons, and
-- demonstrate lookup work growing linearly with resident cache size,
-- initialize and validate a standalone open-addressed hash table,
-- insert standalone key-to-entry mappings,
-- perform standalone hash-table hit/miss lookup,
-- resolve collisions with linear probing,
-- delete mappings using tombstones, and
-- preserve collision-chain lookup across deleted slots.
+- preserve and regress the original linear array cache,
+- preserve Stage 6 lookup bottleneck instrumentation,
+- preserve Stage 7 standalone hash-table validation,
+- preserve Stage 8 minimum-rank bottleneck instrumentation,
+- preserve Stage 9 standalone min-heap validation,
+- initialize an integrated fixed-rank Part 1 cache,
+- allocate resident slots without moving live entries,
+- look up Part 1 residents through the hash table,
+- insert Part 1 residents into both hash table and min-heap,
+- return Part 1 cache hits without changing rank,
+- identify the Part 1 eviction victim through the heap root,
+- evict the minimum-ranked Part 1 resident without a linear rank scan,
+- recycle evicted resident slots,
+- keep hash-table, heap, resident count, and free-slot state synchronized, and
+- validate the complete integrated Part 1 state.
 
 At this commit, the program intentionally does **not** implement:
 
-- hash-table integration with the cache lookup path,
-- optimized rank ordering,
-- dynamic rank updates,
-- optimized lookup implementation, or
-- concurrent/thread-safe access.
+- dynamic rank changes on lookup,
+- arbitrary heap-priority update,
+- indexed heap positions for Part 2,
+- concurrent/thread-safe access, or
+- later-stage Part 2 optimization.
 
 Those capabilities must only be documented after their corresponding implementation stages have actually been completed and validated.
 
@@ -1785,37 +2061,46 @@ Those capabilities must only be documented after their corresponding implementat
 
 ## Complexity at the Current Checkpoint
 
-Stage 2 is intentionally array-based and linear.
+The earlier linear `Cache` remains available as a regression/reference implementation:
 
 ```text
-cache_init()                  O(1)
-cache_is_full()               O(1)
 cache_lookup()                O(N)
-cache_insert()                O(N)
 cache_find_min_rank_index()   O(N)
-cache_remove_at()             O(1)
 cache_evict_min()             O(N)
 cache_get() hit               O(N)
-cache_get() miss              O(N) + DB-read cost
-cache_validate()              O(N^2) debug/correctness check
-lookup-stat counter update    O(1) per comparison
-hash_table_bucket()           O(1)
-hash_table_lookup()           O(1) expected, O(M) worst case
-hash_table_insert()           O(1) expected, O(M) worst case
-hash_table_remove()           O(1) expected, O(M) worst case
-hash table storage            O(M)
-min_heap_peek()               O(1)
-min_heap_push()               O(log N) worst case
-min_heap_pop_min()            O(log N) worst case
-min_heap_validate()           O(N) test/debug check
-standalone heap storage       O(K)
-additional working space      O(1)
-resident cache storage        O(K)
 ```
 
-Stage 6 directly confirms that a missing cache lookup performs exactly N key comparisons for N resident entries. The first algorithmic bottleneck is therefore the O(N) linear cache lookup.
+The new Stage 10 integrated fixed-rank Part 1 path is:
 
-Stage 7 independently validates a hash table whose expected lookup complexity is O(1) at a controlled load factor, but the cache itself still uses the Stage 6 linear lookup. Stage 8 proves that minimum-rank victim selection performs N-1 rank comparisons for N residents, so the current eviction path remains O(N). Stage 9 now independently validates an array-backed binary min-heap with O(1) minimum access and O(log N) push/pop, but that heap is not yet integrated with the cache. In assertion-enabled builds, the O(N²) invariant validator can still dominate wall-clock runtime; it remains a correctness aid rather than a production lookup mechanism.
+```text
+part1_cache_is_full()         O(1)
+part1_cache_lookup()          O(1) expected, O(M) worst case
+part1_cache_insert()          O(log N) expected overall
+part1_cache_evict_min()       O(log N) expected overall
+part1_cache_get() hit         O(1) expected
+part1_cache_get() miss        O(log N) cache maintenance + DB-read cost
+min-heap minimum access       O(1)
+resident-slot allocate/free   O(1)
+Part 1 resident storage       O(K)
+hash-table storage            O(M)
+heap storage                  O(K)
+```
+
+The Stage 10 validator is intentionally thorough and may perform O(N²) work. It is a development correctness aid and is not part of the intended production operation complexity.
+
+Stage 10 therefore addresses the two bottlenecks previously identified:
+
+```text
+Stage 6 bottleneck:
+linear key lookup O(N)
+        -> hash lookup expected O(1)
+
+Stage 8 bottleneck:
+linear minimum-rank scan O(N)
+        -> heap minimum O(1), pop O(log N)
+```
+
+Because Part 1 rank values do not change on lookup, a cache hit does not require heap maintenance.
 
 ---
 
@@ -1955,5 +2240,18 @@ HEAP INVARIANT PASS
 EQUAL-RANK TIE PASS
 ASCENDING POP ORDER PASS
 CAPACITY GUARD PASS
+ASAN/UBSAN PASS
+
+Stage 10
+Integrated hash table + min-heap for fixed-rank Part 1
+COMPLETE
+BUILD PASS
+RUN PASS
+HASH LOOKUP INTEGRATION PASS
+HEAP EVICTION INTEGRATION PASS
+FIXED-RANK HIT PASS
+FULL-CACHE MISS/EVICTION PASS
+HASH/HEAP/RESIDENT SYNCHRONIZATION PASS
+INTEGRATED VALIDATOR PASS
 ASAN/UBSAN PASS
 ```

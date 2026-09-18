@@ -13,6 +13,7 @@
  *   Stage 7 - standalone hash-table lookup validation
  *   Stage 8 - identify the second bottleneck with rank-scan instrumentation
  *   Stage 9 - standalone binary min-heap validation
+ *   Stage 10 - integrated hash table + min-heap cache for fixed-rank Part 1
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
@@ -36,6 +37,10 @@
  *
  * Stage 9 introduces and tests a standalone array-backed binary min-heap.
  * The heap is deliberately not connected to Cache, cache_get(), or eviction.
+ *
+ * Stage 10 combines the validated Stage 7 hash table and Stage 9 min-heap in a
+ * separate fixed-rank Part 1 cache. The earlier linear Cache remains present as
+ * a regression/reference implementation. Dynamic rank updates are not supported.
  */
 
 #include <stdio.h>
@@ -1140,6 +1145,368 @@ int stage9_run_min_heap_tests(void)
 }
 
 
+/* ---------- Stage 10: combine hash table + heap for Part 1 ---------- */
+
+/*
+ * Fixed-rank Part 1 cache.
+ *
+ * The resident entry array provides stable addresses for CacheEntry objects.
+ * Unlike the earlier linear Cache, resident entries are never moved while
+ * cached. A small free-slot stack recycles array slots after eviction.
+ *
+ * index     - key -> CacheEntry * lookup through the Stage 7 hash table
+ * min_heap  - minimum-rank victim selection through the Stage 9 binary heap
+ * active    - marks which resident slots currently contain live entries
+ * free_stack/free_count - O(1) resident-slot allocation/recycling
+ */
+typedef struct {
+    CacheEntry entries[MAX_CACHE_CAPACITY];
+    unsigned char active[MAX_CACHE_CAPACITY];
+    size_t free_stack[MAX_CACHE_CAPACITY];
+    size_t free_count;
+    size_t size;
+    size_t capacity;
+    HashTable index;
+    MinHeap min_heap;
+} Part1Cache;
+
+int part1_cache_init(Part1Cache *cache, size_t capacity)
+{
+    size_t i;
+
+    if (cache == NULL || capacity == 0U || capacity > MAX_CACHE_CAPACITY) {
+        return 0;
+    }
+
+    cache->size = 0U;
+    cache->capacity = capacity;
+    cache->free_count = capacity;
+
+    for (i = 0U; i < MAX_CACHE_CAPACITY; ++i) {
+        cache->entries[i].key = 0ULL;
+        cache->entries[i].value = 0ULL;
+        cache->entries[i].rank = 0LL;
+        cache->active[i] = 0U;
+        cache->free_stack[i] = 0U;
+    }
+
+    /* Arrange the stack so the first allocation uses entries[0]. */
+    for (i = 0U; i < capacity; ++i) {
+        cache->free_stack[i] = capacity - 1U - i;
+    }
+
+    hash_table_init(&cache->index);
+    min_heap_init(&cache->min_heap);
+    return 1;
+}
+
+int part1_cache_is_full(const Part1Cache *cache)
+{
+    return cache != NULL && cache->size >= cache->capacity;
+}
+
+/* Expected/average O(1) at the current controlled hash-table load. */
+CacheEntry *part1_cache_lookup(const Part1Cache *cache, CacheKey key)
+{
+    if (cache == NULL) {
+        return NULL;
+    }
+
+    return hash_table_lookup(&cache->index, key);
+}
+
+/*
+ * Insert a fixed-rank entry into both indexing structures.
+ *
+ * Expected/average complexity:
+ *   hash insert     O(1)
+ *   heap push       O(log N)
+ *   slot allocation O(1)
+ * Overall: O(log N), dominated by heap maintenance.
+ */
+int part1_cache_insert(Part1Cache *cache,
+                       CacheEntry entry,
+                       CacheEntry **inserted_entry)
+{
+    size_t slot_index;
+    CacheEntry *resident;
+
+    if (cache == NULL || part1_cache_is_full(cache) || cache->free_count == 0U) {
+        return 0;
+    }
+
+    if (hash_table_lookup(&cache->index, entry.key) != NULL) {
+        return 0;
+    }
+
+    slot_index = cache->free_stack[--cache->free_count];
+    resident = &cache->entries[slot_index];
+    *resident = entry;
+    cache->active[slot_index] = 1U;
+
+    if (!hash_table_insert(&cache->index, resident)) {
+        cache->active[slot_index] = 0U;
+        cache->free_stack[cache->free_count++] = slot_index;
+        return 0;
+    }
+
+    if (!min_heap_push(&cache->min_heap, resident)) {
+        CacheEntry *removed = NULL;
+        (void)hash_table_remove(&cache->index, resident->key, &removed);
+        cache->active[slot_index] = 0U;
+        cache->free_stack[cache->free_count++] = slot_index;
+        return 0;
+    }
+
+    ++cache->size;
+
+    if (inserted_entry != NULL) {
+        *inserted_entry = resident;
+    }
+
+    return 1;
+}
+
+/*
+ * Evict the current minimum-ranked resident.
+ *
+ * The heap root provides the victim directly, so no O(N) rank scan occurs.
+ * Heap removal is O(log N); hash removal is expected O(1).
+ */
+int part1_cache_evict_min(Part1Cache *cache, CacheEntry *evicted_entry)
+{
+    CacheEntry *victim;
+    CacheEntry *removed = NULL;
+    ptrdiff_t slot_index;
+
+    if (cache == NULL || cache->size == 0U) {
+        return 0;
+    }
+
+    victim = min_heap_pop_min(&cache->min_heap);
+    if (victim == NULL) {
+        return 0;
+    }
+
+    if (!hash_table_remove(&cache->index, victim->key, &removed) ||
+        removed != victim) {
+        /* Valid integrated state should make this path unreachable. */
+        (void)min_heap_push(&cache->min_heap, victim);
+        return 0;
+    }
+
+    slot_index = victim - cache->entries;
+    if (slot_index < 0 || (size_t)slot_index >= cache->capacity ||
+        cache->active[(size_t)slot_index] == 0U) {
+        return 0;
+    }
+
+    if (evicted_entry != NULL) {
+        *evicted_entry = *victim;
+    }
+
+    cache->active[(size_t)slot_index] = 0U;
+    cache->free_stack[cache->free_count++] = (size_t)slot_index;
+    --cache->size;
+    return 1;
+}
+
+/*
+ * Complete fixed-rank Part 1 access path.
+ *
+ * Hit:
+ *   expected O(1) hash lookup.
+ *
+ * Miss:
+ *   DB read + optional O(log N) heap eviction + O(log N) insertion.
+ * Rank does not change on lookup in Part 1.
+ */
+CacheEntry *part1_cache_get(Part1Cache *cache, CacheKey key)
+{
+    CacheEntry *resident;
+    CacheEntry fetched;
+
+    if (cache == NULL) {
+        return NULL;
+    }
+
+    resident = part1_cache_lookup(cache, key);
+    if (resident != NULL) {
+        return resident;
+    }
+
+    fetched = db_read_entry(key);
+
+    if (part1_cache_is_full(cache)) {
+        if (!part1_cache_evict_min(cache, NULL)) {
+            return NULL;
+        }
+    }
+
+    if (!part1_cache_insert(cache, fetched, &resident)) {
+        return NULL;
+    }
+
+    return resident;
+}
+
+/*
+ * Debug/test validator for the integrated Part 1 cache.
+ * This is intentionally thorough rather than optimized.
+ */
+int part1_cache_validate(const Part1Cache *cache)
+{
+    size_t i;
+    size_t j;
+    size_t active_count = 0U;
+
+    if (cache == NULL || cache->capacity == 0U ||
+        cache->capacity > MAX_CACHE_CAPACITY ||
+        cache->size > cache->capacity ||
+        cache->free_count > cache->capacity ||
+        cache->size + cache->free_count != cache->capacity) {
+        return 0;
+    }
+
+    if (cache->index.size != cache->size ||
+        cache->min_heap.size != cache->size ||
+        !hash_table_validate(&cache->index) ||
+        !min_heap_validate(&cache->min_heap)) {
+        return 0;
+    }
+
+    for (i = 0U; i < cache->capacity; ++i) {
+        if (cache->active[i] != 0U) {
+            size_t heap_occurrences = 0U;
+            CacheEntry *resident = (CacheEntry *)&cache->entries[i];
+
+            ++active_count;
+
+            if (hash_table_lookup(&cache->index, resident->key) != resident) {
+                return 0;
+            }
+
+            for (j = 0U; j < cache->min_heap.size; ++j) {
+                if (cache->min_heap.items[j] == resident) {
+                    ++heap_occurrences;
+                }
+            }
+
+            if (heap_occurrences != 1U) {
+                return 0;
+            }
+        }
+    }
+
+    if (active_count != cache->size) {
+        return 0;
+    }
+
+    for (i = 0U; i < cache->free_count; ++i) {
+        size_t slot = cache->free_stack[i];
+
+        if (slot >= cache->capacity || cache->active[slot] != 0U) {
+            return 0;
+        }
+
+        for (j = i + 1U; j < cache->free_count; ++j) {
+            if (cache->free_stack[j] == slot) {
+                return 0;
+            }
+        }
+    }
+
+    for (i = 0U; i < cache->min_heap.size; ++i) {
+        CacheEntry *entry = cache->min_heap.items[i];
+        ptrdiff_t slot;
+
+        if (entry == NULL) {
+            return 0;
+        }
+
+        slot = entry - cache->entries;
+        if (slot < 0 || (size_t)slot >= cache->capacity ||
+            cache->active[(size_t)slot] == 0U) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+int stage10_run_integrated_part1_tests(void)
+{
+    Part1Cache cache;
+    CacheEntry *entry;
+    CacheEntry *minimum;
+    int passed = 1;
+
+    printf("\n=== Stage 10: integrated hash table + min-heap for Part 1 ===\n");
+
+    passed &= check(part1_cache_init(&cache, 3U),
+                    "initialize integrated Part 1 cache");
+    passed &= check(part1_cache_validate(&cache),
+                    "fresh integrated cache validates");
+
+    entry = part1_cache_get(&cache, 1ULL);
+    passed &= check(entry != NULL && entry->key == 1ULL && entry->rank == 10LL,
+                    "Part 1 GET 1 miss inserts through hash+heap");
+
+    entry = part1_cache_get(&cache, 2ULL);
+    passed &= check(entry != NULL && entry->key == 2ULL && entry->rank == 20LL,
+                    "Part 1 GET 2 miss inserts through hash+heap");
+
+    entry = part1_cache_get(&cache, 3ULL);
+    passed &= check(entry != NULL && entry->key == 3ULL && entry->rank == 30LL,
+                    "Part 1 GET 3 miss fills integrated cache");
+
+    passed &= check(cache.size == 3U &&
+                    cache.index.size == 3U &&
+                    cache.min_heap.size == 3U &&
+                    part1_cache_validate(&cache),
+                    "hash, heap, and resident counts stay synchronized");
+
+    entry = part1_cache_get(&cache, 2ULL);
+    passed &= check(entry != NULL && entry->key == 2ULL &&
+                    cache.size == 3U && part1_cache_validate(&cache),
+                    "Part 1 hit returns resident without rank change");
+
+    minimum = min_heap_peek(&cache.min_heap);
+    passed &= check(minimum != NULL && minimum->key == 1ULL &&
+                    minimum->rank == 10LL,
+                    "heap root identifies current minimum in O(1)");
+
+    entry = part1_cache_get(&cache, 4ULL);
+    passed &= check(entry != NULL && entry->key == 4ULL && entry->rank == 40LL,
+                    "full-cache miss evicts heap minimum and inserts key 4");
+
+    passed &= check(part1_cache_lookup(&cache, 1ULL) == NULL,
+                    "evicted key 1 is absent from hash table");
+    passed &= check(part1_cache_lookup(&cache, 2ULL) != NULL &&
+                    part1_cache_lookup(&cache, 3ULL) != NULL &&
+                    part1_cache_lookup(&cache, 4ULL) != NULL,
+                    "keys 2, 3, and 4 remain resident");
+
+    minimum = min_heap_peek(&cache.min_heap);
+    passed &= check(minimum != NULL && minimum->key == 2ULL &&
+                    minimum->rank == 20LL,
+                    "heap minimum advances to key 2 after eviction");
+
+    passed &= check(cache.size == 3U &&
+                    cache.index.size == 3U &&
+                    cache.min_heap.size == 3U &&
+                    part1_cache_validate(&cache),
+                    "integrated Part 1 cache validates after eviction");
+
+    printf("Stage 10 Part 1 finding: hash lookup replaces the O(N) key scan.\n");
+    printf("Stage 10 Part 1 finding: heap root replaces the O(N) minimum-rank scan.\n");
+    printf("Stage 10 Part 1 validation: %s\n",
+           passed ? "PASS" : "FAIL");
+
+    return passed;
+}
+
+
 /* ---------- Stage 8: identify second bottleneck ---------- */
 
 /*
@@ -1390,7 +1757,12 @@ int main(void)
 
     all_passed &= stage9_run_min_heap_tests();
 
-    printf("\nStage 9 validation: %s\n",
+    printf("\nStage 9 regression validation: %s\n",
+           all_passed ? "PASS" : "FAIL");
+
+    all_passed &= stage10_run_integrated_part1_tests();
+
+    printf("\nStage 10 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;
