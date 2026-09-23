@@ -22,6 +22,7 @@
  *   Stage 16 - add min_heap_update_rank() for arbitrary resident priority repair
  *   Stage 17 - test rank-decrease repair independently
  *   Stage 18 - test rank-increase repair independently
+ *   Stage 19 - integrate dynamic rank repair into cache hits
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
@@ -4141,6 +4142,383 @@ int stage18_run_rank_increase_tests(void)
     return passed;
 }
 
+
+
+/* ---------- Stage 19: integrate dynamic rank into cache hits ---------- */
+
+/*
+ * Stage 19 introduces the Part 2 cache-hit path without changing the existing
+ * fixed-rank part1_cache_get() API.
+ *
+ * On a hit:
+ *   1. hash lookup returns the existing resident,
+ *   2. the rank provider computes the post-hit rank,
+ *   3. min_heap_update_rank() repairs the indexed heap,
+ *   4. the same resident pointer is returned.
+ *
+ * On a miss:
+ *   Stage 19 intentionally preserves the Stage 10 Part 1 miss path by
+ *   delegating to part1_cache_get(). No dynamic rank callback is invoked.
+ */
+
+typedef Rank (*Part2RankProvider)(const CacheEntry *entry, void *context);
+
+CacheEntry *part2_cache_get(Part1Cache *cache,
+                            CacheKey key,
+                            Part2RankProvider rank_provider,
+                            void *rank_context)
+{
+    CacheEntry *resident;
+    Rank new_rank;
+
+    if (cache == NULL || rank_provider == NULL) {
+        return NULL;
+    }
+
+    resident = part1_cache_lookup(cache, key);
+
+    if (resident == NULL) {
+        /*
+         * Stage 19 changes hits only. Miss fetch/eviction/insertion semantics
+         * remain exactly those of the validated Part 1 implementation.
+         */
+        return part1_cache_get(cache, key);
+    }
+
+    new_rank = rank_provider(resident, rank_context);
+
+    if (!min_heap_update_rank(&cache->min_heap, resident, new_rank)) {
+        return NULL;
+    }
+
+    return resident;
+}
+
+typedef struct {
+    Part2RankScenario scenario;
+    uint64_t calls;
+} Stage19RankContext;
+
+Rank stage19_rank_provider(const CacheEntry *entry, void *context)
+{
+    Stage19RankContext *rank_context = (Stage19RankContext *)context;
+
+    if (rank_context == NULL) {
+        return entry != NULL ? entry->rank : 0LL;
+    }
+
+    ++rank_context->calls;
+    return stage12_get_entry_rank(entry, rank_context->scenario);
+}
+
+int stage19_prepare_dynamic_hit_cache(Part1Cache *cache)
+{
+    CacheEntry entries[] = {
+        {1ULL, 100ULL, 10LL, HEAP_INDEX_NONE},
+        {2ULL, 200ULL, 20LL, HEAP_INDEX_NONE},
+        {3ULL, 300ULL, 30LL, HEAP_INDEX_NONE},
+        {4ULL, 400ULL, 40LL, HEAP_INDEX_NONE},
+        {5ULL, 500ULL, 50LL, HEAP_INDEX_NONE}
+    };
+    size_t i;
+
+    if (!part1_cache_init(cache, 5U)) {
+        return 0;
+    }
+
+    for (i = 0U; i < sizeof(entries) / sizeof(entries[0]); ++i) {
+        if (!part1_cache_insert(cache, entries[i], NULL)) {
+            return 0;
+        }
+    }
+
+    return part1_cache_validate(cache);
+}
+
+int stage19_test_hit_rank_decrease(void)
+{
+    Part1Cache cache;
+    Stage19RankContext context = {PART2_RANK_DECREASE, 0U};
+    CacheEntry *before;
+    CacheEntry *after;
+    int passed = 1;
+
+    printf("\n[Stage 19] cache hit integrates a lower dynamic rank\n");
+
+    passed &= check(stage19_prepare_dynamic_hit_cache(&cache),
+                    "prepare dynamic-hit cache for decrease");
+
+    before = part1_cache_lookup(&cache, 3ULL);
+
+    passed &= check(before != NULL &&
+                    before->rank == 30LL &&
+                    before->heap_index == 2U,
+                    "key 3 starts at rank 30 and heap index 2");
+
+    after = part2_cache_get(&cache, 3ULL, stage19_rank_provider, &context);
+
+    passed &= check(after == before &&
+                    context.calls == 1U,
+                    "dynamic hit returns same resident and invokes provider once");
+
+    passed &= check(after != NULL &&
+                    after->rank == 0LL &&
+                    after->heap_index == 0U &&
+                    min_heap_peek(&cache.min_heap) == after,
+                    "lower dynamic rank repairs resident upward to heap root");
+
+    passed &= check(part1_cache_validate(&cache),
+                    "integrated cache validates after dynamic rank decrease hit");
+
+    return passed;
+}
+
+int stage19_test_hit_rank_unchanged(void)
+{
+    Part1Cache cache;
+    Stage19RankContext context = {PART2_RANK_UNCHANGED, 0U};
+    CacheEntry *before;
+    CacheEntry *after;
+    size_t original_index;
+    CacheEntry *original_root;
+    int passed = 1;
+
+    printf("\n[Stage 19] cache hit integrates an unchanged dynamic rank\n");
+
+    passed &= check(stage19_prepare_dynamic_hit_cache(&cache),
+                    "prepare dynamic-hit cache for unchanged rank");
+
+    before = part1_cache_lookup(&cache, 3ULL);
+    original_index = before != NULL ? before->heap_index : HEAP_INDEX_NONE;
+    original_root = min_heap_peek(&cache.min_heap);
+
+    after = part2_cache_get(&cache, 3ULL, stage19_rank_provider, &context);
+
+    passed &= check(after == before &&
+                    context.calls == 1U &&
+                    after != NULL &&
+                    after->rank == 30LL,
+                    "unchanged-rank hit returns same resident and invokes provider once");
+
+    passed &= check(after->heap_index == original_index &&
+                    min_heap_peek(&cache.min_heap) == original_root &&
+                    part1_cache_validate(&cache),
+                    "unchanged dynamic rank leaves heap position and root unchanged");
+
+    return passed;
+}
+
+int stage19_test_hit_rank_increase(void)
+{
+    Part1Cache cache;
+    Stage19RankContext context = {PART2_RANK_INCREASE, 0U};
+    CacheEntry *before;
+    CacheEntry *after;
+    int passed = 1;
+
+    printf("\n[Stage 19] cache hit integrates a higher dynamic rank\n");
+
+    passed &= check(stage19_prepare_dynamic_hit_cache(&cache),
+                    "prepare dynamic-hit cache for increase");
+
+    before = part1_cache_lookup(&cache, 1ULL);
+
+    passed &= check(before != NULL &&
+                    before->rank == 10LL &&
+                    before->heap_index == 0U,
+                    "key 1 starts as heap root at rank 10");
+
+    after = part2_cache_get(&cache, 1ULL, stage19_rank_provider, &context);
+
+    passed &= check(after == before &&
+                    context.calls == 1U,
+                    "higher-rank hit returns same resident and invokes provider once");
+
+    passed &= check(after != NULL &&
+                    after->rank == 40LL &&
+                    after->heap_index != 0U &&
+                    min_heap_peek(&cache.min_heap) != after &&
+                    min_heap_peek(&cache.min_heap)->key == 2ULL,
+                    "higher dynamic rank repairs former root downward");
+
+    passed &= check(part1_cache_validate(&cache),
+                    "integrated cache validates after dynamic rank increase hit");
+
+    return passed;
+}
+
+int stage19_test_repeated_dynamic_hits(void)
+{
+    Part1Cache cache;
+    Stage19RankContext context = {PART2_RANK_DECREASE, 0U};
+    CacheEntry *resident;
+    int passed = 1;
+
+    printf("\n[Stage 19] repeated dynamic hits reuse updated heap_index\n");
+
+    passed &= check(stage19_prepare_dynamic_hit_cache(&cache),
+                    "prepare cache for repeated dynamic hits");
+
+    resident = part1_cache_lookup(&cache, 5ULL);
+
+    passed &= check(resident != NULL &&
+                    resident->rank == 50LL,
+                    "key 5 starts at rank 50");
+
+    resident = part2_cache_get(&cache, 5ULL, stage19_rank_provider, &context);
+    passed &= check(resident != NULL &&
+                    resident->rank == 20LL &&
+                    context.calls == 1U &&
+                    part1_cache_validate(&cache),
+                    "first dynamic hit decreases rank and preserves cache validity");
+
+    resident = part2_cache_get(&cache, 5ULL, stage19_rank_provider, &context);
+    passed &= check(resident != NULL &&
+                    resident->rank == -10LL &&
+                    resident->heap_index == 0U &&
+                    context.calls == 2U &&
+                    min_heap_peek(&cache.min_heap) == resident &&
+                    part1_cache_validate(&cache),
+                    "second dynamic hit uses updated heap_index and reaches root");
+
+    return passed;
+}
+
+int stage19_test_miss_preserves_part1_semantics(void)
+{
+    Part1Cache cache;
+    Stage19RankContext context = {PART2_RANK_DECREASE, 0U};
+    CacheEntry *resident;
+    int passed = 1;
+
+    printf("\n[Stage 19] cache miss preserves existing Part 1 semantics\n");
+
+    passed &= check(part1_cache_init(&cache, 3U),
+                    "initialize Stage 19 miss-path cache");
+
+    resident = part2_cache_get(&cache, 7ULL, stage19_rank_provider, &context);
+
+    passed &= check(resident != NULL &&
+                    resident->key == 7ULL &&
+                    resident->value == 700ULL &&
+                    resident->rank == 70LL,
+                    "Part 2 miss inserts deterministic DB entry unchanged");
+
+    passed &= check(context.calls == 0U,
+                    "rank provider is not invoked on cache miss");
+
+    passed &= check(cache.size == 1U &&
+                    cache.index.size == 1U &&
+                    cache.min_heap.size == 1U &&
+                    part1_cache_validate(&cache),
+                    "miss path preserves integrated Part 1 structure");
+
+    return passed;
+}
+
+int stage19_test_dynamic_hit_changes_next_eviction_victim(void)
+{
+    Part1Cache cache;
+    Stage19RankContext context = {PART2_RANK_INCREASE, 0U};
+    CacheEntry *resident;
+    CacheEntry evicted;
+    int passed = 1;
+
+    printf("\n[Stage 19] repaired dynamic hit is visible to later eviction\n");
+
+    passed &= check(part1_cache_init(&cache, 3U),
+                    "initialize eviction-effect cache");
+    passed &= check(part1_cache_get(&cache, 1ULL) != NULL &&
+                    part1_cache_get(&cache, 2ULL) != NULL &&
+                    part1_cache_get(&cache, 3ULL) != NULL,
+                    "fill eviction-effect cache with ranks 10, 20, 30");
+
+    resident = part2_cache_get(&cache, 1ULL, stage19_rank_provider, &context);
+
+    passed &= check(resident != NULL &&
+                    resident->rank == 40LL &&
+                    min_heap_peek(&cache.min_heap) != NULL &&
+                    min_heap_peek(&cache.min_heap)->key == 2ULL,
+                    "increased hit rank changes the current heap minimum");
+
+    passed &= check(part1_cache_evict_min(&cache, &evicted) &&
+                    evicted.key == 2ULL &&
+                    evicted.rank == 20LL,
+                    "subsequent eviction uses repaired dynamic rank ordering");
+
+    passed &= check(part1_cache_lookup(&cache, 1ULL) == resident &&
+                    part1_cache_lookup(&cache, 2ULL) == NULL &&
+                    part1_cache_validate(&cache),
+                    "dynamic-hit resident survives and integrated cache remains valid");
+
+    return passed;
+}
+
+int stage19_test_invalid_dynamic_hit_arguments(void)
+{
+    Part1Cache cache;
+    Stage19RankContext context = {PART2_RANK_UNCHANGED, 0U};
+    CacheEntry *resident;
+    int passed = 1;
+
+    printf("\n[Stage 19] invalid Part 2 hit API arguments are rejected\n");
+
+    passed &= check(part1_cache_init(&cache, 2U),
+                    "initialize invalid-argument cache");
+    passed &= check(part1_cache_get(&cache, 1ULL) != NULL,
+                    "insert resident for invalid-argument checks");
+
+    resident = part1_cache_lookup(&cache, 1ULL);
+
+    passed &= check(part2_cache_get(NULL,
+                                    1ULL,
+                                    stage19_rank_provider,
+                                    &context) == NULL,
+                    "NULL cache is rejected");
+
+    passed &= check(part2_cache_get(&cache,
+                                    1ULL,
+                                    NULL,
+                                    &context) == NULL,
+                    "NULL rank provider is rejected");
+
+    passed &= check(resident != NULL &&
+                    resident->rank == 10LL &&
+                    context.calls == 0U &&
+                    part1_cache_validate(&cache),
+                    "rejected Part 2 accesses do not mutate resident state");
+
+    return passed;
+}
+
+int stage19_run_dynamic_hit_integration_tests(void)
+{
+    int passed = 1;
+
+    printf("\n=== Stage 19: integrate dynamic rank into cache hits ===\n");
+
+    passed &= stage19_test_hit_rank_decrease();
+    passed &= stage19_test_hit_rank_unchanged();
+    passed &= stage19_test_hit_rank_increase();
+    passed &= stage19_test_repeated_dynamic_hits();
+    passed &= stage19_test_miss_preserves_part1_semantics();
+    passed &= stage19_test_dynamic_hit_changes_next_eviction_victim();
+    passed &= stage19_test_invalid_dynamic_hit_arguments();
+
+    printf("\nStage 19 findings:\n");
+    printf("  Part 2 cache hits invoke the rank provider exactly once.\n");
+    printf("  lower/same/higher hit ranks reuse min_heap_update_rank().\n");
+    printf("  the same resident pointer is returned after dynamic hit repair.\n");
+    printf("  repeated hits reuse the resident's maintained heap_index.\n");
+    printf("  misses preserve the existing Part 1 fetch/insert behavior.\n");
+    printf("  repaired hit ranks immediately affect later eviction ordering.\n");
+    printf("Stage 19 boundary: dynamic rank is integrated on hits only.\n");
+    printf("Stage 19 dynamic-hit integration validation: %s\n",
+           passed ? "PASS" : "FAIL");
+
+    return passed;
+}
+
 int main(void)
 {
     Cache cache;
@@ -4304,7 +4682,12 @@ int main(void)
 
     all_passed &= stage18_run_rank_increase_tests();
 
-    printf("\nStage 18 validation: %s\n",
+    printf("\nStage 18 regression validation: %s\n",
+           all_passed ? "PASS" : "FAIL");
+
+    all_passed &= stage19_run_dynamic_hit_integration_tests();
+
+    printf("\nStage 19 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;

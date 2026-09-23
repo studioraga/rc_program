@@ -4743,6 +4743,398 @@ It only expands validation of the rank-increase branch already introduced in Sta
 
 ---
 
+## Stage 19 — Integrate Dynamic Rank Into Cache Hits
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 16 introduced `min_heap_update_rank()`.
+
+Stage 17 independently validated rank decreases.
+
+Stage 18 independently validated rank increases.
+
+Stage 19 now integrates that already-tested heap-update primitive into a **separate Part 2 cache-hit path**.
+
+The existing fixed-rank API:
+
+```c
+part1_cache_get()
+```
+
+remains unchanged.
+
+Stage 19 introduces:
+
+```c
+typedef Rank (*Part2RankProvider)(
+    const CacheEntry *entry,
+    void *context);
+
+CacheEntry *part2_cache_get(
+    Part1Cache *cache,
+    CacheKey key,
+    Part2RankProvider rank_provider,
+    void *rank_context);
+```
+
+This keeps Part 1 and Part 2 behavior explicit and independently testable.
+
+### Part 2 hit path
+
+For a cache hit:
+
+```text
+key
+ |
+ v
+hash lookup
+ |
+ v
+resident CacheEntry *
+ |
+ v
+rank_provider(resident)
+ |
+ v
+new rank
+ |
+ v
+min_heap_update_rank()
+ |
+ v
+same resident pointer returned
+```
+
+The hit path therefore uses:
+
+```text
+hash lookup                  expected O(1)
+resident heap position       O(1) through heap_index
+heap rank repair             O(log N) worst case
+```
+
+So a dynamic-rank cache hit is:
+
+```text
+O(log N) worst case
+```
+
+after the expected-O(1) hash lookup.
+
+### Part 2 miss path
+
+Stage 19 changes **hits only**.
+
+If the key is absent:
+
+```c
+return part1_cache_get(cache, key);
+```
+
+Therefore the validated Part 1 miss behavior remains:
+
+```text
+database read
+optional minimum eviction
+insert into stable resident storage
+insert into hash table
+insert into min-heap
+```
+
+The rank provider is not called on a miss.
+
+---
+
+## Stage 19 Deterministic Rank Provider
+
+For validation, Stage 19 adapts the deterministic Stage 12 rank scenarios through a callback context:
+
+```c
+typedef struct {
+    Part2RankScenario scenario;
+    uint64_t calls;
+} Stage19RankContext;
+```
+
+The provider uses:
+
+```text
+PART2_RANK_DECREASE
+PART2_RANK_UNCHANGED
+PART2_RANK_INCREASE
+```
+
+and counts callback invocations.
+
+This lets Stage 19 verify that a cache hit invokes the dynamic rank provider exactly once.
+
+---
+
+## Stage 19 Validation
+
+### Test 1 — lower dynamic rank on hit
+
+Initial integrated cache:
+
+```text
+key 1 rank 10
+key 2 rank 20
+key 3 rank 30
+key 4 rank 40
+key 5 rank 50
+```
+
+Lookup key `3`.
+
+The provider returns:
+
+```text
+30 -> 0
+```
+
+Stage 19 verifies:
+
+```text
+same resident pointer returned
+provider called exactly once
+rank becomes 0
+heap_index becomes 0
+resident becomes heap minimum
+part1_cache_validate() passes
+```
+
+### Test 2 — unchanged dynamic rank on hit
+
+Lookup key `3` with:
+
+```text
+30 -> 30
+```
+
+Verify:
+
+```text
+same resident pointer
+provider called once
+same heap_index
+same heap root
+integrated validator passes
+```
+
+No heap movement occurs.
+
+### Test 3 — higher dynamic rank on hit
+
+Lookup heap-root key `1`.
+
+The provider returns:
+
+```text
+10 -> 40
+```
+
+The former root moves downward.
+
+Expected new minimum:
+
+```text
+key 2 / rank 20
+```
+
+Stage 19 verifies that the returned pointer is still the original key `1` resident and that the integrated cache remains valid.
+
+### Test 4 — repeated dynamic hits
+
+Key `5` begins at:
+
+```text
+rank 50
+```
+
+First hit:
+
+```text
+50 -> 20
+```
+
+Second hit on the same resident:
+
+```text
+20 -> -10
+```
+
+The second update uses the `heap_index` maintained by the first update.
+
+Expected final state:
+
+```text
+key 5
+rank -10
+heap_index 0
+heap root = key 5
+provider calls = 2
+```
+
+### Test 5 — miss preserves Part 1 semantics
+
+Request a missing key through `part2_cache_get()`.
+
+Stage 19 verifies:
+
+```text
+database entry inserted normally
+rank provider call count remains zero
+resident/hash/heap sizes remain synchronized
+integrated validator passes
+```
+
+This confirms Stage 19 changes the hit path only.
+
+### Test 6 — repaired hit rank affects later eviction
+
+Start with:
+
+```text
+key 1 rank 10
+key 2 rank 20
+key 3 rank 30
+```
+
+Hit key `1` with an increased rank:
+
+```text
+10 -> 40
+```
+
+The new heap minimum becomes:
+
+```text
+key 2 / rank 20
+```
+
+A subsequent minimum eviction must therefore remove key `2`, not key `1`.
+
+This confirms that dynamic hit repair is visible to later cache eviction behavior.
+
+### Test 7 — invalid Part 2 API arguments
+
+Stage 19 rejects:
+
+```text
+NULL cache
+NULL rank provider
+```
+
+and verifies that rejected requests do not mutate the existing resident rank or integrated cache state.
+
+---
+
+## Stage 19 Complexity
+
+Dynamic hit:
+
+```text
+hash lookup                         expected O(1)
+rank-provider invocation            external/user-defined
+resident heap position              O(1)
+min_heap_update_rank                O(log N) worst case
+```
+
+Therefore the data-structure portion of a dynamic hit is:
+
+```text
+O(log N) worst case
+```
+
+The miss path remains the existing Part 1 path.
+
+---
+
+## Stage 19 Build and Validation
+
+### Normal build
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    ranked_cache.c \
+    -o ranked_cache19
+
+./ranked_cache19
+```
+
+Expected final Stage 19 output:
+
+```text
+Stage 19 findings:
+  Part 2 cache hits invoke the rank provider exactly once.
+  lower/same/higher hit ranks reuse min_heap_update_rank().
+  the same resident pointer is returned after dynamic hit repair.
+  repeated hits reuse the resident's maintained heap_index.
+  misses preserve the existing Part 1 fetch/insert behavior.
+  repaired hit ranks immediately affect later eviction ordering.
+Stage 19 boundary: dynamic rank is integrated on hits only.
+Stage 19 dynamic-hit integration validation: PASS
+
+Stage 19 validation: PASS
+```
+
+### UndefinedBehaviorSanitizer
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fsanitize=undefined \
+    ranked_cache.c \
+    -o ranked_cache19_ubsan
+
+./ranked_cache19_ubsan
+```
+
+### AddressSanitizer + UndefinedBehaviorSanitizer
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fsanitize=address,undefined \
+    ranked_cache.c \
+    -o ranked_cache19_san
+
+./ranked_cache19_san
+```
+
+Both sanitizer builds pass.
+
+---
+
+### Stage 19 boundary
+
+Stage 19 deliberately does **not** add:
+
+- dynamic rank computation on cache misses,
+- a new database-rank policy,
+- public API replacement of `part1_cache_get()`,
+- concurrency,
+- additional eviction policy changes,
+- failure rollback for an external rank provider with side effects.
+
+This checkpoint integrates dynamic rank changes into **cache hits only**.
+
+---
+
 ## Build Environment
 
 Current target environment:
@@ -4754,7 +5146,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache18
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache19
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -4770,22 +5162,22 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache18
+./ranked_cache19
 ```
 
 ### Expected result
 
-The active Stage 18 test suite must end with:
+The active Stage 19 test suite must end with:
 
 ```text
-Stage 18 validation: PASS
+Stage 19 validation: PASS
 ```
 
 The Stage 10 Part 1 path combines the hash table and min-heap while preserving the earlier linear cache as a regression/reference implementation.
 
 ### Validation result
 
-Stages 0 through 18 have been validated successfully. The normal build, UBSan build, and combined ASan/UBSan build all pass for Stage 18.
+Stages 0 through 19 have been validated successfully. The normal build, UBSan build, and combined ASan/UBSan build all pass for Stage 19.
 
 ---
 
@@ -4849,7 +5241,13 @@ At this commit, the program can:
 - validate one-level and multi-level sift-down repairs,
 - validate equal-rank child selection during an increase,
 - validate repeated increases through the updated `heap_index`, and
-- validate an integrated hash-found resident rank increase.
+- validate an integrated hash-found resident rank increase,
+- invoke a dynamic rank provider on Part 2 cache hits,
+- repair lower/equal/higher hit ranks through `min_heap_update_rank()`,
+- preserve resident pointer identity across dynamic hit repair,
+- reuse maintained `heap_index` across repeated dynamic hits,
+- preserve the existing Part 1 miss path, and
+- verify repaired hit ranks immediately affect later eviction ordering.
 
 At this commit, the program intentionally does **not** implement:
 
@@ -4936,6 +5334,10 @@ cross its parent and therefore requires no movement.
 Stage 18 mirrors that validation for the rank-increase/sift-down branch. It confirms
 that a larger rank may remain in place, move one level, or move multiple levels while
 preserving the same O(log N) worst-case repair complexity.
+
+Stage 19 integrates the already validated rank-update primitive into cache hits. The
+hash lookup remains expected O(1), heap position lookup is O(1) through `heap_index`,
+and dynamic hit repair is O(log N) worst case, excluding the external rank-provider cost.
 
 ---
 
@@ -5218,6 +5620,23 @@ INCREASE-TIE-ORDER PASS
 REPEATED-INCREASE PASS
 HASH-FOUND-INCREASE PASS
 HEAP_INDEX CONSISTENCY PASS
+INTEGRATED VALIDATOR PASS
+UBSAN PASS
+ASAN/UBSAN PASS
+
+
+Stage 19
+Integrate dynamic rank into cache hits
+COMPLETE
+BUILD PASS
+RUN PASS
+DYNAMIC-HIT DECREASE PASS
+DYNAMIC-HIT UNCHANGED PASS
+DYNAMIC-HIT INCREASE PASS
+REPEATED-DYNAMIC-HIT PASS
+MISS-PATH COMPATIBILITY PASS
+DYNAMIC-RANK EVICTION EFFECT PASS
+INVALID-API REJECTION PASS
 INTEGRATED VALIDATOR PASS
 UBSAN PASS
 ASAN/UBSAN PASS
