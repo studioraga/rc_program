@@ -14,6 +14,7 @@
  *   Stage 8 - identify the second bottleneck with rank-scan instrumentation
  *   Stage 9 - standalone binary min-heap validation
  *   Stage 10 - integrated hash table + min-heap cache for fixed-rank Part 1
+ *   Stage 11 - thorough fixed-rank Part 1 validation
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
@@ -41,6 +42,10 @@
  * Stage 10 combines the validated Stage 7 hash table and Stage 9 min-heap in a
  * separate fixed-rank Part 1 cache. The earlier linear Cache remains present as
  * a regression/reference implementation. Dynamic rank updates are not supported.
+ *
+ * Stage 11 does not change the Part 1 algorithms. It expands validation of the
+ * integrated fixed-rank cache across boundaries, ties, collisions, repeated hits,
+ * repeated evictions, duplicate rejection, stable storage, and slot reuse.
  */
 
 #include <stdio.h>
@@ -1639,6 +1644,433 @@ int stage8_run_min_rank_bottleneck_tests(void)
     return passed;
 }
 
+
+
+/* ---------- Stage 11: test fixed-rank Part 1 thoroughly ---------- */
+
+/*
+ * Stage 11 intentionally changes no Part1Cache production algorithm.
+ * These helpers exercise the Stage 10 integrated path more thoroughly.
+ */
+
+int stage11_test_empty_and_partial_capacity(void)
+{
+    Part1Cache cache;
+    CacheEntry evicted;
+    CacheEntry *entry;
+    int passed = 1;
+
+    printf("\n[Stage 11] empty and partial-capacity behavior\n");
+
+    passed &= check(part1_cache_init(&cache, 4U),
+                    "initialize capacity-4 Part 1 cache");
+    passed &= check(part1_cache_validate(&cache),
+                    "empty Part 1 cache validates");
+    passed &= check(!part1_cache_is_full(&cache),
+                    "empty cache is not full");
+    passed &= check(part1_cache_lookup(&cache, 99ULL) == NULL,
+                    "lookup miss on empty cache returns NULL");
+    passed &= check(!part1_cache_evict_min(&cache, &evicted),
+                    "eviction from empty cache is rejected");
+
+    entry = part1_cache_get(&cache, 10ULL);
+    passed &= check(entry != NULL &&
+                    entry->key == 10ULL &&
+                    entry->value == 1000ULL &&
+                    entry->rank == 100LL,
+                    "first miss inserts deterministic DB entry");
+
+    entry = part1_cache_get(&cache, 20ULL);
+    passed &= check(entry != NULL &&
+                    entry->key == 20ULL &&
+                    entry->rank == 200LL,
+                    "second miss inserts without reaching capacity");
+
+    passed &= check(cache.size == 2U &&
+                    cache.index.size == 2U &&
+                    cache.min_heap.size == 2U &&
+                    cache.free_count == 2U &&
+                    !part1_cache_is_full(&cache) &&
+                    part1_cache_validate(&cache),
+                    "partial cache keeps all structures synchronized");
+
+    passed &= check(min_heap_peek(&cache.min_heap) != NULL &&
+                    min_heap_peek(&cache.min_heap)->key == 10ULL,
+                    "partial cache exposes correct minimum");
+
+    return passed;
+}
+
+int stage11_test_repeated_hits_keep_fixed_rank(void)
+{
+    Part1Cache cache;
+    CacheEntry *first;
+    CacheEntry *again;
+    CacheEntry *minimum_before;
+    Rank original_rank;
+    size_t i;
+    int passed = 1;
+
+    printf("\n[Stage 11] repeated hits preserve fixed-rank semantics\n");
+
+    passed &= check(part1_cache_init(&cache, 3U),
+                    "initialize repeated-hit cache");
+
+    first = part1_cache_get(&cache, 5ULL);
+    passed &= check(first != NULL && first->rank == 50LL,
+                    "initial GET 5 inserts rank 50");
+
+    passed &= check(part1_cache_get(&cache, 8ULL) != NULL,
+                    "GET 8 inserts second resident");
+    passed &= check(part1_cache_get(&cache, 9ULL) != NULL,
+                    "GET 9 fills repeated-hit cache");
+
+    original_rank = first->rank;
+    minimum_before = min_heap_peek(&cache.min_heap);
+
+    for (i = 0U; i < 10U; ++i) {
+        again = part1_cache_get(&cache, 5ULL);
+
+        passed &= check(again == first &&
+                        again->rank == original_rank &&
+                        cache.size == 3U &&
+                        cache.index.size == 3U &&
+                        cache.min_heap.size == 3U &&
+                        min_heap_peek(&cache.min_heap) == minimum_before &&
+                        part1_cache_validate(&cache),
+                        "repeated hit returns same resident and leaves rank/heap unchanged");
+    }
+
+    return passed;
+}
+
+int stage11_test_duplicate_rejection(void)
+{
+    Part1Cache cache;
+    CacheEntry original = {7ULL, 700ULL, 70LL};
+    CacheEntry duplicate = {7ULL, 7777ULL, 1LL};
+    CacheEntry *resident = NULL;
+    CacheEntry *before;
+    size_t size_before;
+    size_t hash_before;
+    size_t heap_before;
+    size_t free_before;
+    int passed = 1;
+
+    printf("\n[Stage 11] duplicate-key rejection\n");
+
+    passed &= check(part1_cache_init(&cache, 3U),
+                    "initialize duplicate test cache");
+    passed &= check(part1_cache_insert(&cache, original, &resident),
+                    "insert original key 7");
+
+    before = resident;
+    size_before = cache.size;
+    hash_before = cache.index.size;
+    heap_before = cache.min_heap.size;
+    free_before = cache.free_count;
+
+    resident = NULL;
+    passed &= check(!part1_cache_insert(&cache, duplicate, &resident),
+                    "duplicate key insertion is rejected");
+
+    resident = part1_cache_lookup(&cache, 7ULL);
+    passed &= check(resident == before &&
+                    resident != NULL &&
+                    resident->value == 700ULL &&
+                    resident->rank == 70LL &&
+                    cache.size == size_before &&
+                    cache.index.size == hash_before &&
+                    cache.min_heap.size == heap_before &&
+                    cache.free_count == free_before &&
+                    part1_cache_validate(&cache),
+                    "duplicate rejection leaves integrated state unchanged");
+
+    return passed;
+}
+
+int stage11_test_equal_rank_tie(void)
+{
+    Part1Cache cache;
+    CacheEntry a = {30ULL, 3000ULL, 50LL};
+    CacheEntry b = {10ULL, 1000ULL, 50LL};
+    CacheEntry c = {20ULL, 2000ULL, 50LL};
+    CacheEntry evicted;
+    CacheEntry *minimum;
+    int passed = 1;
+
+    printf("\n[Stage 11] equal-rank deterministic tie handling\n");
+
+    passed &= check(part1_cache_init(&cache, 3U),
+                    "initialize equal-rank cache");
+    passed &= check(part1_cache_insert(&cache, a, NULL),
+                    "insert key 30 rank 50");
+    passed &= check(part1_cache_insert(&cache, b, NULL),
+                    "insert key 10 rank 50");
+    passed &= check(part1_cache_insert(&cache, c, NULL),
+                    "insert key 20 rank 50");
+
+    minimum = min_heap_peek(&cache.min_heap);
+    passed &= check(minimum != NULL &&
+                    minimum->key == 10ULL &&
+                    minimum->rank == 50LL,
+                    "equal ranks choose lower key as heap minimum");
+
+    passed &= check(part1_cache_evict_min(&cache, &evicted),
+                    "evict equal-rank minimum");
+    passed &= check(evicted.key == 10ULL &&
+                    evicted.rank == 50LL &&
+                    part1_cache_lookup(&cache, 10ULL) == NULL &&
+                    part1_cache_lookup(&cache, 20ULL) != NULL &&
+                    part1_cache_lookup(&cache, 30ULL) != NULL &&
+                    part1_cache_validate(&cache),
+                    "equal-rank eviction removes deterministic key 10");
+
+    return passed;
+}
+
+int stage11_test_integrated_hash_collisions(void)
+{
+    Part1Cache cache;
+    CacheEntry a = {1ULL, 100ULL, 30LL};
+    CacheEntry b = {212ULL, 21200ULL, 10LL};
+    CacheEntry c = {423ULL, 42300ULL, 20LL};
+    CacheEntry evicted;
+    int passed = 1;
+
+    printf("\n[Stage 11] integrated hash collisions and tombstone traversal\n");
+
+    passed &= check(part1_cache_init(&cache, 3U),
+                    "initialize collision cache");
+
+    /* 1, 212, and 423 all hash to the same initial bucket modulo 211. */
+    passed &= check(part1_cache_insert(&cache, a, NULL),
+                    "insert collision key 1");
+    passed &= check(part1_cache_insert(&cache, b, NULL),
+                    "insert collision key 212");
+    passed &= check(part1_cache_insert(&cache, c, NULL),
+                    "insert collision key 423");
+
+    passed &= check(part1_cache_lookup(&cache, 1ULL) != NULL &&
+                    part1_cache_lookup(&cache, 212ULL) != NULL &&
+                    part1_cache_lookup(&cache, 423ULL) != NULL &&
+                    part1_cache_validate(&cache),
+                    "all colliding keys are reachable through integrated hash index");
+
+    passed &= check(part1_cache_evict_min(&cache, &evicted),
+                    "evict minimum colliding key");
+    passed &= check(evicted.key == 212ULL && evicted.rank == 10LL,
+                    "heap selects key 212 as collision-set victim");
+
+    passed &= check(part1_cache_lookup(&cache, 212ULL) == NULL &&
+                    part1_cache_lookup(&cache, 423ULL) != NULL &&
+                    part1_cache_lookup(&cache, 1ULL) != NULL &&
+                    part1_cache_validate(&cache),
+                    "remaining colliding keys survive hash tombstone");
+
+    return passed;
+}
+
+int stage11_test_capacity_boundaries(void)
+{
+    Part1Cache cache;
+    Part1Cache maximum;
+    CacheEntry extra = {1001ULL, 100100ULL, 10010LL};
+    CacheEntry *entry;
+    size_t i;
+    int passed = 1;
+
+    printf("\n[Stage 11] capacity boundaries\n");
+
+    passed &= check(!part1_cache_init(NULL, 1U),
+                    "NULL Part 1 cache initialization is rejected");
+    passed &= check(!part1_cache_init(&cache, 0U),
+                    "zero capacity is rejected");
+    passed &= check(!part1_cache_init(&cache, MAX_CACHE_CAPACITY + 1U),
+                    "capacity above maximum is rejected");
+
+    passed &= check(part1_cache_init(&cache, 1U),
+                    "capacity-one cache initializes");
+    entry = part1_cache_get(&cache, 9ULL);
+    passed &= check(entry != NULL &&
+                    entry->key == 9ULL &&
+                    part1_cache_is_full(&cache) &&
+                    part1_cache_validate(&cache),
+                    "capacity-one cache becomes full after one insert");
+
+    passed &= check(!part1_cache_insert(&cache, extra, NULL),
+                    "direct insert beyond full capacity is rejected");
+    passed &= check(part1_cache_lookup(&cache, 9ULL) != NULL &&
+                    cache.size == 1U &&
+                    part1_cache_validate(&cache),
+                    "failed over-capacity insert leaves state unchanged");
+
+    entry = part1_cache_get(&cache, 10ULL);
+    passed &= check(entry != NULL &&
+                    entry->key == 10ULL &&
+                    part1_cache_lookup(&cache, 9ULL) == NULL &&
+                    cache.size == 1U &&
+                    part1_cache_validate(&cache),
+                    "capacity-one miss evicts old minimum and reuses capacity");
+
+    passed &= check(part1_cache_init(&maximum, MAX_CACHE_CAPACITY),
+                    "maximum-capacity cache initializes");
+
+    for (i = 0U; i < MAX_CACHE_CAPACITY; ++i) {
+        CacheEntry e;
+        e.key = (CacheKey)(10000U + i);
+        e.value = (unsigned long long)e.key * 100ULL;
+        e.rank = (Rank)(i + 1U);
+
+        if (!part1_cache_insert(&maximum, e, NULL)) {
+            passed &= check(0, "fill maximum-capacity cache");
+            break;
+        }
+    }
+
+    passed &= check(maximum.size == MAX_CACHE_CAPACITY &&
+                    maximum.index.size == MAX_CACHE_CAPACITY &&
+                    maximum.min_heap.size == MAX_CACHE_CAPACITY &&
+                    maximum.free_count == 0U &&
+                    part1_cache_is_full(&maximum) &&
+                    part1_cache_validate(&maximum),
+                    "maximum-capacity cache fills and validates");
+
+    passed &= check(!part1_cache_insert(&maximum, extra, NULL),
+                    "maximum-capacity direct overflow is rejected");
+
+    return passed;
+}
+
+int stage11_test_slot_reuse_and_pointer_stability(void)
+{
+    Part1Cache cache;
+    CacheEntry *p1;
+    CacheEntry *p2;
+    CacheEntry *p3;
+    CacheEntry *p4;
+    int passed = 1;
+
+    printf("\n[Stage 11] stable resident addresses and free-slot reuse\n");
+
+    passed &= check(part1_cache_init(&cache, 3U),
+                    "initialize slot-reuse cache");
+
+    p1 = part1_cache_get(&cache, 1ULL);
+    p2 = part1_cache_get(&cache, 2ULL);
+    p3 = part1_cache_get(&cache, 3ULL);
+
+    passed &= check(p1 != NULL && p2 != NULL && p3 != NULL &&
+                    part1_cache_validate(&cache),
+                    "capture initial stable resident pointers");
+
+    p4 = part1_cache_get(&cache, 4ULL);
+
+    passed &= check(p4 != NULL &&
+                    part1_cache_lookup(&cache, 1ULL) == NULL &&
+                    part1_cache_lookup(&cache, 2ULL) == p2 &&
+                    part1_cache_lookup(&cache, 3ULL) == p3 &&
+                    part1_cache_lookup(&cache, 4ULL) == p4 &&
+                    part1_cache_validate(&cache),
+                    "surviving resident pointers remain stable after eviction");
+
+    passed &= check(p4 == p1,
+                    "new resident reuses the freed victim slot");
+
+    return passed;
+}
+
+int stage11_test_repeated_evictions_and_consistency(void)
+{
+    Part1Cache cache;
+    CacheEntry *entry;
+    CacheKey key;
+    int passed = 1;
+
+    printf("\n[Stage 11] repeated evictions and cross-structure consistency\n");
+
+    passed &= check(part1_cache_init(&cache, 5U),
+                    "initialize repeated-eviction cache");
+
+    for (key = 1ULL; key <= 5ULL; ++key) {
+        entry = part1_cache_get(&cache, key);
+        passed &= check(entry != NULL &&
+                        entry->key == key &&
+                        part1_cache_validate(&cache),
+                        "fill repeated-eviction cache");
+    }
+
+    /* Hits must not alter fixed ranks or resident count. */
+    passed &= check(part1_cache_get(&cache, 3ULL) ==
+                    part1_cache_lookup(&cache, 3ULL),
+                    "hit key 3 returns existing resident");
+    passed &= check(part1_cache_get(&cache, 5ULL) ==
+                    part1_cache_lookup(&cache, 5ULL),
+                    "hit key 5 returns existing resident");
+    passed &= check(cache.size == 5U && part1_cache_validate(&cache),
+                    "repeated hits keep full cache structurally unchanged");
+
+    for (key = 6ULL; key <= 8ULL; ++key) {
+        entry = part1_cache_get(&cache, key);
+        passed &= check(entry != NULL &&
+                        entry->key == key &&
+                        cache.size == 5U &&
+                        cache.index.size == 5U &&
+                        cache.min_heap.size == 5U &&
+                        cache.free_count == 0U &&
+                        part1_cache_validate(&cache),
+                        "full-cache miss preserves synchronized size after eviction");
+    }
+
+    passed &= check(part1_cache_lookup(&cache, 1ULL) == NULL &&
+                    part1_cache_lookup(&cache, 2ULL) == NULL &&
+                    part1_cache_lookup(&cache, 3ULL) == NULL &&
+                    part1_cache_lookup(&cache, 4ULL) != NULL &&
+                    part1_cache_lookup(&cache, 5ULL) != NULL &&
+                    part1_cache_lookup(&cache, 6ULL) != NULL &&
+                    part1_cache_lookup(&cache, 7ULL) != NULL &&
+                    part1_cache_lookup(&cache, 8ULL) != NULL,
+                    "repeated evictions retain the five highest fixed ranks");
+
+    passed &= check(min_heap_peek(&cache.min_heap) != NULL &&
+                    min_heap_peek(&cache.min_heap)->key == 4ULL &&
+                    min_heap_peek(&cache.min_heap)->rank == 40LL &&
+                    part1_cache_validate(&cache),
+                    "heap minimum advances correctly after repeated evictions");
+
+    return passed;
+}
+
+int stage11_run_part1_thorough_tests(void)
+{
+    int passed = 1;
+
+    printf("\n=== Stage 11: thorough fixed-rank Part 1 validation ===\n");
+
+    passed &= stage11_test_empty_and_partial_capacity();
+    passed &= stage11_test_repeated_hits_keep_fixed_rank();
+    passed &= stage11_test_duplicate_rejection();
+    passed &= stage11_test_equal_rank_tie();
+    passed &= stage11_test_integrated_hash_collisions();
+    passed &= stage11_test_capacity_boundaries();
+    passed &= stage11_test_slot_reuse_and_pointer_stability();
+    passed &= stage11_test_repeated_evictions_and_consistency();
+
+    printf("\nStage 11 Part 1 coverage:\n");
+    printf("  empty/partial capacity       : tested\n");
+    printf("  repeated fixed-rank hits     : tested\n");
+    printf("  duplicate rejection          : tested\n");
+    printf("  equal-rank deterministic tie : tested\n");
+    printf("  integrated hash collisions   : tested\n");
+    printf("  capacity boundaries          : tested\n");
+    printf("  stable addresses/slot reuse  : tested\n");
+    printf("  repeated evictions           : tested\n");
+    printf("Stage 11 Part 1 validation: %s\n",
+           passed ? "PASS" : "FAIL");
+
+    return passed;
+}
+
 int main(void)
 {
     Cache cache;
@@ -1762,7 +2194,12 @@ int main(void)
 
     all_passed &= stage10_run_integrated_part1_tests();
 
-    printf("\nStage 10 validation: %s\n",
+    printf("\nStage 10 regression validation: %s\n",
+           all_passed ? "PASS" : "FAIL");
+
+    all_passed &= stage11_run_part1_thorough_tests();
+
+    printf("\nStage 11 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;

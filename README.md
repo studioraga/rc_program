@@ -1673,7 +1673,7 @@ as they did in Stage 8.
 ### Build
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache10
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache9
 ```
 
 ### Sanitizer build
@@ -1981,6 +1981,277 @@ Those remain outside this checkpoint.
 
 ---
 
+## Stage 11 — Thorough Part 1 Validation
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 11 changes no `Part1Cache` production algorithm.
+
+Its purpose is to stress the Stage 10 fixed-rank integration across a broader set of functional and structural cases before any Part 2 work begins.
+
+The Stage 10 architecture remains:
+
+```text
+stable CacheEntry storage
+        |
+        +--> HashTable: key -> CacheEntry *
+        |
+        +--> MinHeap: minimum-ranked CacheEntry *
+```
+
+The Stage 11 tests exercise this integrated path directly.
+
+### Test group 1 — empty and partial capacity
+
+Validate:
+
+- empty-cache initialization,
+- empty lookup miss,
+- empty eviction rejection,
+- insertion while capacity is still available,
+- synchronized resident/hash/heap counts,
+- correct heap minimum before capacity is reached.
+
+Example:
+
+```text
+capacity = 4
+
+GET 10 -> miss -> rank 100
+GET 20 -> miss -> rank 200
+
+size       = 2
+hash size  = 2
+heap size  = 2
+free slots = 2
+minimum    = key 10 / rank 100
+```
+
+### Test group 2 — repeated fixed-rank hits
+
+Part 1 requires rank to remain unchanged on lookup.
+
+Stage 11 repeatedly accesses the same resident entry and verifies:
+
+- the same resident pointer is returned,
+- the rank remains unchanged,
+- cache size remains unchanged,
+- hash size remains unchanged,
+- heap size remains unchanged,
+- the heap root remains unchanged,
+- the integrated validator continues to pass.
+
+This confirms that fixed-rank hits do not perform rank maintenance.
+
+### Test group 3 — duplicate-key rejection
+
+Insert:
+
+```text
+key   = 7
+value = 700
+rank  = 70
+```
+
+Then attempt to insert another entry with:
+
+```text
+key   = 7
+value = 7777
+rank  = 1
+```
+
+The duplicate must be rejected.
+
+The original resident must remain unchanged and all structure counts must remain identical.
+
+### Test group 4 — equal-rank deterministic tie behavior
+
+Stage 11 inserts:
+
+| Key | Rank |
+|---:|---:|
+| 30 | 50 |
+| 10 | 50 |
+| 20 | 50 |
+
+The heap's deterministic secondary ordering by key requires:
+
+```text
+minimum = key 10 / rank 50
+```
+
+Eviction must therefore remove key `10`.
+
+### Test group 5 — integrated hash collisions
+
+Keys:
+
+```text
+1
+212
+423
+```
+
+all map to the same initial bucket with:
+
+```text
+HASH_TABLE_CAPACITY = 211
+```
+
+Stage 11 verifies these collisions inside `Part1Cache`, not merely in the standalone Stage 7 hash table.
+
+The test then evicts the minimum-ranked colliding entry and verifies that lookups for later entries continue across the resulting hash-table tombstone.
+
+### Test group 6 — capacity boundaries
+
+Stage 11 validates:
+
+```text
+NULL cache initialization      -> reject
+capacity = 0                   -> reject
+capacity > MAX_CACHE_CAPACITY  -> reject
+capacity = 1                   -> accept
+capacity = MAX_CACHE_CAPACITY  -> accept
+```
+
+For a one-entry cache:
+
+```text
+GET 9
+GET 10
+```
+
+the second miss must evict key `9`, insert key `10`, and preserve a resident size of exactly one.
+
+The maximum-capacity test fills all `MAX_CACHE_CAPACITY` resident slots, validates the integrated state, and confirms that direct insertion beyond capacity is rejected.
+
+### Test group 7 — stable addresses and free-slot reuse
+
+Because the hash table and heap store `CacheEntry *`, resident addresses must remain stable.
+
+Stage 11 fills a capacity-three cache with keys `1`, `2`, and `3`, captures their resident pointers, and then requests key `4`.
+
+Key `1` is evicted.
+
+The test verifies:
+
+- pointers for keys `2` and `3` remain unchanged,
+- key `4` occupies the recycled slot previously used by key `1`,
+- the integrated validator passes.
+
+### Test group 8 — repeated evictions
+
+A capacity-five cache is filled with:
+
+```text
+keys 1, 2, 3, 4, 5
+```
+
+Then:
+
+```text
+GET 3 -> hit
+GET 5 -> hit
+GET 6 -> miss/full
+GET 7 -> miss/full
+GET 8 -> miss/full
+```
+
+Because the deterministic database rank is:
+
+```text
+rank = key * 10
+```
+
+the successive full-cache misses remove the lowest fixed ranks.
+
+Final resident set:
+
+```text
+4, 5, 6, 7, 8
+```
+
+and:
+
+```text
+heap minimum = key 4 / rank 40
+```
+
+The validator is run throughout the sequence.
+
+## Stage 11 Validation
+
+### Normal build
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    ranked_cache.c \
+    -o ranked_cache11
+```
+
+### Run
+
+```bash
+./ranked_cache11
+```
+
+The Stage 11 section must end with:
+
+```text
+Stage 11 Part 1 coverage:
+  empty/partial capacity       : tested
+  repeated fixed-rank hits     : tested
+  duplicate rejection          : tested
+  equal-rank deterministic tie : tested
+  integrated hash collisions   : tested
+  capacity boundaries          : tested
+  stable addresses/slot reuse  : tested
+  repeated evictions           : tested
+Stage 11 Part 1 validation: PASS
+
+Stage 11 validation: PASS
+```
+
+### Sanitizer build
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fsanitize=address,undefined \
+    ranked_cache.c \
+    -o ranked_cache11_san
+
+./ranked_cache11_san
+```
+
+The sanitizer build completes with exit status `0` and no AddressSanitizer or UndefinedBehaviorSanitizer diagnostics.
+
+### Stage 11 boundary
+
+Stage 11 remains strictly within **fixed-rank Part 1**.
+
+It does not add:
+
+- dynamic rank recalculation,
+- arbitrary heap-priority updates,
+- indexed heap positions,
+- Part 2 behavior,
+- concurrency,
+- performance benchmarking changes.
+
+
+---
+
 ## Build Environment
 
 Current target environment:
@@ -1992,7 +2263,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache10
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache11
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -2008,22 +2279,22 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache10
+./ranked_cache11
 ```
 
 ### Expected result
 
-The active Stage 10 test suite must end with:
+The active Stage 11 test suite must end with:
 
 ```text
-Stage 10 validation: PASS
+Stage 11 validation: PASS
 ```
 
 The Stage 10 Part 1 path combines the hash table and min-heap while preserving the earlier linear cache as a regression/reference implementation.
 
 ### Validation result
 
-Stages 0 through 10 have been validated successfully. The active Stage 10 test returns exit status `0`, including the sanitizer validation build.
+Stages 0 through 11 have been validated successfully. The active Stage 11 test returns exit status `0`, including the sanitizer validation build.
 
 ---
 
@@ -2045,7 +2316,15 @@ At this commit, the program can:
 - evict the minimum-ranked Part 1 resident without a linear rank scan,
 - recycle evicted resident slots,
 - keep hash-table, heap, resident count, and free-slot state synchronized, and
-- validate the complete integrated Part 1 state.
+- validate the complete integrated Part 1 state,
+- validate empty and partial-capacity Part 1 behavior,
+- verify repeated hits preserve fixed rank and resident identity,
+- verify duplicate insertion leaves integrated state unchanged,
+- verify deterministic equal-rank eviction,
+- verify integrated hash collision/tombstone behavior,
+- validate capacity-one and maximum-capacity boundaries,
+- verify stable resident pointers and free-slot reuse, and
+- validate repeated full-cache evictions while maintaining cross-structure consistency.
 
 At this commit, the program intentionally does **not** implement:
 
@@ -2101,6 +2380,9 @@ linear minimum-rank scan O(N)
 ```
 
 Because Part 1 rank values do not change on lookup, a cache hit does not require heap maintenance.
+
+Stage 11 does not change these production complexities. Its additional test helpers and
+validator calls are correctness instrumentation rather than cache-operation optimizations.
 
 ---
 
@@ -2253,5 +2535,22 @@ FIXED-RANK HIT PASS
 FULL-CACHE MISS/EVICTION PASS
 HASH/HEAP/RESIDENT SYNCHRONIZATION PASS
 INTEGRATED VALIDATOR PASS
+ASAN/UBSAN PASS
+
+
+Stage 11
+Thorough fixed-rank Part 1 validation
+COMPLETE
+BUILD PASS
+RUN PASS
+EMPTY/PARTIAL CAPACITY PASS
+REPEATED FIXED-RANK HIT PASS
+DUPLICATE-KEY REJECTION PASS
+EQUAL-RANK TIE PASS
+INTEGRATED HASH COLLISION PASS
+CAPACITY BOUNDARY PASS
+STABLE ADDRESS/SLOT REUSE PASS
+REPEATED EVICTION PASS
+CROSS-STRUCTURE CONSISTENCY PASS
 ASAN/UBSAN PASS
 ```
