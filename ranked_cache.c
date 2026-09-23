@@ -15,6 +15,7 @@
  *   Stage 9 - standalone binary min-heap validation
  *   Stage 10 - integrated hash table + min-heap cache for fixed-rank Part 1
  *   Stage 11 - thorough fixed-rank Part 1 validation
+ *   Stage 12 - introduce and validate the Part 2 rank-change contract
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
@@ -46,6 +47,11 @@
  * Stage 11 does not change the Part 1 algorithms. It expands validation of the
  * integrated fixed-rank cache across boundaries, ties, collisions, repeated hits,
  * repeated evictions, duplicate rejection, stable storage, and slot reuse.
+ *
+ * Stage 12 begins Part 2 by validating the new contract only: getEntryRank()
+ * may return a lower, unchanged, or higher rank after a lookup. Stage 12
+ * deliberately does not repair the ordinary heap after such a change; instead,
+ * it proves why an arbitrary-priority update mechanism is required next.
  */
 
 #include <stdio.h>
@@ -2071,6 +2077,360 @@ int stage11_run_part1_thorough_tests(void)
     return passed;
 }
 
+
+
+/* ---------- Stage 12: begin Part 2 rank-change contract ---------- */
+
+/*
+ * Part 2 changes one fundamental assumption from Part 1:
+ *
+ *   after an entry is looked up, getEntryRank(entry) may return a new rank.
+ *
+ * The new rank is not constrained to move in one direction. It may be:
+ *   - lower than the existing rank,
+ *   - equal to the existing rank, or
+ *   - higher than the existing rank.
+ *
+ * Stage 12 models that contract and demonstrates the limitation of the
+ * existing ordinary binary heap. It intentionally does NOT implement heap
+ * repair for an arbitrary resident entry yet.
+ */
+
+typedef enum {
+    PART2_RANK_DECREASE = 0,
+    PART2_RANK_UNCHANGED = 1,
+    PART2_RANK_INCREASE = 2
+} Part2RankScenario;
+
+/*
+ * Deterministic Stage 12 stand-in for the interview-supplied getEntryRank().
+ *
+ * The actual problem statement treats getEntryRank(entry) as an external
+ * ranking function. For this incremental checkpoint we need deterministic
+ * values so tests can prove all three directions of change.
+ *
+ * Test precondition: the ranks used here are comfortably away from signed
+ * overflow/underflow.
+ */
+Rank stage12_get_entry_rank(const CacheEntry *entry,
+                            Part2RankScenario scenario)
+{
+    if (entry == NULL) {
+        return 0LL;
+    }
+
+    switch (scenario) {
+        case PART2_RANK_DECREASE:
+            return entry->rank - 30LL;
+
+        case PART2_RANK_INCREASE:
+            return entry->rank + 30LL;
+
+        case PART2_RANK_UNCHANGED:
+        default:
+            return entry->rank;
+    }
+}
+
+/*
+ * Locate a resident through the integrated hash table and apply the new rank
+ * returned by the Stage 12 getEntryRank() stand-in.
+ *
+ * IMPORTANT:
+ * This helper intentionally does not repair the heap. That is the behavior
+ * under examination in Stage 12, not the final Part 2 implementation.
+ */
+int stage12_apply_rank_change_without_heap_repair(
+    Part1Cache *cache,
+    CacheKey key,
+    Part2RankScenario scenario,
+    Rank *old_rank,
+    Rank *new_rank,
+    CacheEntry **resident_out)
+{
+    CacheEntry *resident;
+    Rank updated;
+
+    if (cache == NULL) {
+        return 0;
+    }
+
+    resident = part1_cache_lookup(cache, key);
+    if (resident == NULL) {
+        return 0;
+    }
+
+    updated = stage12_get_entry_rank(resident, scenario);
+
+    if (old_rank != NULL) {
+        *old_rank = resident->rank;
+    }
+
+    resident->rank = updated;
+
+    if (new_rank != NULL) {
+        *new_rank = updated;
+    }
+
+    if (resident_out != NULL) {
+        *resident_out = resident;
+    }
+
+    return 1;
+}
+
+/*
+ * Restore one resident rank after a Stage 12 experiment.
+ *
+ * Stage 12 experiments change exactly one rank and then restore it before the
+ * next case. Because the original Stage 10 heap was valid before the mutation,
+ * restoring the original rank restores the original ordering relationship.
+ */
+int stage12_restore_rank(Part1Cache *cache,
+                         CacheKey key,
+                         Rank original_rank)
+{
+    CacheEntry *resident;
+
+    if (cache == NULL) {
+        return 0;
+    }
+
+    resident = part1_cache_lookup(cache, key);
+    if (resident == NULL) {
+        return 0;
+    }
+
+    resident->rank = original_rank;
+    return 1;
+}
+
+int stage12_prepare_part2_probe_cache(Part1Cache *cache)
+{
+    CacheEntry e1 = {1ULL, 100ULL, 10LL};
+    CacheEntry e2 = {2ULL, 200ULL, 20LL};
+    CacheEntry e3 = {3ULL, 300ULL, 30LL};
+
+    if (!part1_cache_init(cache, 3U)) {
+        return 0;
+    }
+
+    if (!part1_cache_insert(cache, e1, NULL) ||
+        !part1_cache_insert(cache, e2, NULL) ||
+        !part1_cache_insert(cache, e3, NULL)) {
+        return 0;
+    }
+
+    return part1_cache_validate(cache);
+}
+
+int stage12_test_rank_direction_contract(void)
+{
+    CacheEntry sample = {7ULL, 700ULL, 70LL};
+    Rank lower;
+    Rank same;
+    Rank higher;
+    int passed = 1;
+
+    printf("\n[Stage 12] Part 2 getEntryRank direction contract\n");
+
+    lower = stage12_get_entry_rank(&sample, PART2_RANK_DECREASE);
+    same = stage12_get_entry_rank(&sample, PART2_RANK_UNCHANGED);
+    higher = stage12_get_entry_rank(&sample, PART2_RANK_INCREASE);
+
+    passed &= check(lower < sample.rank,
+                    "getEntryRank can return a lower rank");
+    passed &= check(same == sample.rank,
+                    "getEntryRank can return an unchanged rank");
+    passed &= check(higher > sample.rank,
+                    "getEntryRank can return a higher rank");
+
+    return passed;
+}
+
+int stage12_test_decrease_can_stale_heap(void)
+{
+    Part1Cache cache;
+    CacheEntry *resident;
+    CacheEntry *heap_root;
+    Rank old_rank;
+    Rank new_rank;
+    int passed = 1;
+
+    printf("\n[Stage 12] decreasing a non-root rank can stale the ordinary heap\n");
+
+    passed &= check(stage12_prepare_part2_probe_cache(&cache),
+                    "prepare valid Part 2 probe cache");
+
+    /*
+     * Initial heap minimum is key 1 / rank 10.
+     * Change key 3 from rank 30 to rank 0 without heap repair.
+     * Key 3 should now be the true minimum, but it is still below the root in
+     * the existing heap array.
+     */
+    passed &= check(stage12_apply_rank_change_without_heap_repair(
+                        &cache,
+                        3ULL,
+                        PART2_RANK_DECREASE,
+                        &old_rank,
+                        &new_rank,
+                        &resident),
+                    "apply lower rank to key 3");
+
+    heap_root = min_heap_peek(&cache.min_heap);
+
+    passed &= check(old_rank == 30LL &&
+                    new_rank == 0LL &&
+                    resident != NULL &&
+                    resident->key == 3ULL,
+                    "key 3 rank changes from 30 to 0");
+
+    passed &= check(part1_cache_lookup(&cache, 3ULL) == resident,
+                    "hash lookup still finds the same resident after rank change");
+
+    passed &= check(heap_root != NULL &&
+                    heap_root->key == 1ULL &&
+                    heap_root->rank == 10LL &&
+                    resident->rank < heap_root->rank,
+                    "heap root is stale after unrepaired rank decrease");
+
+    passed &= check(!min_heap_validate(&cache.min_heap),
+                    "heap validator detects rank-decrease ordering violation");
+    passed &= check(!part1_cache_validate(&cache),
+                    "integrated validator rejects stale heap after rank decrease");
+
+    passed &= check(stage12_restore_rank(&cache, 3ULL, old_rank),
+                    "restore key 3 original rank");
+    passed &= check(part1_cache_validate(&cache),
+                    "restoring original rank restores valid Part 1 state");
+
+    return passed;
+}
+
+int stage12_test_increase_can_stale_heap(void)
+{
+    Part1Cache cache;
+    CacheEntry *resident;
+    CacheEntry *heap_root;
+    Rank old_rank;
+    Rank new_rank;
+    int passed = 1;
+
+    printf("\n[Stage 12] increasing the root rank can stale the ordinary heap\n");
+
+    passed &= check(stage12_prepare_part2_probe_cache(&cache),
+                    "prepare valid Part 2 probe cache");
+
+    /*
+     * Initial heap root is key 1 / rank 10.
+     * Change it to rank 40 without heap repair.
+     * Keys 2 and 3 now outrank the root, so the heap property is violated.
+     */
+    passed &= check(stage12_apply_rank_change_without_heap_repair(
+                        &cache,
+                        1ULL,
+                        PART2_RANK_INCREASE,
+                        &old_rank,
+                        &new_rank,
+                        &resident),
+                    "apply higher rank to heap-root key 1");
+
+    heap_root = min_heap_peek(&cache.min_heap);
+
+    passed &= check(old_rank == 10LL &&
+                    new_rank == 40LL &&
+                    resident != NULL &&
+                    resident->key == 1ULL,
+                    "key 1 rank changes from 10 to 40");
+
+    passed &= check(part1_cache_lookup(&cache, 1ULL) == resident,
+                    "hash lookup remains valid after root rank change");
+
+    passed &= check(heap_root == resident &&
+                    heap_root->rank == 40LL &&
+                    part1_cache_lookup(&cache, 2ULL)->rank == 20LL,
+                    "ordinary heap still exposes stale root after rank increase");
+
+    passed &= check(!min_heap_validate(&cache.min_heap),
+                    "heap validator detects rank-increase ordering violation");
+    passed &= check(!part1_cache_validate(&cache),
+                    "integrated validator rejects stale heap after rank increase");
+
+    passed &= check(stage12_restore_rank(&cache, 1ULL, old_rank),
+                    "restore key 1 original rank");
+    passed &= check(part1_cache_validate(&cache),
+                    "restoring root rank restores valid Part 1 state");
+
+    return passed;
+}
+
+int stage12_test_unchanged_rank_needs_no_repair(void)
+{
+    Part1Cache cache;
+    CacheEntry *resident;
+    CacheEntry *before_root;
+    CacheEntry *after_root;
+    Rank old_rank;
+    Rank new_rank;
+    int passed = 1;
+
+    printf("\n[Stage 12] unchanged rank preserves ordinary heap validity\n");
+
+    passed &= check(stage12_prepare_part2_probe_cache(&cache),
+                    "prepare valid unchanged-rank probe cache");
+
+    before_root = min_heap_peek(&cache.min_heap);
+
+    passed &= check(stage12_apply_rank_change_without_heap_repair(
+                        &cache,
+                        2ULL,
+                        PART2_RANK_UNCHANGED,
+                        &old_rank,
+                        &new_rank,
+                        &resident),
+                    "apply unchanged rank to key 2");
+
+    after_root = min_heap_peek(&cache.min_heap);
+
+    passed &= check(old_rank == 20LL &&
+                    new_rank == 20LL &&
+                    resident != NULL &&
+                    resident->key == 2ULL,
+                    "key 2 rank remains 20");
+
+    passed &= check(before_root == after_root &&
+                    min_heap_validate(&cache.min_heap) &&
+                    part1_cache_validate(&cache),
+                    "unchanged rank requires no heap repair");
+
+    return passed;
+}
+
+int stage12_run_part2_contract_tests(void)
+{
+    int passed = 1;
+
+    printf("\n=== Stage 12: begin Part 2 rank-change contract ===\n");
+
+    passed &= stage12_test_rank_direction_contract();
+    passed &= stage12_test_decrease_can_stale_heap();
+    passed &= stage12_test_increase_can_stale_heap();
+    passed &= stage12_test_unchanged_rank_needs_no_repair();
+
+    printf("\nStage 12 Part 2 findings:\n");
+    printf("  getEntryRank may move rank lower, equal, or higher.\n");
+    printf("  hash lookup still finds the resident in O(1) expected time.\n");
+    printf("  an ordinary heap does not self-repair after arbitrary rank change.\n");
+    printf("  decrease may require upward heap movement.\n");
+    printf("  increase may require downward heap movement.\n");
+    printf("  unchanged rank requires no heap movement.\n");
+    printf("Stage 12 conclusion: arbitrary resident priority update must be solved next.\n");
+    printf("Stage 12 Part 2 contract validation: %s\n",
+           passed ? "PASS" : "FAIL");
+
+    return passed;
+}
+
 int main(void)
 {
     Cache cache;
@@ -2199,7 +2559,12 @@ int main(void)
 
     all_passed &= stage11_run_part1_thorough_tests();
 
-    printf("\nStage 11 validation: %s\n",
+    printf("\nStage 11 regression validation: %s\n",
+           all_passed ? "PASS" : "FAIL");
+
+    all_passed &= stage12_run_part2_contract_tests();
+
+    printf("\nStage 12 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;

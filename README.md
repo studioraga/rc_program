@@ -2252,6 +2252,299 @@ It does not add:
 
 ---
 
+## Stage 12 — Begin Part 2: Rank May Change on Lookup
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 12 begins Part 2 by changing one assumption only:
+
+> After a resident entry is looked up, `getEntryRank(entry)` may return a new rank.
+
+The new rank is not constrained to move in one direction. It may be:
+
+- lower than the existing rank,
+- equal to the existing rank, or
+- higher than the existing rank.
+
+Stage 12 deliberately does **not** implement arbitrary heap-priority repair yet.
+
+Its purpose is to model the Part 2 contract and prove why the existing ordinary binary heap from Part 1 is insufficient once a resident's rank can change in place.
+
+### Deterministic Stage 12 rank provider
+
+The original problem statement treats `getEntryRank(entry)` as an externally supplied ranking function.
+
+For deterministic testing, Stage 12 introduces:
+
+```c
+typedef enum {
+    PART2_RANK_DECREASE = 0,
+    PART2_RANK_UNCHANGED = 1,
+    PART2_RANK_INCREASE = 2
+} Part2RankScenario;
+```
+
+and:
+
+```c
+Rank stage12_get_entry_rank(
+    const CacheEntry *entry,
+    Part2RankScenario scenario);
+```
+
+The Stage 12 test provider returns:
+
+```text
+decrease  -> current rank - 30
+unchanged -> current rank
+increase  -> current rank + 30
+```
+
+This is a controlled stand-in for the interview-supplied ranking callback. It exists only to validate all possible rank-change directions.
+
+### Applying a Part 2 rank change
+
+Stage 12 adds:
+
+```c
+stage12_apply_rank_change_without_heap_repair()
+```
+
+The helper:
+
+1. finds the resident through the integrated hash table,
+2. obtains a new rank from the Stage 12 `getEntryRank()` stand-in,
+3. writes that rank into the existing resident,
+4. deliberately does **not** repair the heap.
+
+This is intentional.
+
+Stage 12 is testing the question:
+
+```text
+What happens to the existing Part 1 heap
+if a cached resident's priority changes arbitrarily?
+```
+
+### Probe cache
+
+The Part 2 experiments begin with a valid three-entry integrated cache:
+
+| Key | Rank |
+|---:|---:|
+| 1 | 10 |
+| 2 | 20 |
+| 3 | 30 |
+
+Initially:
+
+```text
+heap minimum = key 1 / rank 10
+```
+
+and the complete `Part1Cache` validator passes.
+
+---
+
+### Test 1 — Rank decrease may require upward movement
+
+Change:
+
+```text
+key 3
+rank 30 -> 0
+```
+
+The hash table still finds exactly the same resident pointer.
+
+However, the ordinary heap has not been repaired, so its root still reports:
+
+```text
+key 1 / rank 10
+```
+
+while key `3` now has the smaller rank:
+
+```text
+key 3 / rank 0
+```
+
+Therefore:
+
+```text
+heap root is stale
+min_heap_validate() fails
+part1_cache_validate() fails
+```
+
+This proves that a sufficiently lower arbitrary rank may require the resident to move **upward** in the heap.
+
+Stage 12 then restores key `3` to rank `30`, after which the integrated validator passes again.
+
+---
+
+### Test 2 — Rank increase may require downward movement
+
+Begin again from the valid probe cache:
+
+```text
+key 1 rank 10
+key 2 rank 20
+key 3 rank 30
+```
+
+Change the heap root:
+
+```text
+key 1
+rank 10 -> 40
+```
+
+Without heap repair, key `1` remains at the root even though key `2` with rank `20` should now precede it.
+
+Therefore:
+
+```text
+heap root is stale
+min_heap_validate() fails
+part1_cache_validate() fails
+```
+
+This proves that a sufficiently higher arbitrary rank may require the resident to move **downward** in the heap.
+
+The original rank is then restored and the integrated cache validates again.
+
+---
+
+### Test 3 — Unchanged rank needs no repair
+
+Change:
+
+```text
+key 2
+rank 20 -> 20
+```
+
+The heap remains valid because the ordering relation did not change.
+
+The tests verify:
+
+```text
+same rank
+same heap root
+min_heap_validate() passes
+part1_cache_validate() passes
+```
+
+---
+
+## Stage 12 Findings
+
+Stage 12 establishes these Part 2 facts:
+
+```text
+hash lookup:
+    still finds resident by key
+    expected O(1)
+
+rank update:
+    may decrease
+    may stay the same
+    may increase
+
+ordinary heap:
+    does not automatically know which resident changed
+    does not automatically repair itself
+
+rank decreases:
+    may require movement toward the root
+
+rank increases:
+    may require movement away from the root
+
+unchanged rank:
+    requires no heap movement
+```
+
+The key Stage 12 conclusion is:
+
+> Part 2 requires an efficient way to locate the changed resident inside the heap and repair its position in either direction.
+
+That problem is intentionally **not solved in Stage 12**.
+
+---
+
+## Stage 12 Validation
+
+### Normal build
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    ranked_cache.c \
+    -o ranked_cache12
+```
+
+### Run
+
+```bash
+./ranked_cache12
+```
+
+The Stage 12 section must end with:
+
+```text
+Stage 12 Part 2 findings:
+  getEntryRank may move rank lower, equal, or higher.
+  hash lookup still finds the resident in O(1) expected time.
+  an ordinary heap does not self-repair after arbitrary rank change.
+  decrease may require upward heap movement.
+  increase may require downward heap movement.
+  unchanged rank requires no heap movement.
+Stage 12 conclusion: arbitrary resident priority update must be solved next.
+Stage 12 Part 2 contract validation: PASS
+
+Stage 12 validation: PASS
+```
+
+### Sanitizer build
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fsanitize=address,undefined \
+    ranked_cache.c \
+    -o ranked_cache12_san
+
+./ranked_cache12_san
+```
+
+The sanitizer build completes with exit status `0` and no AddressSanitizer or UndefinedBehaviorSanitizer diagnostics.
+
+### Stage 12 boundary
+
+Stage 12 does **not** add:
+
+- heap indices stored in cache entries,
+- arbitrary heap-element lookup,
+- heap priority update,
+- indexed-heap repair,
+- Part 2 production `cache_get()` behavior,
+- concurrency,
+- new performance optimization.
+
+This checkpoint only establishes and validates the Part 2 problem that the next incremental stages must solve.
+
+---
+
 ## Build Environment
 
 Current target environment:
@@ -2263,7 +2556,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache11
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache12
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -2279,22 +2572,22 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache11
+./ranked_cache12
 ```
 
 ### Expected result
 
-The active Stage 11 test suite must end with:
+The active Stage 12 test suite must end with:
 
 ```text
-Stage 11 validation: PASS
+Stage 12 validation: PASS
 ```
 
 The Stage 10 Part 1 path combines the hash table and min-heap while preserving the earlier linear cache as a regression/reference implementation.
 
 ### Validation result
 
-Stages 0 through 11 have been validated successfully. The active Stage 11 test returns exit status `0`, including the sanitizer validation build.
+Stages 0 through 12 have been validated successfully. The active Stage 12 test returns exit status `0`, including the sanitizer validation build.
 
 ---
 
@@ -2324,11 +2617,16 @@ At this commit, the program can:
 - verify integrated hash collision/tombstone behavior,
 - validate capacity-one and maximum-capacity boundaries,
 - verify stable resident pointers and free-slot reuse, and
-- validate repeated full-cache evictions while maintaining cross-structure consistency.
+- validate repeated full-cache evictions while maintaining cross-structure consistency,
+- model the Part 2 `getEntryRank()` contract with lower/equal/higher outcomes,
+- apply an arbitrary resident rank change through the integrated hash lookup,
+- prove an unrepaired rank decrease can stale the ordinary heap,
+- prove an unrepaired rank increase can stale the ordinary heap, and
+- verify an unchanged rank leaves the existing heap valid.
 
 At this commit, the program intentionally does **not** implement:
 
-- dynamic rank changes on lookup,
+- production Part 2 rank changes inside `part1_cache_get()`,
 - arbitrary heap-priority update,
 - indexed heap positions for Part 2,
 - concurrent/thread-safe access, or
@@ -2383,6 +2681,11 @@ Because Part 1 rank values do not change on lookup, a cache hit does not require
 
 Stage 11 does not change these production complexities. Its additional test helpers and
 validator calls are correctness instrumentation rather than cache-operation optimizations.
+
+Stage 12 also does not change production complexity. It demonstrates that after an
+arbitrary rank change, the existing ordinary heap may become invalid. Hash lookup still
+locates the resident in expected O(1), but Stage 12 intentionally provides no efficient
+way to locate that resident's heap position or repair the heap yet.
 
 ---
 
@@ -2552,5 +2855,22 @@ CAPACITY BOUNDARY PASS
 STABLE ADDRESS/SLOT REUSE PASS
 REPEATED EVICTION PASS
 CROSS-STRUCTURE CONSISTENCY PASS
+ASAN/UBSAN PASS
+
+
+Stage 12
+Begin Part 2 rank-change contract
+COMPLETE
+BUILD PASS
+RUN PASS
+LOWER-RANK CONTRACT PASS
+UNCHANGED-RANK CONTRACT PASS
+HIGHER-RANK CONTRACT PASS
+HASH-LOOKUP RESIDENT IDENTITY PASS
+STALE-HEAP DECREASE DETECTION PASS
+STALE-HEAP INCREASE DETECTION PASS
+UNCHANGED-RANK HEAP VALIDITY PASS
+PART 1 STATE RESTORE PASS
+PART 2 UPDATE PROBLEM CONFIRMED
 ASAN/UBSAN PASS
 ```
