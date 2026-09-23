@@ -30,6 +30,7 @@
  *   Stage 22 - add a correctness-first debug/sanitizer workload gate
  *   Stage 23 - add optimized build configuration after correctness gate
  *   Stage 24 - benchmark fixed-rank reference versus optimized Part 1
+ *   Stage 25 - benchmark dynamic-rank linear reference versus indexed Part 2
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
@@ -6376,6 +6377,530 @@ int stage24_run_fixed_rank_benchmark_tests(void)
     return passed;
 }
 
+
+
+/* ---------- Stage 25: benchmark dynamic rank ---------- */
+
+#define STAGE25_BENCH_CAPACITY 100U
+#define STAGE25_BENCH_KEY_SPACE 200ULL
+#define STAGE25_BENCH_WARMUP_OPS 20000U
+#define STAGE25_BENCH_MEASURED_OPS 200000U
+#define STAGE25_BENCH_REPEATS 5U
+#define STAGE25_BENCH_SEED UINT64_C(0xd1b54a32d192ed03)
+
+static volatile uint64_t g_stage25_checksum_sink;
+
+/*
+ * Benchmark/reference-only minimum selection for dynamic rank.
+ *
+ * The original Stage 3 linear cache uses first-encountered tie behavior. The
+ * integrated heap uses (rank, key) ordering. For Stage 25 semantic equivalence,
+ * the dynamic linear reference must use that same deterministic (rank, key)
+ * victim rule; otherwise equal-rank victims could diverge even when both
+ * implementations are individually correct.
+ */
+int stage25_linear_find_min_rank_key_index(const Cache *cache,
+                                           size_t *min_index)
+{
+    size_t candidate;
+    size_t i;
+
+    if (cache == NULL || min_index == NULL || cache->size == 0U) {
+        return 0;
+    }
+
+    candidate = 0U;
+
+    for (i = 1U; i < cache->size; ++i) {
+        const CacheEntry *current = &cache->entries[i];
+        const CacheEntry *best = &cache->entries[candidate];
+
+        if (current->rank < best->rank ||
+            (current->rank == best->rank && current->key < best->key)) {
+            candidate = i;
+        }
+    }
+
+    *min_index = candidate;
+    return 1;
+}
+
+int stage25_linear_dynamic_get(Cache *cache,
+                               CacheKey key,
+                               Part2RankScenario scenario,
+                               CacheStats *stats,
+                               CacheEntry **entry_out)
+{
+    CacheEntry *resident;
+    CacheEntry fetched;
+    Rank old_rank;
+    Rank new_rank;
+    size_t victim_index;
+
+    if (cache == NULL || stats == NULL || entry_out == NULL) {
+        return 0;
+    }
+
+    ++stats->accesses;
+    resident = cache_lookup(cache, key);
+
+    if (resident != NULL) {
+        ++stats->hits;
+        ++stats->rank_provider_calls;
+
+        old_rank = resident->rank;
+        new_rank = stage12_get_entry_rank(resident, scenario);
+        resident->rank = new_rank;
+        ++stats->rank_updates;
+
+        if (new_rank < old_rank) {
+            ++stats->rank_decreases;
+        } else if (new_rank > old_rank) {
+            ++stats->rank_increases;
+        } else {
+            ++stats->rank_unchanged;
+        }
+
+        *entry_out = resident;
+        return 1;
+    }
+
+    ++stats->misses;
+    ++stats->db_reads;
+    fetched = db_read_entry(key);
+
+    if (cache_is_full(cache)) {
+        if (!stage25_linear_find_min_rank_key_index(cache, &victim_index) ||
+            !cache_remove_at(cache, victim_index, NULL)) {
+            return 0;
+        }
+        ++stats->evictions;
+    }
+
+    if (!cache_insert(cache, fetched)) {
+        return 0;
+    }
+    ++stats->insertions;
+
+    resident = cache_lookup(cache, key);
+    if (resident == NULL) {
+        return 0;
+    }
+
+    *entry_out = resident;
+    return 1;
+}
+
+int stage25_run_linear_dynamic_workload(const WorkloadOp operations[],
+                                        size_t count,
+                                        Stage24Timing *timing,
+                                        Cache *final_cache,
+                                        CacheStats *final_stats)
+{
+    CacheEntry *entry;
+    CacheStats stats = {0};
+    struct timespec start;
+    struct timespec end;
+    uint64_t checksum = 0U;
+    size_t i;
+
+    if (operations == NULL ||
+        timing == NULL ||
+        final_cache == NULL ||
+        final_stats == NULL ||
+        !cache_init(final_cache, STAGE25_BENCH_CAPACITY)) {
+        return 0;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        return 0;
+    }
+
+    for (i = 0U; i < count; ++i) {
+        if (!stage25_linear_dynamic_get(final_cache,
+                                        operations[i].key,
+                                        operations[i].scenario,
+                                        &stats,
+                                        &entry)) {
+            return 0;
+        }
+
+        checksum ^= (uint64_t)entry->key;
+        checksum += (uint64_t)entry->value;
+        checksum ^= (uint64_t)entry->rank;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+        return 0;
+    }
+
+    timing->seconds = stage24_elapsed_seconds(&start, &end);
+    timing->ns_per_op = count == 0U
+        ? 0.0
+        : (timing->seconds * 1000000000.0) / (double)count;
+    timing->checksum = checksum;
+    *final_stats = stats;
+
+    g_stage25_checksum_sink ^= checksum;
+    return 1;
+}
+
+int stage25_run_part2_dynamic_workload(const WorkloadOp operations[],
+                                       size_t count,
+                                       Stage24Timing *timing,
+                                       Part1Cache *final_cache,
+                                       CacheStats *final_stats)
+{
+    Stage19RankContext context;
+    CacheEntry *entry;
+    struct timespec start;
+    struct timespec end;
+    uint64_t checksum = 0U;
+    size_t i;
+
+    if (operations == NULL ||
+        timing == NULL ||
+        final_cache == NULL ||
+        final_stats == NULL ||
+        !part1_cache_init(final_cache, STAGE25_BENCH_CAPACITY)) {
+        return 0;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        return 0;
+    }
+
+    for (i = 0U; i < count; ++i) {
+        context.scenario = operations[i].scenario;
+        context.calls = 0U;
+
+        entry = part2_cache_get(final_cache,
+                                operations[i].key,
+                                stage19_rank_provider,
+                                &context);
+        if (entry == NULL) {
+            return 0;
+        }
+
+        checksum ^= (uint64_t)entry->key;
+        checksum += (uint64_t)entry->value;
+        checksum ^= (uint64_t)entry->rank;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+        return 0;
+    }
+
+    timing->seconds = stage24_elapsed_seconds(&start, &end);
+    timing->ns_per_op = count == 0U
+        ? 0.0
+        : (timing->seconds * 1000000000.0) / (double)count;
+    timing->checksum = checksum;
+    *final_stats = part1_cache_stats_snapshot(final_cache);
+
+    g_stage25_checksum_sink ^= checksum;
+    return 1;
+}
+
+int stage25_generate_dynamic_operations(WorkloadOp operations[],
+                                        size_t count,
+                                        uint64_t seed,
+                                        CacheKey key_space)
+{
+    WorkloadGenerator generator;
+
+    if ((operations == NULL && count != 0U) ||
+        !workload_generator_init(&generator, seed, key_space)) {
+        return 0;
+    }
+
+    return workload_generate(&generator, operations, count);
+}
+
+int stage25_test_dynamic_reference_semantics(void)
+{
+    WorkloadOp operations[2000];
+    Cache linear;
+    Part1Cache part2;
+    CacheStats linear_stats = {0};
+    CacheStats part2_stats = {0};
+    Stage24Timing linear_timing = {0.0, 0.0, 0U};
+    Stage24Timing part2_timing = {0.0, 0.0, 0U};
+    int passed = 1;
+
+    printf("\n[Stage 25] dynamic-rank reference/indexed equivalence\n");
+
+    passed &= check(stage25_generate_dynamic_operations(
+                        operations,
+                        sizeof(operations) / sizeof(operations[0]),
+                        STAGE25_BENCH_SEED,
+                        STAGE25_BENCH_KEY_SPACE),
+                    "generate deterministic dynamic-rank equivalence workload");
+
+    passed &= check(stage25_run_linear_dynamic_workload(
+                        operations,
+                        sizeof(operations) / sizeof(operations[0]),
+                        &linear_timing,
+                        &linear,
+                        &linear_stats),
+                    "execute linear dynamic-rank reference workload");
+
+    passed &= check(stage25_run_part2_dynamic_workload(
+                        operations,
+                        sizeof(operations) / sizeof(operations[0]),
+                        &part2_timing,
+                        &part2,
+                        &part2_stats),
+                    "execute indexed Part 2 dynamic-rank workload");
+
+    passed &= check(linear_timing.checksum == part2_timing.checksum,
+                    "dynamic implementations produce identical checksum");
+
+    passed &= check(stage21_stats_equal(linear_stats, part2_stats),
+                    "dynamic implementations produce identical statistics");
+
+    passed &= check(stage24_fixed_caches_logically_equal(
+                        &linear,
+                        &part2,
+                        STAGE25_BENCH_KEY_SPACE),
+                    "dynamic implementations end in identical logical state");
+
+    passed &= check(cache_validate(&linear) &&
+                    part1_cache_validate(&part2),
+                    "dynamic equivalence caches satisfy invariants");
+
+    return passed;
+}
+
+int stage25_test_dynamic_workload_replay(void)
+{
+    WorkloadOp first[128];
+    WorkloadOp second[128];
+    size_t i;
+    size_t decrease = 0U;
+    size_t unchanged = 0U;
+    size_t increase = 0U;
+    int passed = 1;
+
+    printf("\n[Stage 25] deterministic dynamic benchmark workload\n");
+
+    passed &= check(stage25_generate_dynamic_operations(
+                        first, 128U, STAGE25_BENCH_SEED, 31ULL),
+                    "generate first dynamic benchmark workload");
+    passed &= check(stage25_generate_dynamic_operations(
+                        second, 128U, STAGE25_BENCH_SEED, 31ULL),
+                    "replay dynamic benchmark workload");
+
+    for (i = 0U; i < 128U; ++i) {
+        passed &= check(workload_operation_equal(&first[i], &second[i]),
+                        "same seed reproduces dynamic benchmark operation");
+        passed &= check(first[i].key >= 1ULL && first[i].key <= 31ULL,
+                        "dynamic benchmark key stays inside key space");
+
+        if (first[i].scenario == PART2_RANK_DECREASE) {
+            ++decrease;
+        } else if (first[i].scenario == PART2_RANK_UNCHANGED) {
+            ++unchanged;
+        } else if (first[i].scenario == PART2_RANK_INCREASE) {
+            ++increase;
+        } else {
+            passed &= check(0, "dynamic benchmark scenario is valid");
+        }
+    }
+
+    passed &= check(decrease > 0U && unchanged > 0U && increase > 0U,
+                    "dynamic benchmark sample exercises all rank directions");
+
+    return passed;
+}
+
+int stage25_run_dynamic_rank_benchmark(void)
+{
+#ifdef RANKED_CACHE_OPTIMIZED_BUILD
+    const size_t total_ops =
+        STAGE25_BENCH_WARMUP_OPS + STAGE25_BENCH_MEASURED_OPS;
+    WorkloadOp *operations;
+    Stage24Timing linear_timings[STAGE25_BENCH_REPEATS] = {{0.0, 0.0, 0U}};
+    Stage24Timing part2_timings[STAGE25_BENCH_REPEATS] = {{0.0, 0.0, 0U}};
+    Cache warm_linear;
+    Part1Cache warm_part2;
+    Cache measured_linear;
+    Part1Cache measured_part2;
+    CacheStats warm_linear_stats = {0};
+    CacheStats warm_part2_stats = {0};
+    CacheStats linear_stats = {0};
+    CacheStats part2_stats = {0};
+    Stage24Timing warm_linear_timing = {0.0, 0.0, 0U};
+    Stage24Timing warm_part2_timing = {0.0, 0.0, 0U};
+    size_t repeat;
+    double linear_median;
+    double part2_median;
+    double ratio;
+    int passed = 1;
+
+    printf("\n[Stage 25] optimized dynamic-rank benchmark\n");
+
+    operations = (WorkloadOp *)malloc(total_ops * sizeof(*operations));
+    passed &= check(operations != NULL,
+                    "allocate deterministic dynamic-rank benchmark operations");
+
+    if (operations == NULL) {
+        return 0;
+    }
+
+    passed &= check(stage25_generate_dynamic_operations(
+                        operations,
+                        total_ops,
+                        STAGE25_BENCH_SEED,
+                        STAGE25_BENCH_KEY_SPACE),
+                    "generate deterministic dynamic-rank benchmark workload");
+
+    /* Warmup is outside the measured operation interval. */
+    passed &= check(stage25_run_linear_dynamic_workload(
+                        operations,
+                        STAGE25_BENCH_WARMUP_OPS,
+                        &warm_linear_timing,
+                        &warm_linear,
+                        &warm_linear_stats),
+                    "warm up linear dynamic-rank reference path");
+
+    passed &= check(stage25_run_part2_dynamic_workload(
+                        operations,
+                        STAGE25_BENCH_WARMUP_OPS,
+                        &warm_part2_timing,
+                        &warm_part2,
+                        &warm_part2_stats),
+                    "warm up indexed Part 2 dynamic-rank path");
+
+    passed &= check(warm_linear_timing.checksum == warm_part2_timing.checksum &&
+                    stage21_stats_equal(warm_linear_stats, warm_part2_stats) &&
+                    stage24_fixed_caches_logically_equal(
+                        &warm_linear, &warm_part2, STAGE25_BENCH_KEY_SPACE),
+                    "dynamic warmup implementations remain semantically equivalent");
+
+    printf("  workload: capacity=%u key_space=%llu measured_ops=%u repeats=%u\n",
+           STAGE25_BENCH_CAPACITY,
+           (unsigned long long)STAGE25_BENCH_KEY_SPACE,
+           STAGE25_BENCH_MEASURED_OPS,
+           STAGE25_BENCH_REPEATS);
+
+    for (repeat = 0U; repeat < STAGE25_BENCH_REPEATS; ++repeat) {
+        const WorkloadOp *measured_ops =
+            operations + STAGE25_BENCH_WARMUP_OPS;
+
+        if ((repeat % 2U) == 0U) {
+            passed &= check(stage25_run_linear_dynamic_workload(
+                                measured_ops,
+                                STAGE25_BENCH_MEASURED_OPS,
+                                &linear_timings[repeat],
+                                &measured_linear,
+                                &linear_stats),
+                            "measure linear dynamic-rank reference path");
+            passed &= check(stage25_run_part2_dynamic_workload(
+                                measured_ops,
+                                STAGE25_BENCH_MEASURED_OPS,
+                                &part2_timings[repeat],
+                                &measured_part2,
+                                &part2_stats),
+                            "measure indexed Part 2 dynamic-rank path");
+        } else {
+            passed &= check(stage25_run_part2_dynamic_workload(
+                                measured_ops,
+                                STAGE25_BENCH_MEASURED_OPS,
+                                &part2_timings[repeat],
+                                &measured_part2,
+                                &part2_stats),
+                            "measure indexed Part 2 dynamic-rank path");
+            passed &= check(stage25_run_linear_dynamic_workload(
+                                measured_ops,
+                                STAGE25_BENCH_MEASURED_OPS,
+                                &linear_timings[repeat],
+                                &measured_linear,
+                                &linear_stats),
+                            "measure linear dynamic-rank reference path");
+        }
+
+        passed &= check(linear_timings[repeat].checksum ==
+                        part2_timings[repeat].checksum,
+                        "measured dynamic implementations produce identical checksum");
+
+        passed &= check(stage21_stats_equal(linear_stats, part2_stats),
+                        "measured dynamic implementations produce identical statistics");
+
+        passed &= check(stage24_fixed_caches_logically_equal(
+                            &measured_linear,
+                            &measured_part2,
+                            STAGE25_BENCH_KEY_SPACE),
+                        "measured dynamic implementations end in identical logical state");
+
+        passed &= check(cache_validate(&measured_linear) &&
+                        part1_cache_validate(&measured_part2),
+                        "measured dynamic caches satisfy final invariants");
+
+        printf("  repeat %zu: linear-dynamic=%10.2f ns/op  part2=%10.2f ns/op\n",
+               repeat + 1U,
+               linear_timings[repeat].ns_per_op,
+               part2_timings[repeat].ns_per_op);
+    }
+
+    linear_median = stage24_median_ns_per_op(
+        linear_timings, STAGE25_BENCH_REPEATS);
+    part2_median = stage24_median_ns_per_op(
+        part2_timings, STAGE25_BENCH_REPEATS);
+    ratio = part2_median > 0.0 ? linear_median / part2_median : 0.0;
+
+    printf("  median:   linear-dynamic=%10.2f ns/op  part2=%10.2f ns/op\n",
+           linear_median,
+           part2_median);
+    printf("  median ratio (linear-dynamic / part2): %.3f x\n", ratio);
+    printf("  measured stats: hits=%llu misses=%llu rank_updates=%llu "
+           "dec=%llu same=%llu inc=%llu\n",
+           (unsigned long long)part2_stats.hits,
+           (unsigned long long)part2_stats.misses,
+           (unsigned long long)part2_stats.rank_updates,
+           (unsigned long long)part2_stats.rank_decreases,
+           (unsigned long long)part2_stats.rank_unchanged,
+           (unsigned long long)part2_stats.rank_increases);
+    printf("  checksum sink: %llu\n",
+           (unsigned long long)g_stage25_checksum_sink);
+
+    passed &= check(linear_median > 0.0 && part2_median > 0.0,
+                    "dynamic-rank benchmark records positive elapsed time");
+
+    free(operations);
+    return passed;
+#else
+    printf("\n[Stage 25] dynamic-rank benchmark timing skipped in non-optimized build\n");
+    printf("[INFO] Build with RANKED_CACHE_OPTIMIZED_BUILD=1 and -O3 -DNDEBUG.\n");
+    return 1;
+#endif
+}
+
+int stage25_run_dynamic_rank_benchmark_tests(void)
+{
+    int passed = 1;
+
+    printf("\n=== Stage 25: benchmark dynamic rank ===\n");
+
+    passed &= stage25_test_dynamic_workload_replay();
+    passed &= stage25_test_dynamic_reference_semantics();
+    passed &= stage25_run_dynamic_rank_benchmark();
+
+    printf("\nStage 25 findings:\n");
+    printf("  dynamic benchmark compares a linear reference with indexed Part 2.\n");
+    printf("  both paths consume the same pre-generated key/scenario operation stream.\n");
+    printf("  the linear reference mirrors Part 2 hit-only rank updates and (rank,key) eviction.\n");
+    printf("  warmup is outside the measured operation interval.\n");
+    printf("  repeated runs alternate execution order and report median ns/op.\n");
+    printf("  checksums, CacheStats, final state, and invariants guard timing correctness.\n");
+    printf("  timing remains observational and is not a correctness threshold.\n");
+    printf("Stage 25 boundary: dynamic-rank benchmark only; no further optimization is added.\n");
+    printf("Stage 25 dynamic-rank benchmark validation: %s\n",
+           passed ? "PASS" : "FAIL");
+
+    return passed;
+}
+
 int main(void)
 {
     Cache cache;
@@ -6569,7 +7094,12 @@ int main(void)
 
     all_passed &= stage24_run_fixed_rank_benchmark_tests();
 
-    printf("\nStage 24 validation: %s\n",
+    printf("\nStage 24 regression validation: %s\n",
+           all_passed ? "PASS" : "FAIL");
+
+    all_passed &= stage25_run_dynamic_rank_benchmark_tests();
+
+    printf("\nStage 25 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;

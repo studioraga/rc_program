@@ -6963,6 +6963,556 @@ It establishes the fixed-rank benchmark first.
 
 ---
 
+## Stage 25 — Benchmark Dynamic Rank
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 24 established the first benchmark for fixed-rank Part 1.
+
+Stage 25 now benchmarks the Part 2 dynamic-rank path only.
+
+It compares:
+
+```text
+linear dynamic-rank reference
+        versus
+indexed Part 2 cache
+```
+
+The benchmark preserves the Stage 24 measurement discipline:
+
+```text
+deterministic pre-generated workload
+warmup outside measured interval
+fresh cache per measured repetition
+alternating execution order
+CLOCK_MONOTONIC
+five measured repetitions
+median ns/op
+checksum guard
+final-state guard
+```
+
+Stage 25 adds stronger dynamic-rank correctness guards:
+
+```text
+identical CacheStats
+identical rank-direction counts
+identical final key/value/rank state
+identical cache invariants
+```
+
+No speedup threshold is used as a correctness requirement.
+
+---
+
+## Dynamic-Rank Reference Semantics
+
+The original linear cache did not contain a Part 2 dynamic-rank API.
+
+Stage 25 therefore adds a **benchmark/reference-only** dynamic access helper:
+
+```c
+stage25_linear_dynamic_get()
+```
+
+It mirrors the Stage 19 Part 2 semantics:
+
+### Hit
+
+```text
+linear key lookup
+        |
+        v
+resident found
+        |
+        v
+apply deterministic rank scenario
+        |
+        +--> decrease
+        +--> unchanged
+        +--> increase
+```
+
+### Miss
+
+```text
+linear key lookup -> miss
+        |
+        v
+DB read
+        |
+        v
+evict minimum if full
+        |
+        v
+insert fetched entry
+```
+
+The rank scenario is applied on hits only.
+
+It is not applied on a miss, matching:
+
+```c
+part2_cache_get()
+```
+
+### Equal-rank eviction rule
+
+There is one important difference between the old Stage 3 linear cache and the integrated heap.
+
+The old linear reference selects the first encountered entry for equal minimum ranks.
+
+The Part 2 heap uses deterministic:
+
+```text
+(rank, key)
+```
+
+ordering.
+
+For Stage 25 semantic equivalence, the benchmark-only linear dynamic reference therefore selects its eviction victim using:
+
+```text
+lowest rank
+then lowest key
+```
+
+This ensures both measured implementations implement the same dynamic cache policy.
+
+The production Stage 3 reference implementation itself is not changed.
+
+---
+
+## Stage 25 Benchmark Configuration
+
+```text
+capacity        = 100
+key space       = 200
+warmup ops      = 20,000
+measured ops    = 200,000
+repetitions     = 5
+seed            = 0xd1b54a32d192ed03
+clock           = CLOCK_MONOTONIC
+```
+
+Each generated operation contains:
+
+```text
+key
+rank scenario
+```
+
+where the rank scenario is:
+
+```text
+DECREASE
+UNCHANGED
+INCREASE
+```
+
+The complete workload is generated before timing starts.
+
+The same exact `WorkloadOp[]` array is supplied to both measured implementations.
+
+---
+
+## Dynamic Benchmark Execution
+
+### Linear dynamic reference
+
+For each operation:
+
+```text
+O(N) linear key lookup
+        |
+        +--> hit
+        |     |
+        |     v
+        |   modify resident rank
+        |
+        +--> miss
+              |
+              v
+            optional O(N) minimum selection
+```
+
+### Indexed Part 2
+
+For each operation:
+
+```text
+expected O(1) hash lookup
+        |
+        +--> hit
+        |     |
+        |     v
+        |   O(1) heap-index lookup
+        |     |
+        |     v
+        |   O(log N) rank repair worst case
+        |
+        +--> miss
+              |
+              v
+            heap/hash insertion/eviction path
+```
+
+---
+
+## Warmup and Measurement
+
+Stage 25 pre-generates:
+
+```text
+warmup operations
++
+measured operations
+```
+
+The first:
+
+```text
+20,000 operations
+```
+
+are executed before the measured repetitions.
+
+Warmup timing is discarded.
+
+Every measured repetition initializes fresh caches and runs only:
+
+```text
+200,000 measured operations
+```
+
+inside the timed workload loop.
+
+Execution order alternates:
+
+```text
+repeat 1:
+linear dynamic -> Part 2
+
+repeat 2:
+Part 2 -> linear dynamic
+
+repeat 3:
+linear dynamic -> Part 2
+
+repeat 4:
+Part 2 -> linear dynamic
+
+repeat 5:
+linear dynamic -> Part 2
+```
+
+This reduces a fixed first/second ordering bias without making the benchmark nondeterministic.
+
+---
+
+## Stage 25 Correctness Guards
+
+Timing is accepted only if both implementations produce the same semantics.
+
+### Checksum
+
+Each returned resident contributes:
+
+```text
+key
+value
+rank
+```
+
+to a workload checksum.
+
+The checksums must match.
+
+### Statistics
+
+Stage 25 requires the complete statistics vectors to match:
+
+```text
+accesses
+hits
+misses
+db_reads
+insertions
+evictions
+rank_provider_calls
+rank_updates
+rank_decreases
+rank_unchanged
+rank_increases
+```
+
+### Final logical state
+
+For every key in the benchmark key space:
+
+```text
+resident/absent state
+key
+value
+rank
+```
+
+must match.
+
+### Structural invariants
+
+After each measured repetition:
+
+```c
+cache_validate()
+```
+
+and:
+
+```c
+part1_cache_validate()
+```
+
+must pass.
+
+No benchmark timing is accepted merely because it is positive.
+
+Correctness equivalence comes first.
+
+---
+
+## Stage 25 Validation
+
+### Dynamic workload replay
+
+Stage 25 validates a deterministic 128-operation sample.
+
+The same seed must reproduce the same:
+
+```text
+key
+scenario
+```
+
+pair for every operation.
+
+The sample must contain all three scenario classes:
+
+```text
+decrease
+unchanged
+increase
+```
+
+### Untimed semantic-equivalence run
+
+Before the optimized benchmark, Stage 25 executes a deterministic:
+
+```text
+2,000-operation
+```
+
+dynamic workload through both implementations.
+
+It verifies:
+
+```text
+identical checksum
+identical CacheStats
+identical final logical state
+valid linear cache
+valid integrated Part 2 cache
+```
+
+This check also runs under the Stage 22 correctness/sanitizer configuration.
+
+---
+
+## Stage 25 Correctness Build
+
+Re-run the correctness gate against the Stage 25 source:
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -Werror \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fno-omit-frame-pointer \
+    -DRANKED_CACHE_CORRECTNESS_BUILD=1 \
+    -fsanitize=address,undefined \
+    ranked_cache.c \
+    -o ranked_cache25_correctness
+```
+
+Run:
+
+```bash
+ASAN_OPTIONS=detect_leaks=1 \
+UBSAN_OPTIONS=halt_on_error=1 \
+./ranked_cache25_correctness
+```
+
+In this build the wall-clock Stage 25 benchmark is skipped, but all dynamic workload and semantic-equivalence validation runs.
+
+Expected:
+
+```text
+Stage 25 dynamic-rank benchmark validation: PASS
+Stage 25 validation: PASS
+```
+
+---
+
+## Stage 25 Optimized Benchmark Build
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -Werror \
+    -std=c11 \
+    -O3 \
+    -DNDEBUG \
+    -DRANKED_CACHE_OPTIMIZED_BUILD=1 \
+    ranked_cache.c \
+    -o ranked_cache25_optimized
+```
+
+Run:
+
+```bash
+./ranked_cache25_optimized
+```
+
+Expected Stage 25 ending:
+
+```text
+Stage 25 findings:
+  dynamic benchmark compares a linear reference with indexed Part 2.
+  both paths consume the same pre-generated key/scenario operation stream.
+  the linear reference mirrors Part 2 hit-only rank updates and (rank,key) eviction.
+  warmup is outside the measured operation interval.
+  repeated runs alternate execution order and report median ns/op.
+  checksums, CacheStats, final state, and invariants guard timing correctness.
+  timing remains observational and is not a correctness threshold.
+Stage 25 boundary: dynamic-rank benchmark only; no further optimization is added.
+Stage 25 dynamic-rank benchmark validation: PASS
+
+Stage 25 validation: PASS
+```
+
+---
+
+## Stage 25 Observed Result in the Validation Sandbox
+
+One optimized validation run produced:
+
+```text
+repeat 1: linear-dynamic=33.76 ns/op  part2=11.47 ns/op
+repeat 2: linear-dynamic=33.18 ns/op  part2=11.04 ns/op
+repeat 3: linear-dynamic=32.00 ns/op  part2=10.93 ns/op
+repeat 4: linear-dynamic=33.06 ns/op  part2=12.20 ns/op
+repeat 5: linear-dynamic=35.09 ns/op  part2=11.31 ns/op
+```
+
+Median:
+
+```text
+linear dynamic = 33.18 ns/op
+indexed Part 2 = 11.31 ns/op
+
+linear-dynamic / Part2 = 2.933x
+```
+
+Measured workload statistics were:
+
+```text
+hits          = 199,900
+misses        = 100
+rank updates  = 199,900
+decreases     = 66,612
+unchanged     = 66,804
+increases     = 66,484
+```
+
+On this validation host, the indexed Part 2 implementation was therefore about:
+
+```text
+2.93x
+```
+
+faster by the median ratio for this specific workload.
+
+This is an environment-specific observation, not a universal speedup claim.
+
+Results can vary with:
+
+- processor,
+- cache hierarchy,
+- compiler version,
+- CPU frequency,
+- scheduler activity,
+- operating-system load,
+- virtualization/container overhead.
+
+The authoritative result for the project should be obtained by rebuilding and rerunning the same Stage 25 optimized target on the intended Node1 environment.
+
+No specific speedup is required for Stage 25 to pass.
+
+---
+
+## Stage 25 Complexity Context
+
+The dynamic linear reference can require:
+
+```text
+hit lookup                    O(N)
+miss lookup                   O(N)
+minimum selection             O(N)
+rank update after known hit   O(1)
+```
+
+The integrated Part 2 path uses:
+
+```text
+hash lookup                   expected O(1)
+resident heap position        O(1)
+rank repair                   O(log N) worst case
+heap minimum                  O(1)
+heap insertion/removal        O(log N)
+```
+
+Stage 25 is the first benchmark that directly exercises the Part 2 indexed rank-update advantage validated structurally in Stages 14 through 19.
+
+---
+
+### Stage 25 boundary
+
+Stage 25 deliberately does **not** add:
+
+- further cache optimization,
+- CPU affinity,
+- real-time scheduler configuration,
+- hardware performance counters,
+- `perf` integration,
+- `-march=native`,
+- LTO,
+- PGO,
+- multithreading,
+- benchmark-result persistence,
+- confidence intervals,
+- latency percentiles.
+
+It benchmarks the existing dynamic-rank implementations only.
+
+---
+
 ## Build Environment
 
 Current target environment:
@@ -6974,7 +7524,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -Werror -std=c11 -O3 -DNDEBUG -DRANKED_CACHE_OPTIMIZED_BUILD=1 ranked_cache.c -o ranked_cache24_optimized
+gcc -Wall -Wextra -Wpedantic -Werror -std=c11 -O3 -DNDEBUG -DRANKED_CACHE_OPTIMIZED_BUILD=1 ranked_cache.c -o ranked_cache25_optimized
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -6990,22 +7540,22 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache24_optimized
+./ranked_cache25_optimized
 ```
 
 ### Expected result
 
-The active Stage 24 fixed-rank benchmark suite must end with:
+The active Stage 25 dynamic-rank benchmark suite must end with:
 
 ```text
-Stage 24 validation: PASS
+Stage 25 validation: PASS
 ```
 
 The Stage 10 Part 1 path combines the hash table and min-heap while preserving the earlier linear cache as a regression/reference implementation.
 
 ### Validation result
 
-Stages 0 through 24 have been validated successfully. The Stage 22 correctness build still passes with assertions and ASan/UBSan, the Stage 23 optimized build still passes, and Stage 24 adds a deterministic fixed-rank benchmark with correctness guards and median CLOCK_MONOTONIC timing.
+Stages 0 through 25 have been validated successfully. The Stage 22 correctness build still passes with assertions and ASan/UBSan, the Stage 23 optimized build still passes, Stage 24 fixed-rank benchmarking remains a regression, and Stage 25 adds a deterministic dynamic-rank benchmark with checksum/statistics/state guards and median CLOCK_MONOTONIC timing.
 
 ---
 
@@ -7099,7 +7649,12 @@ At this commit, the program can:
 - pre-generate workload keys and keep warmup outside the measured interval,
 - alternate benchmark execution order across repeated runs,
 - report median fixed-rank nanoseconds per operation, and
-- verify benchmark checksums and final logical state before accepting timing output.
+- verify benchmark checksums and final logical state before accepting timing output,
+- benchmark a dynamic-rank linear reference against indexed Part 2,
+- use the same pre-generated key/scenario stream for both dynamic implementations,
+- require dynamic benchmark checksum, CacheStats, final-state, and invariant equivalence,
+- alternate dynamic benchmark execution order across five repetitions, and
+- report median dynamic-rank nanoseconds per operation without using speed as a PASS threshold.
 
 At this commit, the program intentionally does **not** implement:
 
@@ -7207,6 +7762,10 @@ still reports no timing or performance result.
 
 Stage 24 adds the first `CLOCK_MONOTONIC` timing harness, limited to fixed-rank Part 1.
 Measured values are observational only and never determine correctness PASS/FAIL.
+
+Stage 25 extends the same timing discipline to dynamic rank. It compares a linear
+dynamic reference against the existing indexed Part 2 path while requiring exact
+statistics and logical-state equivalence before accepting each timing sample.
 
 ---
 
@@ -7599,4 +8158,23 @@ WARMUP-OUTSIDE-MEASUREMENT PASS
 5-REPEAT BENCHMARK PASS
 MEDIAN NS/OP REPORT PASS
 DYNAMIC-RANK BENCHMARK NOT INTRODUCED
+
+
+Stage 25
+Benchmark dynamic rank
+COMPLETE
+CORRECTNESS BUILD REGRESSION PASS
+OPTIMIZED BUILD REGRESSION PASS
+DETERMINISTIC DYNAMIC WORKLOAD PASS
+ALL RANK DIRECTIONS PASS
+DYNAMIC SEMANTIC EQUIVALENCE PASS
+CHECKSUM GUARD PASS
+CACHESTATS GUARD PASS
+FINAL-STATE GUARD PASS
+INVARIANT GUARD PASS
+CLOCK_MONOTONIC TIMING PASS
+WARMUP-OUTSIDE-MEASUREMENT PASS
+5-REPEAT DYNAMIC BENCHMARK PASS
+MEDIAN NS/OP REPORT PASS
+NO FURTHER OPTIMIZATION INTRODUCED
 ```
