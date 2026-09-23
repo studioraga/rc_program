@@ -9011,3 +9011,59 @@ WARMUP-OUTSIDE-MEASUREMENT PASS
 3-REPEAT CPU-BEHAVIOR RUN PASS
 NO HARDWARE COUNTERS INTRODUCED
 ```
+
+---
+
+## Stage 28 V6 — Validation + Instrumentation + Benchmark
+
+Stage 28 now includes a V6 comparison layer under `cmp_alternative/`.
+
+V6 does **not** introduce a sixth cache architecture. Versions A through E remain the five implementations being compared. V6 adds a common experimental layer around them so the comparison is based on three separate kinds of evidence:
+
+```text
+validation
+    all versions implement the same logical cache behavior
+
+instrumentation
+    count the primitive work each data structure performs
+
+benchmark
+    measure wall-clock ns/op with instrumentation disabled
+```
+
+The implementation remains in:
+
+```text
+cmp_alternative/ranked_cached_cmp_alternative_stage28.c
+```
+
+The detailed V6 design, counters, deterministic workload, and benchmark results are documented in:
+
+```text
+cmp_alternative/README.md
+```
+
+### V6 validation status
+
+The V6 deterministic validation workload uses:
+
+```text
+capacity   = 32
+key_space  = 65
+operations = 4000
+seed       = 0x510e527fade682d1
+```
+
+All Versions A–E must produce the same checksum and the same `CacheStats` before instrumentation or benchmark results are accepted.
+
+The V6 normal, ASan/UBSan, and optimized builds all end with:
+
+```text
+V6 cross-version validation: PASS
+V6 instrumentation validation: PASS
+V6 benchmark validation: PASS
+V6 validation + instrumentation + benchmark: PASS
+Stage 28 alternative-implementation validation: PASS
+```
+
+The Stage 27 production/reference file `ranked_cache.c` is not modified by V6.

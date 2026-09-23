@@ -7,6 +7,9 @@
  *
  * This file is intentionally separate from ranked_cache.c.  The main source
  * remains the incremental production/reference implementation through Stage 27.
+ * V6 adds validation + instrumentation + benchmark on top of the five cache
+ * alternatives.  The A-E algorithms remain unchanged; V6 observes them.
+ *
  * This comparison program implements five complete caches that share exactly
  * the same external semantics so their data-structure trade-offs can be studied
  * side-by-side:
@@ -58,6 +61,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define CMP_MAX_CAPACITY 100U
 #define CMP_HASH_CAPACITY 257U
@@ -101,6 +105,57 @@ typedef struct {
     CacheKey key;
     RankScenario scenario;
 } WorkloadOp;
+
+
+/* ------------------------------------------------------------------------- */
+/* V6 — validation + instrumentation + benchmark                             */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Instrumentation is intentionally external to the A-E data structures.
+ *
+ * A single active pointer lets the benchmark disable instrumentation entirely
+ * while the dedicated instrumentation pass counts primitive operations.
+ */
+typedef struct {
+    uint64_t linear_lookup_comparisons;
+    uint64_t linear_min_comparisons;
+
+    uint64_t hash_slot_probes;
+
+    uint64_t avl_key_comparisons;
+    uint64_t avl_rotations;
+
+    uint64_t lazy_heap_comparisons;
+    uint64_t lazy_heap_swaps;
+    uint64_t lazy_heap_pushes;
+    uint64_t lazy_heap_pops;
+    uint64_t lazy_stale_discards;
+
+    uint64_t indexed_heap_comparisons;
+    uint64_t indexed_heap_swaps;
+} V6Instrumentation;
+
+typedef struct {
+    double seconds;
+    double ns_per_op;
+    uint64_t checksum;
+} V6Timing;
+
+static V6Instrumentation *g_v6_instrumentation = NULL;
+
+static void v6_count(uint64_t *counter)
+{
+    if (g_v6_instrumentation != NULL && counter != NULL) {
+        ++(*counter);
+    }
+}
+
+static double v6_elapsed_seconds(struct timespec start, struct timespec end)
+{
+    return (double)(end.tv_sec - start.tv_sec) +
+           (double)(end.tv_nsec - start.tv_nsec) / 1000000000.0;
+}
 
 static CacheEntry db_read_entry(CacheKey key)
 {
@@ -243,6 +298,10 @@ static void *hash_lookup(const HashTable *table, CacheKey key)
         size_t index = (start + step) % CMP_HASH_CAPACITY;
         const HashSlot *slot = &table->slots[index];
 
+        if (g_v6_instrumentation != NULL) {
+            v6_count(&g_v6_instrumentation->hash_slot_probes);
+        }
+
         if (slot->state == HASH_EMPTY) {
             return NULL;
         }
@@ -267,6 +326,10 @@ static int hash_insert(HashTable *table, CacheKey key, void *value)
     for (step = 0U; step < CMP_HASH_CAPACITY; ++step) {
         size_t index = (start + step) % CMP_HASH_CAPACITY;
         HashSlot *slot = &table->slots[index];
+
+        if (g_v6_instrumentation != NULL) {
+            v6_count(&g_v6_instrumentation->hash_slot_probes);
+        }
 
         if (slot->state == HASH_OCCUPIED && slot->key == key) {
             return 0;
@@ -307,6 +370,10 @@ static int hash_remove(HashTable *table, CacheKey key)
     for (step = 0U; step < CMP_HASH_CAPACITY; ++step) {
         size_t index = (start + step) % CMP_HASH_CAPACITY;
         HashSlot *slot = &table->slots[index];
+
+        if (g_v6_instrumentation != NULL) {
+            v6_count(&g_v6_instrumentation->hash_slot_probes);
+        }
 
         if (slot->state == HASH_EMPTY) {
             return 0;
@@ -366,6 +433,9 @@ static CacheEntry *a_lookup(VersionA *cache, CacheKey key)
 {
     size_t i;
     for (i = 0U; i < cache->size; ++i) {
+        if (g_v6_instrumentation != NULL) {
+            v6_count(&g_v6_instrumentation->linear_lookup_comparisons);
+        }
         if (cache->entries[i].key == key) {
             return &cache->entries[i];
         }
@@ -378,6 +448,9 @@ static size_t a_min_index(const VersionA *cache)
     size_t best = 0U;
     size_t i;
     for (i = 1U; i < cache->size; ++i) {
+        if (g_v6_instrumentation != NULL) {
+            v6_count(&g_v6_instrumentation->linear_min_comparisons);
+        }
         if (entry_less(&cache->entries[i], &cache->entries[best])) {
             best = i;
         }
@@ -552,9 +625,13 @@ static StableEntry *b_find_min(VersionB *cache)
     size_t i;
     for (i = 0U; i < cache->pool.capacity; ++i) {
         StableEntry *candidate = &cache->pool.entries[i];
-        if (candidate->active &&
-            (best == NULL || entry_less(&candidate->data, &best->data))) {
-            best = candidate;
+        if (candidate->active) {
+            if (best != NULL && g_v6_instrumentation != NULL) {
+                v6_count(&g_v6_instrumentation->linear_min_comparisons);
+            }
+            if (best == NULL || entry_less(&candidate->data, &best->data)) {
+                best = candidate;
+            }
         }
     }
     return best;
@@ -655,6 +732,9 @@ static void avl_refresh(AvlNode *node)
 
 static int avl_entry_cmp(const CacheEntry *a, const CacheEntry *b)
 {
+    if (g_v6_instrumentation != NULL) {
+        v6_count(&g_v6_instrumentation->avl_key_comparisons);
+    }
     if (a->rank < b->rank) return -1;
     if (a->rank > b->rank) return 1;
     if (a->key < b->key) return -1;
@@ -665,6 +745,9 @@ static int avl_entry_cmp(const CacheEntry *a, const CacheEntry *b)
 static AvlNode *avl_rotate_right(AvlNode *y)
 {
     AvlNode *x = y->left;
+    if (g_v6_instrumentation != NULL) {
+        v6_count(&g_v6_instrumentation->avl_rotations);
+    }
     AvlNode *t2 = x->right;
     x->right = y;
     y->left = t2;
@@ -676,6 +759,9 @@ static AvlNode *avl_rotate_right(AvlNode *y)
 static AvlNode *avl_rotate_left(AvlNode *x)
 {
     AvlNode *y = x->right;
+    if (g_v6_instrumentation != NULL) {
+        v6_count(&g_v6_instrumentation->avl_rotations);
+    }
     AvlNode *t2 = y->left;
     y->left = x;
     x->right = t2;
@@ -907,6 +993,9 @@ typedef struct {
 
 static int lazy_node_less(const LazyHeapNode *a, const LazyHeapNode *b)
 {
+    if (g_v6_instrumentation != NULL) {
+        v6_count(&g_v6_instrumentation->lazy_heap_comparisons);
+    }
     if (a->rank_snapshot != b->rank_snapshot) {
         return a->rank_snapshot < b->rank_snapshot;
     }
@@ -916,6 +1005,9 @@ static int lazy_node_less(const LazyHeapNode *a, const LazyHeapNode *b)
 static void lazy_swap(LazyHeapNode *a, LazyHeapNode *b)
 {
     LazyHeapNode tmp = *a;
+    if (g_v6_instrumentation != NULL) {
+        v6_count(&g_v6_instrumentation->lazy_heap_swaps);
+    }
     *a = *b;
     *b = tmp;
 }
@@ -924,6 +1016,9 @@ static int lazy_push(LazyHeap *heap, LazyHeapNode node)
 {
     size_t i;
     if (heap == NULL || heap->size >= CMP_LAZY_HEAP_MAX) return 0;
+    if (g_v6_instrumentation != NULL) {
+        v6_count(&g_v6_instrumentation->lazy_heap_pushes);
+    }
     i = heap->size++;
     heap->nodes[i] = node;
     while (i > 0U) {
@@ -939,6 +1034,9 @@ static int lazy_pop_raw(LazyHeap *heap, LazyHeapNode *out)
 {
     size_t i = 0U;
     if (heap == NULL || heap->size == 0U) return 0;
+    if (g_v6_instrumentation != NULL) {
+        v6_count(&g_v6_instrumentation->lazy_heap_pops);
+    }
     if (out != NULL) *out = heap->nodes[0];
     --heap->size;
     if (heap->size == 0U) return 1;
@@ -976,6 +1074,9 @@ static StableEntry *d_peek_current_min(VersionD *cache)
         }
         (void)lazy_pop_raw(&cache->heap, NULL);
         ++cache->stale_discards;
+        if (g_v6_instrumentation != NULL) {
+            v6_count(&g_v6_instrumentation->lazy_stale_discards);
+        }
     }
     return NULL;
 }
@@ -1099,6 +1200,9 @@ typedef struct {
 static void indexed_swap(IndexedHeap *heap, size_t a, size_t b)
 {
     StableEntry *tmp = heap->items[a];
+    if (g_v6_instrumentation != NULL) {
+        v6_count(&g_v6_instrumentation->indexed_heap_swaps);
+    }
     heap->items[a] = heap->items[b];
     heap->items[b] = tmp;
     heap->items[a]->heap_index = a;
@@ -1109,6 +1213,9 @@ static void indexed_sift_up(IndexedHeap *heap, size_t i)
 {
     while (i > 0U) {
         size_t parent = (i - 1U) / 2U;
+        if (g_v6_instrumentation != NULL) {
+            v6_count(&g_v6_instrumentation->indexed_heap_comparisons);
+        }
         if (!entry_less(&heap->items[i]->data, &heap->items[parent]->data)) break;
         indexed_swap(heap, i, parent);
         i = parent;
@@ -1121,8 +1228,18 @@ static void indexed_sift_down(IndexedHeap *heap, size_t i)
         size_t left = 2U * i + 1U;
         size_t right = left + 1U;
         size_t best = i;
-        if (left < heap->size && entry_less(&heap->items[left]->data, &heap->items[best]->data)) best = left;
-        if (right < heap->size && entry_less(&heap->items[right]->data, &heap->items[best]->data)) best = right;
+        if (left < heap->size) {
+            if (g_v6_instrumentation != NULL) {
+                v6_count(&g_v6_instrumentation->indexed_heap_comparisons);
+            }
+            if (entry_less(&heap->items[left]->data, &heap->items[best]->data)) best = left;
+        }
+        if (right < heap->size) {
+            if (g_v6_instrumentation != NULL) {
+                v6_count(&g_v6_instrumentation->indexed_heap_comparisons);
+            }
+            if (entry_less(&heap->items[right]->data, &heap->items[best]->data)) best = right;
+        }
         if (best == i) break;
         indexed_swap(heap, i, best);
         i = best;
@@ -1503,6 +1620,573 @@ static void print_complexity_table(void)
     printf("M = number of lazy-heap records, which can grow with rank updates.\n");
 }
 
+
+/* ------------------------------------------------------------------------- */
+/* V6 validation + instrumentation + benchmark harness                       */
+/* ------------------------------------------------------------------------- */
+
+#define V6_CAPACITY 32U
+#define V6_KEY_SPACE 65ULL
+#define V6_VALIDATION_OPS 4000U
+#define V6_INSTRUMENT_OPS 4000U
+#define V6_WARMUP_OPS 1000U
+#define V6_BENCH_OPS 10000U
+#define V6_BENCH_REPETITIONS 5U
+#define V6_SEED UINT64_C(0x510e527fade682d1)
+
+typedef enum {
+    V6_VERSION_A = 0,
+    V6_VERSION_B = 1,
+    V6_VERSION_C = 2,
+    V6_VERSION_D = 3,
+    V6_VERSION_E = 4,
+    V6_VERSION_COUNT = 5
+} V6VersionId;
+
+static const char *v6_version_name(V6VersionId id)
+{
+    static const char *names[V6_VERSION_COUNT] = {
+        "Version A", "Version B", "Version C", "Version D", "Version E"
+    };
+    return (id >= V6_VERSION_A && id < V6_VERSION_COUNT) ? names[id] : "Unknown";
+}
+
+static int v6_generate_workload(WorkloadOp *ops,
+                                size_t count,
+                                uint64_t seed,
+                                CacheKey key_space)
+{
+    WorkloadGenerator generator;
+    size_t i;
+
+    if ((ops == NULL && count != 0U) ||
+        !workload_init(&generator, seed, key_space)) {
+        return 0;
+    }
+
+    for (i = 0U; i < count; ++i) {
+        if (!workload_next(&generator, &ops[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static uint64_t v6_run_version(V6VersionId id,
+                               const WorkloadOp *ops,
+                               size_t count,
+                               size_t capacity,
+                               CacheStats *stats_out,
+                               int validate_final,
+                               V6Instrumentation *instrumentation,
+                               size_t *aux_size_out,
+                               uint64_t *stale_discards_out)
+{
+    uint64_t checksum = 0U;
+    size_t i;
+
+    if (ops == NULL || stats_out == NULL) {
+        return 0U;
+    }
+
+    memset(stats_out, 0, sizeof(*stats_out));
+    if (aux_size_out != NULL) *aux_size_out = 0U;
+    if (stale_discards_out != NULL) *stale_discards_out = 0U;
+    if (instrumentation != NULL) {
+        memset(instrumentation, 0, sizeof(*instrumentation));
+    }
+
+    g_v6_instrumentation = instrumentation;
+
+    switch (id) {
+    case V6_VERSION_A: {
+        VersionA cache;
+        if (!a_init(&cache, capacity)) {
+            g_v6_instrumentation = NULL;
+            return 0U;
+        }
+        for (i = 0U; i < count; ++i) {
+            CacheEntry *entry = a_get(&cache, ops[i].key, ops[i].scenario);
+            if (entry == NULL) {
+                g_v6_instrumentation = NULL;
+                return 0U;
+            }
+            checksum = checksum_mix(checksum, entry);
+        }
+        g_v6_instrumentation = NULL;
+        if (validate_final && !a_validate(&cache)) return 0U;
+        *stats_out = cache.stats;
+        if (aux_size_out != NULL) *aux_size_out = cache.size;
+        return checksum;
+    }
+
+    case V6_VERSION_B: {
+        VersionB cache;
+        if (!b_init(&cache, capacity)) {
+            g_v6_instrumentation = NULL;
+            return 0U;
+        }
+        for (i = 0U; i < count; ++i) {
+            CacheEntry *entry = b_get(&cache, ops[i].key, ops[i].scenario);
+            if (entry == NULL) {
+                g_v6_instrumentation = NULL;
+                return 0U;
+            }
+            checksum = checksum_mix(checksum, entry);
+        }
+        g_v6_instrumentation = NULL;
+        if (validate_final && !b_validate(&cache)) return 0U;
+        *stats_out = cache.stats;
+        if (aux_size_out != NULL) *aux_size_out = cache.pool.size;
+        return checksum;
+    }
+
+    case V6_VERSION_C: {
+        VersionC cache;
+        int valid;
+        if (!c_init(&cache, capacity)) {
+            g_v6_instrumentation = NULL;
+            return 0U;
+        }
+        for (i = 0U; i < count; ++i) {
+            CacheEntry *entry = c_get(&cache, ops[i].key, ops[i].scenario);
+            if (entry == NULL) {
+                g_v6_instrumentation = NULL;
+                avl_free_all(cache.root);
+                return 0U;
+            }
+            checksum = checksum_mix(checksum, entry);
+        }
+        g_v6_instrumentation = NULL;
+        valid = !validate_final || c_validate(&cache);
+        *stats_out = cache.stats;
+        if (aux_size_out != NULL) *aux_size_out = cache.pool.size;
+        avl_free_all(cache.root);
+        return valid ? checksum : 0U;
+    }
+
+    case V6_VERSION_D: {
+        VersionD cache;
+        if (!d_init(&cache, capacity)) {
+            g_v6_instrumentation = NULL;
+            return 0U;
+        }
+        for (i = 0U; i < count; ++i) {
+            CacheEntry *entry = d_get(&cache, ops[i].key, ops[i].scenario);
+            if (entry == NULL) {
+                g_v6_instrumentation = NULL;
+                return 0U;
+            }
+            checksum = checksum_mix(checksum, entry);
+        }
+        g_v6_instrumentation = NULL;
+        if (validate_final && !d_validate(&cache)) return 0U;
+        *stats_out = cache.stats;
+        if (aux_size_out != NULL) *aux_size_out = cache.heap.size;
+        if (stale_discards_out != NULL) *stale_discards_out = cache.stale_discards;
+        return checksum;
+    }
+
+    case V6_VERSION_E: {
+        VersionE cache;
+        if (!e_init(&cache, capacity)) {
+            g_v6_instrumentation = NULL;
+            return 0U;
+        }
+        for (i = 0U; i < count; ++i) {
+            CacheEntry *entry = e_get(&cache, ops[i].key, ops[i].scenario);
+            if (entry == NULL) {
+                g_v6_instrumentation = NULL;
+                return 0U;
+            }
+            checksum = checksum_mix(checksum, entry);
+        }
+        g_v6_instrumentation = NULL;
+        if (validate_final && !e_validate(&cache)) return 0U;
+        *stats_out = cache.stats;
+        if (aux_size_out != NULL) *aux_size_out = cache.heap.size;
+        return checksum;
+    }
+
+    default:
+        g_v6_instrumentation = NULL;
+        return 0U;
+    }
+}
+
+static int v6_validate_semantic_equivalence(void)
+{
+    WorkloadOp *ops;
+    CacheStats stats[V6_VERSION_COUNT];
+    uint64_t checksum[V6_VERSION_COUNT];
+    size_t aux_size[V6_VERSION_COUNT];
+    uint64_t stale[V6_VERSION_COUNT];
+    size_t i;
+    int passed = 1;
+
+    ops = (WorkloadOp *)malloc(V6_VALIDATION_OPS * sizeof(*ops));
+    if (ops == NULL) return 0;
+
+    passed &= v6_generate_workload(
+        ops, V6_VALIDATION_OPS, V6_SEED, V6_KEY_SPACE);
+
+    for (i = 0U; passed && i < V6_VERSION_COUNT; ++i) {
+        checksum[i] = v6_run_version(
+            (V6VersionId)i,
+            ops,
+            V6_VALIDATION_OPS,
+            V6_CAPACITY,
+            &stats[i],
+            1,
+            NULL,
+            &aux_size[i],
+            &stale[i]);
+
+        if (checksum[i] == 0U) {
+            passed = 0;
+        }
+    }
+
+    for (i = 1U; passed && i < V6_VERSION_COUNT; ++i) {
+        if (checksum[i] != checksum[0] || !stats_equal(stats[i], stats[0])) {
+            passed = 0;
+        }
+    }
+
+    if (passed) {
+        printf("\nV6 semantic validation: PASS\n");
+        printf("  capacity=%u key_space=%llu operations=%u checksum=%" PRIu64 "\n",
+               V6_CAPACITY,
+               (unsigned long long)V6_KEY_SPACE,
+               V6_VALIDATION_OPS,
+               checksum[0]);
+        print_stats("V6 oracle", stats[0]);
+        printf("  Version D lazy heap records=%zu stale_discards=%" PRIu64 "\n",
+               aux_size[V6_VERSION_D], stale[V6_VERSION_D]);
+        printf("  Version E indexed heap records=%zu\n",
+               aux_size[V6_VERSION_E]);
+    }
+
+    free(ops);
+    return passed;
+}
+
+static void v6_print_instrumentation_row(const char *name,
+                                         const V6Instrumentation *m)
+{
+    printf("%-9s lookup_cmp=%" PRIu64
+           " min_cmp=%" PRIu64
+           " hash_probes=%" PRIu64
+           " avl_cmp=%" PRIu64
+           " avl_rot=%" PRIu64
+           " lazy_cmp=%" PRIu64
+           " lazy_swap=%" PRIu64
+           " lazy_push=%" PRIu64
+           " lazy_pop=%" PRIu64
+           " stale=%" PRIu64
+           " idx_cmp=%" PRIu64
+           " idx_swap=%" PRIu64 "\n",
+           name,
+           m->linear_lookup_comparisons,
+           m->linear_min_comparisons,
+           m->hash_slot_probes,
+           m->avl_key_comparisons,
+           m->avl_rotations,
+           m->lazy_heap_comparisons,
+           m->lazy_heap_swaps,
+           m->lazy_heap_pushes,
+           m->lazy_heap_pops,
+           m->lazy_stale_discards,
+           m->indexed_heap_comparisons,
+           m->indexed_heap_swaps);
+}
+
+static int v6_run_instrumentation_pass(void)
+{
+    WorkloadOp *ops;
+    V6Instrumentation metrics[V6_VERSION_COUNT];
+    CacheStats stats[V6_VERSION_COUNT];
+    uint64_t checksum[V6_VERSION_COUNT];
+    size_t aux_size[V6_VERSION_COUNT];
+    uint64_t stale[V6_VERSION_COUNT];
+    size_t i;
+    int passed = 1;
+
+    ops = (WorkloadOp *)malloc(V6_INSTRUMENT_OPS * sizeof(*ops));
+    if (ops == NULL) return 0;
+
+    passed &= v6_generate_workload(
+        ops, V6_INSTRUMENT_OPS, V6_SEED, V6_KEY_SPACE);
+
+    for (i = 0U; passed && i < V6_VERSION_COUNT; ++i) {
+        checksum[i] = v6_run_version(
+            (V6VersionId)i,
+            ops,
+            V6_INSTRUMENT_OPS,
+            V6_CAPACITY,
+            &stats[i],
+            1,
+            &metrics[i],
+            &aux_size[i],
+            &stale[i]);
+        if (checksum[i] == 0U) passed = 0;
+    }
+
+    for (i = 1U; passed && i < V6_VERSION_COUNT; ++i) {
+        if (checksum[i] != checksum[0] || !stats_equal(stats[i], stats[0])) {
+            passed = 0;
+        }
+    }
+
+    if (passed) {
+        passed &= metrics[V6_VERSION_A].linear_lookup_comparisons > 0U;
+        passed &= metrics[V6_VERSION_A].linear_min_comparisons > 0U;
+        passed &= metrics[V6_VERSION_A].hash_slot_probes == 0U;
+
+        passed &= metrics[V6_VERSION_B].hash_slot_probes > 0U;
+        passed &= metrics[V6_VERSION_B].linear_min_comparisons > 0U;
+
+        passed &= metrics[V6_VERSION_C].hash_slot_probes > 0U;
+        passed &= metrics[V6_VERSION_C].avl_key_comparisons > 0U;
+        passed &= metrics[V6_VERSION_C].avl_rotations > 0U;
+
+        passed &= metrics[V6_VERSION_D].hash_slot_probes > 0U;
+        passed &= metrics[V6_VERSION_D].lazy_heap_comparisons > 0U;
+        passed &= metrics[V6_VERSION_D].lazy_heap_pushes > 0U;
+        passed &= metrics[V6_VERSION_D].lazy_stale_discards > 0U;
+
+        passed &= metrics[V6_VERSION_E].hash_slot_probes > 0U;
+        passed &= metrics[V6_VERSION_E].indexed_heap_comparisons > 0U;
+        passed &= metrics[V6_VERSION_E].indexed_heap_swaps > 0U;
+    }
+
+    if (passed) {
+        printf("\nV6 instrumentation counters\n");
+        for (i = 0U; i < V6_VERSION_COUNT; ++i) {
+            v6_print_instrumentation_row(v6_version_name((V6VersionId)i),
+                                         &metrics[i]);
+        }
+        printf("  Version D final lazy heap records=%zu\n",
+               aux_size[V6_VERSION_D]);
+        printf("  Version E final indexed heap records=%zu\n",
+               aux_size[V6_VERSION_E]);
+    }
+
+    free(ops);
+    return passed;
+}
+
+static int v6_benchmark_one(V6VersionId id,
+                            const WorkloadOp *ops,
+                            size_t count,
+                            V6Timing *timing)
+{
+    CacheStats stats;
+    struct timespec start;
+    struct timespec end;
+    uint64_t checksum;
+    double seconds;
+
+    if (ops == NULL || timing == NULL || count == 0U) {
+        return 0;
+    }
+
+    g_v6_instrumentation = NULL;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) return 0;
+
+    checksum = v6_run_version(
+        id, ops, count, V6_CAPACITY, &stats, 0, NULL, NULL, NULL);
+
+    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0 || checksum == 0U) return 0;
+
+    seconds = v6_elapsed_seconds(start, end);
+    if (seconds <= 0.0) return 0;
+
+    timing->seconds = seconds;
+    timing->ns_per_op = seconds * 1000000000.0 / (double)count;
+    timing->checksum = checksum;
+    return 1;
+}
+
+static void v6_sort_doubles(double *values, size_t count)
+{
+    size_t i;
+    size_t j;
+    for (i = 0U; i < count; ++i) {
+        for (j = i + 1U; j < count; ++j) {
+            if (values[j] < values[i]) {
+                double tmp = values[i];
+                values[i] = values[j];
+                values[j] = tmp;
+            }
+        }
+    }
+}
+
+static double v6_median(double *values, size_t count)
+{
+    v6_sort_doubles(values, count);
+    return values[count / 2U];
+}
+
+static int v6_run_benchmark(void)
+{
+    WorkloadOp *warmup;
+    WorkloadOp *measured;
+    double samples[V6_VERSION_COUNT][V6_BENCH_REPETITIONS];
+    uint64_t reference_checksum[V6_BENCH_REPETITIONS] = {0U};
+    size_t rep;
+    size_t version;
+    int passed = 1;
+
+    warmup = (WorkloadOp *)malloc(V6_WARMUP_OPS * sizeof(*warmup));
+    measured = (WorkloadOp *)malloc(V6_BENCH_OPS * sizeof(*measured));
+    if (warmup == NULL || measured == NULL) {
+        free(warmup);
+        free(measured);
+        return 0;
+    }
+
+    passed &= v6_generate_workload(
+        warmup, V6_WARMUP_OPS, V6_SEED ^ UINT64_C(0x1111111111111111),
+        V6_KEY_SPACE);
+    passed &= v6_generate_workload(
+        measured, V6_BENCH_OPS, V6_SEED ^ UINT64_C(0x2222222222222222),
+        V6_KEY_SPACE);
+
+    /*
+     * Warm each implementation independently outside the measured interval.
+     * The warmup cache is intentionally discarded.
+     */
+    for (version = 0U; passed && version < V6_VERSION_COUNT; ++version) {
+        CacheStats warm_stats;
+        if (v6_run_version((V6VersionId)version,
+                           warmup,
+                           V6_WARMUP_OPS,
+                           V6_CAPACITY,
+                           &warm_stats,
+                           0,
+                           NULL,
+                           NULL,
+                           NULL) == 0U) {
+            passed = 0;
+        }
+    }
+
+    for (rep = 0U; passed && rep < V6_BENCH_REPETITIONS; ++rep) {
+        /*
+         * Rotate the first implementation each repetition to avoid always
+         * giving Version A the same scheduling/cache position.
+         */
+        for (version = 0U; version < V6_VERSION_COUNT; ++version) {
+            size_t rotated = (version + rep) % V6_VERSION_COUNT;
+            V6Timing timing;
+
+            if (!v6_benchmark_one((V6VersionId)rotated,
+                                  measured,
+                                  V6_BENCH_OPS,
+                                  &timing)) {
+                passed = 0;
+                break;
+            }
+
+            samples[rotated][rep] = timing.ns_per_op;
+
+            if (rotated == V6_VERSION_A) {
+                reference_checksum[rep] = timing.checksum;
+            } else if (reference_checksum[rep] != 0U &&
+                       timing.checksum != reference_checksum[rep]) {
+                passed = 0;
+                break;
+            }
+        }
+
+        /*
+         * Version A may execute later in the rotation. Verify the whole row
+         * once all five samples have completed.
+         */
+        if (passed) {
+            uint64_t oracle = 0U;
+            for (version = 0U; version < V6_VERSION_COUNT; ++version) {
+                CacheStats stats;
+                uint64_t checksum = v6_run_version(
+                    (V6VersionId)version,
+                    measured,
+                    V6_BENCH_OPS,
+                    V6_CAPACITY,
+                    &stats,
+                    1,
+                    NULL,
+                    NULL,
+                    NULL);
+                if (checksum == 0U) {
+                    passed = 0;
+                    break;
+                }
+                if (version == 0U) oracle = checksum;
+                if (checksum != oracle) {
+                    passed = 0;
+                    break;
+                }
+            }
+            reference_checksum[rep] = oracle;
+        }
+    }
+
+    if (passed) {
+        printf("\nV6 optimized-style benchmark (instrumentation disabled)\n");
+        printf("  capacity=%u key_space=%llu warmup=%u measured=%u repetitions=%u\n",
+               V6_CAPACITY,
+               (unsigned long long)V6_KEY_SPACE,
+               V6_WARMUP_OPS,
+               V6_BENCH_OPS,
+               V6_BENCH_REPETITIONS);
+        for (version = 0U; version < V6_VERSION_COUNT; ++version) {
+            double copy[V6_BENCH_REPETITIONS];
+            double median;
+            for (rep = 0U; rep < V6_BENCH_REPETITIONS; ++rep) {
+                copy[rep] = samples[version][rep];
+            }
+            median = v6_median(copy, V6_BENCH_REPETITIONS);
+            printf("  %-9s median=%9.2f ns/op samples=",
+                   v6_version_name((V6VersionId)version), median);
+            for (rep = 0U; rep < V6_BENCH_REPETITIONS; ++rep) {
+                printf("%s%.2f", rep == 0U ? "" : ",", samples[version][rep]);
+            }
+            printf("\n");
+        }
+    }
+
+    free(warmup);
+    free(measured);
+    return passed;
+}
+
+static int run_v6_validation_instrumentation_benchmark(void)
+{
+    int passed = 1;
+
+    printf("\n=== V6 — Validation + instrumentation + benchmark ===\n");
+
+    passed &= v6_validate_semantic_equivalence();
+    printf("V6 cross-version validation: %s\n", passed ? "PASS" : "FAIL");
+
+    if (passed) {
+        passed &= v6_run_instrumentation_pass();
+        printf("V6 instrumentation validation: %s\n", passed ? "PASS" : "FAIL");
+    }
+
+    if (passed) {
+        passed &= v6_run_benchmark();
+        printf("V6 benchmark validation: %s\n", passed ? "PASS" : "FAIL");
+    }
+
+    printf("V6 validation + instrumentation + benchmark: %s\n",
+           passed ? "PASS" : "FAIL");
+    return passed;
+}
+
 int main(void)
 {
     int passed = 1;
@@ -1520,6 +2204,10 @@ int main(void)
 
     if (passed) {
         passed &= run_deterministic_equivalence_test();
+    }
+
+    if (passed) {
+        passed &= run_v6_validation_instrumentation_benchmark();
     }
 
     printf("\nStage 28 alternative-implementation validation: %s\n",

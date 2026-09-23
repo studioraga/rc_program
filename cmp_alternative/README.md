@@ -9261,3 +9261,367 @@ Stage 28 deliberately does not replace the main `ranked_cache.c` implementation 
 
 It creates a side-by-side comparison laboratory for Versions A–E only.
 
+
+---
+
+# Stage 28 V6 — Validation + Instrumentation + Benchmark
+
+**Status: COMPLETE AND VALIDATED**
+
+V6 is an experimental layer on top of the existing Stage 28 Versions A–E.
+
+It is **not** a sixth cache implementation.
+
+The five architectures remain:
+
+```text
+Version A — linear array
+Version B — hash + linear minimum
+Version C — hash + AVL tree
+Version D — hash + lazy heap
+Version E — hash + indexed heap
+```
+
+V6 adds three independent activities around those implementations:
+
+```text
+1. validation
+2. instrumentation
+3. benchmark
+```
+
+Keeping those activities separate is deliberate. Instrumentation counters are useful for explaining *why* implementations behave differently, but incrementing counters itself adds work. Therefore V6 disables instrumentation during the wall-clock benchmark.
+
+## V6.1 — Validation layer
+
+The V6 semantic-validation workload uses:
+
+```text
+capacity   = 32
+key_space  = 65
+operations = 4000
+seed       = 0x510e527fade682d1
+```
+
+All five implementations consume the exact same pre-generated operation stream.
+
+Every operation contains:
+
+```text
+key
+rank scenario: DECREASE / UNCHANGED / INCREASE
+```
+
+V6 requires all five versions to produce the same:
+
+- returned-entry checksum,
+- access count,
+- hit count,
+- miss count,
+- DB-read count,
+- insertion count,
+- eviction count,
+- rank-update count,
+- rank-decrease count,
+- rank-unchanged count,
+- rank-increase count,
+- final valid cache structure.
+
+The deterministic V6 oracle is:
+
+```text
+accesses     = 4000
+hits         = 1940
+misses       = 2060
+evictions    = 2028
+rank_updates = 1940
+checksum     = 530825638660624256
+```
+
+The lazy/indexed heap ending sizes are also observable:
+
+```text
+Version D lazy heap records    = 1828
+Version D stale discards       = 144
+Version E indexed heap records = 32
+```
+
+This validation runs before instrumentation or timing is considered.
+
+## V6.2 — Instrumentation layer
+
+V6 introduces `V6Instrumentation`.
+
+The counters are external to the cache structures so Versions A–E remain architecturally unchanged.
+
+The instrumentation pointer is enabled only during the instrumentation pass and disabled during benchmarking.
+
+### Counters
+
+```c
+uint64_t linear_lookup_comparisons;
+uint64_t linear_min_comparisons;
+
+uint64_t hash_slot_probes;
+
+uint64_t avl_key_comparisons;
+uint64_t avl_rotations;
+
+uint64_t lazy_heap_comparisons;
+uint64_t lazy_heap_swaps;
+uint64_t lazy_heap_pushes;
+uint64_t lazy_heap_pops;
+uint64_t lazy_stale_discards;
+
+uint64_t indexed_heap_comparisons;
+uint64_t indexed_heap_swaps;
+```
+
+These counters expose the data-structure work that Big-O notation hides.
+
+### Version A instrumentation
+
+Version A counts:
+
+```text
+linear lookup key comparisons
+linear minimum comparisons
+```
+
+For the 4000-operation V6 workload:
+
+```text
+linear lookup comparisons = 97862
+linear minimum comparisons = 62868
+```
+
+No hash/tree/heap work should be recorded.
+
+### Version B instrumentation
+
+Version B removes the linear lookup scan by using the hash table, but minimum selection remains a linear scan.
+
+Observed V6 counters:
+
+```text
+hash probes               = 194806
+linear minimum comparisons = 62868
+```
+
+The equal `62868` minimum-comparison count for Versions A and B makes the remaining Version B bottleneck explicit.
+
+### Version C instrumentation
+
+Version C replaces linear minimum selection with the AVL tree.
+
+Observed V6 counters:
+
+```text
+hash probes         = 194806
+AVL comparisons     = 40002
+AVL rotations       = 1778
+```
+
+The counters expose the balancing work required to maintain the `(rank,key)` ordered tree.
+
+### Version D instrumentation
+
+Version D records lazy-heap work:
+
+```text
+hash probes          = 194806
+heap comparisons     = 59018
+heap swaps           = 38296
+heap pushes          = 4000
+heap pops            = 2172
+stale root discards  = 144
+```
+
+Every hit produces a new versioned heap record rather than modifying an arbitrary heap node in place.
+
+The final V6 lazy heap contains:
+
+```text
+1828 records for 32 residents
+```
+
+which directly exposes the memory/work-history trade-off.
+
+### Version E instrumentation
+
+Version E records indexed-heap repair work:
+
+```text
+hash probes             = 194806
+indexed heap comparisons = 27959
+indexed heap swaps       = 18494
+```
+
+The heap remains bounded to:
+
+```text
+32 records for 32 residents
+```
+
+because each resident has exactly one indexed-heap position.
+
+## V6.3 — Benchmark layer
+
+The benchmark intentionally runs with:
+
+```c
+g_v6_instrumentation = NULL;
+```
+
+so counter increments do not contaminate timing.
+
+Configuration:
+
+```text
+capacity       = 32
+key_space      = 65
+warmup         = 1000 operations
+measured       = 10000 operations
+repetitions    = 5
+```
+
+The workload is pre-generated before timing begins.
+
+Warmup runs outside the measured interval.
+
+Each timed implementation starts from a fresh cache.
+
+The first implementation is rotated across repetitions so Version A does not always receive the same scheduling/cache position.
+
+Timing uses:
+
+```c
+clock_gettime(CLOCK_MONOTONIC, ...)
+```
+
+and reports:
+
+```text
+nanoseconds per operation
+five samples
+median sample
+```
+
+No measured speed is used as a correctness PASS threshold.
+
+### Optimized validation-host result
+
+One `-O3 -DNDEBUG` validation run produced:
+
+| Version | Median ns/op | Architecture |
+|---|---:|---|
+| A | 27.54 | linear array |
+| B | 111.65 | hash + linear minimum |
+| C | 161.56 | hash + AVL tree |
+| D | 151.92 | hash + lazy heap |
+| E | 104.06 | hash + indexed heap |
+
+These measurements are environment-specific.
+
+At `capacity=32`, Version A can still benefit from excellent contiguous-array locality and very small absolute `N`; the asymptotically stronger alternatives pay hashing, pointer, tree, or heap constant factors.
+
+The benchmark therefore does **not** declare the fastest measured version to be the universally best architecture.
+
+Version E remains the bounded optimized Part 2 architecture because it combines:
+
+```text
+expected O(1) lookup
+O(log N) arbitrary rank repair
+O(1) minimum peek
+O(log N) eviction
+one heap position per resident
+```
+
+whereas Version D retains an update-history-dependent heap and Version B retains O(N) minimum selection.
+
+For authoritative performance evidence, rebuild and rerun the optimized comparison binary on the intended Node1 environment.
+
+## V6.4 — Build and validation
+
+Run all commands from:
+
+```bash
+cd cmp_alternative
+```
+
+### Normal warning-clean build
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -Werror \
+    -std=c11 \
+    ranked_cached_cmp_alternative_stage28.c \
+    -o ranked_cached_cmp_alternative_v6
+
+./ranked_cached_cmp_alternative_v6
+```
+
+### ASan/UBSan build
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -Werror \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fsanitize=address,undefined \
+    ranked_cached_cmp_alternative_stage28.c \
+    -o ranked_cached_cmp_alternative_v6_san
+
+ASAN_OPTIONS=detect_leaks=1 \
+UBSAN_OPTIONS=halt_on_error=1 \
+./ranked_cached_cmp_alternative_v6_san
+```
+
+### Optimized benchmark build
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -Werror \
+    -std=c11 \
+    -O3 \
+    -DNDEBUG \
+    ranked_cached_cmp_alternative_stage28.c \
+    -o ranked_cached_cmp_alternative_v6_optimized
+
+./ranked_cached_cmp_alternative_v6_optimized
+```
+
+All builds must end with:
+
+```text
+V6 cross-version validation: PASS
+V6 instrumentation validation: PASS
+V6 benchmark validation: PASS
+V6 validation + instrumentation + benchmark: PASS
+Stage 28 alternative-implementation validation: PASS
+```
+
+## V6.5 — Boundary
+
+V6 deliberately does not:
+
+- add a Version F cache,
+- change the A–E algorithms,
+- modify `ranked_cache.c`,
+- use `perf` or hardware counters,
+- pin CPU affinity,
+- lock CPU frequency,
+- use `-march=native`, LTO, or PGO,
+- add multithreading.
+
+It adds validation, explainable primitive-operation instrumentation, and a common wall-clock benchmark around the existing five Stage 28 alternatives.
