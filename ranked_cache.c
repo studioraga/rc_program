@@ -21,6 +21,7 @@
  *   Stage 15 - harden min_heap_swap() as the indexed-heap consistency primitive
  *   Stage 16 - add min_heap_update_rank() for arbitrary resident priority repair
  *   Stage 17 - test rank-decrease repair independently
+ *   Stage 18 - test rank-increase repair independently
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
@@ -67,6 +68,10 @@
  * maintains it during heap push/swap/pop operations. Stage 14 does not yet use
  * the index to repair a changed priority; it only establishes trustworthy O(1)
  * resident-to-heap-position metadata for the next incremental step.
+ *
+ * Stage 17 independently stress-tests only the rank-decrease/sift-up branch of
+ * min_heap_update_rank(). Stage 18 now mirrors that discipline for the
+ * rank-increase/sift-down branch without changing production heap logic.
  */
 
 #include <stdio.h>
@@ -3878,6 +3883,264 @@ int stage17_run_rank_decrease_tests(void)
     return passed;
 }
 
+
+
+/* ---------- Stage 18: test rank increase independently ---------- */
+
+/*
+ * Stage 16 implemented min_heap_update_rank(). Stage 18 makes no production
+ * changes; it exercises only the new-rank > old-rank branch in greater depth.
+ */
+
+int stage18_test_increase_without_movement(void)
+{
+    MinHeap heap;
+    CacheEntry entries[7];
+    CacheEntry *target;
+    size_t original_index;
+    int passed = 1;
+
+    printf("\n[Stage 18] rank increase that does not require movement\n");
+
+    passed &= check(stage16_prepare_update_heap(&heap, entries, 7U),
+                    "prepare no-move increase heap");
+
+    target = &entries[1]; /* key 2, rank 20, index 1, children 40 and 50 */
+    original_index = target->heap_index;
+
+    passed &= check(original_index == 1U,
+                    "no-move increase target starts at internal index 1");
+
+    passed &= check(min_heap_update_rank(&heap, target, 35LL),
+                    "increase key 2 rank from 20 to 35");
+
+    passed &= check(target->rank == 35LL &&
+                    target->heap_index == original_index,
+                    "higher rank still below both children stays in place");
+
+    passed &= check(min_heap_validate(&heap) &&
+                    stage14_check_all_heap_indices(&heap),
+                    "no-move increase preserves heap and reverse indices");
+
+    return passed;
+}
+
+int stage18_test_increase_one_level(void)
+{
+    MinHeap heap;
+    CacheEntry entries[7];
+    CacheEntry *target;
+    int passed = 1;
+
+    printf("\n[Stage 18] rank increase moves exactly one level downward\n");
+
+    passed &= check(stage16_prepare_update_heap(&heap, entries, 7U),
+                    "prepare one-level increase heap");
+
+    target = &entries[0]; /* root rank 10; children ranks 20 and 30 */
+
+    passed &= check(target->heap_index == 0U,
+                    "one-level increase target starts at root");
+
+    passed &= check(min_heap_update_rank(&heap, target, 25LL),
+                    "increase key 1 rank from 10 to 25");
+
+    passed &= check(target->rank == 25LL &&
+                    target->heap_index == 1U &&
+                    heap.items[1] == target,
+                    "increase crosses smaller child and moves to index 1");
+
+    passed &= check(heap.items[0]->rank == 20LL &&
+                    target->rank < heap.items[3]->rank &&
+                    target->rank < heap.items[4]->rank,
+                    "target stops after one level when still below its new children");
+
+    passed &= check(min_heap_validate(&heap) &&
+                    stage14_check_all_heap_indices(&heap),
+                    "one-level increase preserves all invariants");
+
+    return passed;
+}
+
+int stage18_test_increase_multiple_levels(void)
+{
+    MinHeap heap;
+    CacheEntry entries[7];
+    CacheEntry *target;
+    int passed = 1;
+
+    printf("\n[Stage 18] rank increase moves through multiple levels downward\n");
+
+    passed &= check(stage16_prepare_update_heap(&heap, entries, 7U),
+                    "prepare multi-level increase heap");
+
+    target = &entries[0];
+
+    passed &= check(min_heap_update_rank(&heap, target, 100LL),
+                    "increase key 1 rank from 10 to 100");
+
+    passed &= check(target->rank == 100LL &&
+                    target->heap_index == 3U &&
+                    heap.items[3] == target &&
+                    min_heap_peek(&heap)->rank == 20LL,
+                    "multi-level increase descends from root to leaf index 3");
+
+    passed &= check(min_heap_validate(&heap) &&
+                    stage14_check_all_heap_indices(&heap),
+                    "multi-level increase preserves heap/index consistency");
+
+    return passed;
+}
+
+int stage18_test_increase_equal_rank_key_tie(void)
+{
+    MinHeap heap;
+    CacheEntry entries[] = {
+        {30ULL, 3000ULL, 10LL, HEAP_INDEX_NONE},
+        {20ULL, 2000ULL, 20LL, HEAP_INDEX_NONE},
+        {10ULL, 1000ULL, 20LL, HEAP_INDEX_NONE}
+    };
+    CacheEntry *target = &entries[0];
+    int passed = 1;
+
+    printf("\n[Stage 18] rank increase respects equal-rank child tie ordering\n");
+
+    min_heap_init(&heap);
+    for (size_t i = 0U; i < sizeof(entries) / sizeof(entries[0]); ++i) {
+        passed &= check(min_heap_push(&heap, &entries[i]),
+                        "prepare tie-order increase heap");
+    }
+
+    passed &= check(target->heap_index == 0U,
+                    "tie-order increase target starts at root");
+
+    passed &= check(min_heap_update_rank(&heap, target, 20LL),
+                    "increase key 30 rank from 10 to 20");
+
+    /*
+     * Both children now tie target on rank 20. Among the two children,
+     * key 10 is smaller than key 20 and also smaller than target key 30,
+     * so sift-down must choose key 10 as the new root.
+     */
+    passed &= check(min_heap_peek(&heap)->key == 10ULL &&
+                    min_heap_peek(&heap)->rank == 20LL &&
+                    target->heap_index == 2U &&
+                    heap.items[2] == target,
+                    "equal-rank children use lower key when choosing downward swap");
+
+    passed &= check(min_heap_validate(&heap) &&
+                    stage14_check_all_heap_indices(&heap),
+                    "tie-order increase leaves heap valid");
+
+    return passed;
+}
+
+int stage18_test_repeated_increases_use_updated_heap_index(void)
+{
+    MinHeap heap;
+    CacheEntry entries[7];
+    CacheEntry *target;
+    int passed = 1;
+
+    printf("\n[Stage 18] repeated increases use the resident's updated heap_index\n");
+
+    passed &= check(stage16_prepare_update_heap(&heap, entries, 7U),
+                    "prepare repeated-increase heap");
+
+    target = &entries[0];
+
+    passed &= check(min_heap_update_rank(&heap, target, 25LL),
+                    "first increase moves key 1 from index 0 to index 1");
+    passed &= check(target->heap_index == 1U,
+                    "first increase updates heap_index to 1");
+
+    passed &= check(min_heap_update_rank(&heap, target, 100LL),
+                    "second increase uses new index and moves key 1 to leaf");
+    passed &= check(target->heap_index == 3U &&
+                    heap.items[3] == target,
+                    "second increase descends through updated reverse index");
+
+    passed &= check(min_heap_validate(&heap) &&
+                    stage14_check_all_heap_indices(&heap),
+                    "repeated increases preserve heap/index consistency");
+
+    return passed;
+}
+
+int stage18_test_integrated_hash_found_rank_increase(void)
+{
+    Part1Cache cache;
+    CacheEntry entry;
+    CacheEntry *resident;
+    CacheKey key;
+    int passed = 1;
+
+    printf("\n[Stage 18] integrated hash-found resident rank increase\n");
+
+    passed &= check(part1_cache_init(&cache, 5U),
+                    "initialize integrated increase cache");
+
+    for (key = 1ULL; key <= 5ULL; ++key) {
+        entry.key = key;
+        entry.value = key * 100ULL;
+        entry.rank = (Rank)(key * 10ULL);
+        entry.heap_index = HEAP_INDEX_NONE;
+
+        passed &= check(part1_cache_insert(&cache, entry, NULL),
+                        "fill integrated increase cache");
+    }
+
+    resident = part1_cache_lookup(&cache, 1ULL);
+    passed &= check(resident != NULL &&
+                    resident->rank == 10LL &&
+                    resident->heap_index == 0U,
+                    "hash lookup finds root key 1 before increase");
+
+    passed &= check(min_heap_update_rank(&cache.min_heap, resident, 100LL),
+                    "increase hash-found key 1 rank from 10 to 100");
+
+    passed &= check(resident->rank == 100LL &&
+                    resident->heap_index == 3U &&
+                    min_heap_peek(&cache.min_heap) != resident &&
+                    min_heap_peek(&cache.min_heap)->key == 2ULL,
+                    "integrated increase moves hash-found former root downward");
+
+    passed &= check(part1_cache_lookup(&cache, 1ULL) == resident,
+                    "hash index still points to same resident after increase");
+
+    passed &= check(part1_cache_validate(&cache),
+                    "integrated cache validates after independent increase repair");
+
+    return passed;
+}
+
+int stage18_run_rank_increase_tests(void)
+{
+    int passed = 1;
+
+    printf("\n=== Stage 18: test rank increase independently ===\n");
+
+    passed &= stage18_test_increase_without_movement();
+    passed &= stage18_test_increase_one_level();
+    passed &= stage18_test_increase_multiple_levels();
+    passed &= stage18_test_increase_equal_rank_key_tie();
+    passed &= stage18_test_repeated_increases_use_updated_heap_index();
+    passed &= stage18_test_integrated_hash_found_rank_increase();
+
+    printf("\nStage 18 findings:\n");
+    printf("  a higher rank does not always require movement.\n");
+    printf("  when needed, increase repair moves only downward.\n");
+    printf("  one-level and multi-level sift-down paths both preserve heap_index.\n");
+    printf("  equal-rank child selection still uses the deterministic key tie-break.\n");
+    printf("  repeated increases use the resident's newly maintained heap_index.\n");
+    printf("  a hash-found resident can be increased and repaired without a heap scan.\n");
+    printf("Stage 18 boundary: only rank-increase behavior is expanded here.\n");
+    printf("Stage 18 rank-increase validation: %s\n",
+           passed ? "PASS" : "FAIL");
+
+    return passed;
+}
+
 int main(void)
 {
     Cache cache;
@@ -4036,7 +4299,12 @@ int main(void)
 
     all_passed &= stage17_run_rank_decrease_tests();
 
-    printf("\nStage 17 validation: %s\n",
+    printf("\nStage 17 regression validation: %s\n",
+           all_passed ? "PASS" : "FAIL");
+
+    all_passed &= stage18_run_rank_increase_tests();
+
+    printf("\nStage 18 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;
