@@ -17,6 +17,7 @@
  *   Stage 11 - thorough fixed-rank Part 1 validation
  *   Stage 12 - introduce and validate the Part 2 rank-change contract
  *   Stage 13 - prove ordinary heap lacks direct arbitrary-entry location
+ *   Stage 14 - add and maintain CacheEntry.heap_index reverse position
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
@@ -58,6 +59,11 @@
  * can return CacheEntry * by key, but MinHeap stores only an array of pointers and
  * records no reverse mapping from CacheEntry * to heap index. Locating an arbitrary
  * resident in the heap therefore requires a linear scan at this checkpoint.
+ *
+ * Stage 14 adds that reverse position directly to CacheEntry as heap_index and
+ * maintains it during heap push/swap/pop operations. Stage 14 does not yet use
+ * the index to repair a changed priority; it only establishes trustworthy O(1)
+ * resident-to-heap-position metadata for the next incremental step.
  */
 
 #include <stdio.h>
@@ -67,6 +73,7 @@
 
 #define MAX_CACHE_CAPACITY 100U
 #define HASH_TABLE_CAPACITY 211U
+#define HEAP_INDEX_NONE SIZE_MAX
 
 typedef unsigned long long CacheKey;
 typedef long long Rank;
@@ -75,6 +82,7 @@ typedef struct {
     CacheKey key;
     unsigned long long value;
     Rank rank;
+    size_t heap_index;
 } CacheEntry;
 
 /*
@@ -453,6 +461,7 @@ CacheEntry db_read_entry(CacheKey key)
     e.key = key;
     e.value = key * 100ULL;
     e.rank = (Rank)(key * 10ULL);
+    e.heap_index = HEAP_INDEX_NONE;
 
     return e;
 }
@@ -936,8 +945,16 @@ void min_heap_init(MinHeap *heap)
 void min_heap_swap(MinHeap *heap, size_t a, size_t b)
 {
     CacheEntry *tmp = heap->items[a];
+
     heap->items[a] = heap->items[b];
     heap->items[b] = tmp;
+
+    /*
+     * Stage 14 reverse-position invariant:
+     * every resident heap entry records the array slot that currently owns it.
+     */
+    heap->items[a]->heap_index = a;
+    heap->items[b]->heap_index = b;
 }
 
 void min_heap_sift_up(MinHeap *heap, size_t index)
@@ -994,6 +1011,7 @@ int min_heap_push(MinHeap *heap, CacheEntry *entry)
 
     index = heap->size;
     heap->items[index] = entry;
+    entry->heap_index = index;
     ++heap->size;
     min_heap_sift_up(heap, index);
     return 1;
@@ -1030,11 +1048,13 @@ CacheEntry *min_heap_pop_min(MinHeap *heap)
     if (heap->size > 0U) {
         heap->items[0] = heap->items[heap->size];
         heap->items[heap->size] = NULL;
+        heap->items[0]->heap_index = 0U;
         min_heap_sift_down(heap, 0U);
     } else {
         heap->items[0] = NULL;
     }
 
+    minimum->heap_index = HEAP_INDEX_NONE;
     return minimum;
 }
 
@@ -1055,7 +1075,8 @@ int min_heap_validate(const MinHeap *heap)
         size_t left = 2U * i + 1U;
         size_t right = left + 1U;
 
-        if (heap->items[i] == NULL) {
+        if (heap->items[i] == NULL ||
+            heap->items[i]->heap_index != i) {
             return 0;
         }
 
@@ -1077,12 +1098,12 @@ int stage9_run_min_heap_tests(void)
 {
     MinHeap heap;
     CacheEntry entries[] = {
-        {1ULL, 100ULL, 50LL},
-        {2ULL, 200ULL, 20LL},
-        {3ULL, 300ULL, 80LL},
-        {4ULL, 400ULL, 10LL},
-        {5ULL, 500ULL, 60LL},
-        {6ULL, 600ULL, 20LL}
+        {1ULL, 100ULL, 50LL, HEAP_INDEX_NONE},
+        {2ULL, 200ULL, 20LL, HEAP_INDEX_NONE},
+        {3ULL, 300ULL, 80LL, HEAP_INDEX_NONE},
+        {4ULL, 400ULL, 10LL, HEAP_INDEX_NONE},
+        {5ULL, 500ULL, 60LL, HEAP_INDEX_NONE},
+        {6ULL, 600ULL, 20LL, HEAP_INDEX_NONE}
     };
     const Rank expected_ranks[] = {10LL, 20LL, 20LL, 50LL, 60LL, 80LL};
     const CacheKey expected_keys[] = {4ULL, 2ULL, 6ULL, 1ULL, 5ULL, 3ULL};
@@ -1137,7 +1158,7 @@ int stage9_run_min_heap_tests(void)
     min_heap_init(&heap);
     {
         CacheEntry full_entries[MAX_CACHE_CAPACITY];
-        CacheEntry extra = {9999ULL, 999900ULL, -9999LL};
+        CacheEntry extra = {9999ULL, 999900ULL, -9999LL, HEAP_INDEX_NONE};
 
         for (i = 0U; i < MAX_CACHE_CAPACITY; ++i) {
             full_entries[i].key = (CacheKey)(1000U + i);
@@ -1259,6 +1280,7 @@ int part1_cache_insert(Part1Cache *cache,
     slot_index = cache->free_stack[--cache->free_count];
     resident = &cache->entries[slot_index];
     *resident = entry;
+    resident->heap_index = HEAP_INDEX_NONE;
     cache->active[slot_index] = 1U;
 
     if (!hash_table_insert(&cache->index, resident)) {
@@ -1399,7 +1421,9 @@ int part1_cache_validate(const Part1Cache *cache)
 
             ++active_count;
 
-            if (hash_table_lookup(&cache->index, resident->key) != resident) {
+            if (hash_table_lookup(&cache->index, resident->key) != resident ||
+                resident->heap_index >= cache->min_heap.size ||
+                cache->min_heap.items[resident->heap_index] != resident) {
                 return 0;
             }
 
@@ -1759,8 +1783,8 @@ int stage11_test_repeated_hits_keep_fixed_rank(void)
 int stage11_test_duplicate_rejection(void)
 {
     Part1Cache cache;
-    CacheEntry original = {7ULL, 700ULL, 70LL};
-    CacheEntry duplicate = {7ULL, 7777ULL, 1LL};
+    CacheEntry original = {7ULL, 700ULL, 70LL, HEAP_INDEX_NONE};
+    CacheEntry duplicate = {7ULL, 7777ULL, 1LL, HEAP_INDEX_NONE};
     CacheEntry *resident = NULL;
     CacheEntry *before;
     size_t size_before;
@@ -1804,9 +1828,9 @@ int stage11_test_duplicate_rejection(void)
 int stage11_test_equal_rank_tie(void)
 {
     Part1Cache cache;
-    CacheEntry a = {30ULL, 3000ULL, 50LL};
-    CacheEntry b = {10ULL, 1000ULL, 50LL};
-    CacheEntry c = {20ULL, 2000ULL, 50LL};
+    CacheEntry a = {30ULL, 3000ULL, 50LL, HEAP_INDEX_NONE};
+    CacheEntry b = {10ULL, 1000ULL, 50LL, HEAP_INDEX_NONE};
+    CacheEntry c = {20ULL, 2000ULL, 50LL, HEAP_INDEX_NONE};
     CacheEntry evicted;
     CacheEntry *minimum;
     int passed = 1;
@@ -1844,9 +1868,9 @@ int stage11_test_equal_rank_tie(void)
 int stage11_test_integrated_hash_collisions(void)
 {
     Part1Cache cache;
-    CacheEntry a = {1ULL, 100ULL, 30LL};
-    CacheEntry b = {212ULL, 21200ULL, 10LL};
-    CacheEntry c = {423ULL, 42300ULL, 20LL};
+    CacheEntry a = {1ULL, 100ULL, 30LL, HEAP_INDEX_NONE};
+    CacheEntry b = {212ULL, 21200ULL, 10LL, HEAP_INDEX_NONE};
+    CacheEntry c = {423ULL, 42300ULL, 20LL, HEAP_INDEX_NONE};
     CacheEntry evicted;
     int passed = 1;
 
@@ -1887,7 +1911,7 @@ int stage11_test_capacity_boundaries(void)
 {
     Part1Cache cache;
     Part1Cache maximum;
-    CacheEntry extra = {1001ULL, 100100ULL, 10010LL};
+    CacheEntry extra = {1001ULL, 100100ULL, 10010LL, HEAP_INDEX_NONE};
     CacheEntry *entry;
     size_t i;
     int passed = 1;
@@ -2213,9 +2237,9 @@ int stage12_restore_rank(Part1Cache *cache,
 
 int stage12_prepare_part2_probe_cache(Part1Cache *cache)
 {
-    CacheEntry e1 = {1ULL, 100ULL, 10LL};
-    CacheEntry e2 = {2ULL, 200ULL, 20LL};
-    CacheEntry e3 = {3ULL, 300ULL, 30LL};
+    CacheEntry e1 = {1ULL, 100ULL, 10LL, HEAP_INDEX_NONE};
+    CacheEntry e2 = {2ULL, 200ULL, 20LL, HEAP_INDEX_NONE};
+    CacheEntry e3 = {3ULL, 300ULL, 30LL, HEAP_INDEX_NONE};
 
     if (!part1_cache_init(cache, 3U)) {
         return 0;
@@ -2232,7 +2256,7 @@ int stage12_prepare_part2_probe_cache(Part1Cache *cache)
 
 int stage12_test_rank_direction_contract(void)
 {
-    CacheEntry sample = {7ULL, 700ULL, 70LL};
+    CacheEntry sample = {7ULL, 700ULL, 70LL, HEAP_INDEX_NONE};
     Rank lower;
     Rank same;
     Rank higher;
@@ -2549,6 +2573,7 @@ int stage13_prepare_positioned_heap(MinHeap *heap,
         entries[i].key = (CacheKey)(i + 1U);
         entries[i].value = (unsigned long long)(i + 1U) * 100ULL;
         entries[i].rank = (Rank)(i + 1U);
+        entries[i].heap_index = i;
 
         heap->items[i] = &entries[i];
     }
@@ -2607,7 +2632,7 @@ int stage13_test_heap_position_profiles(void)
 {
     MinHeap heap;
     CacheEntry entries[MAX_CACHE_CAPACITY];
-    CacheEntry missing = {9999ULL, 999900ULL, 9999LL};
+    CacheEntry missing = {9999ULL, 999900ULL, 9999LL, HEAP_INDEX_NONE};
     int passed = 1;
 
     printf("\n[Stage 13] ordinary-heap arbitrary-entry location profiles\n");
@@ -2656,7 +2681,7 @@ int stage13_test_heap_location_scaling(void)
     size_t sizes[] = {1U, 10U, 25U, 50U, 100U};
     MinHeap heap;
     CacheEntry entries[MAX_CACHE_CAPACITY];
-    CacheEntry missing = {8888ULL, 888800ULL, 8888LL};
+    CacheEntry missing = {8888ULL, 888800ULL, 8888LL, HEAP_INDEX_NONE};
     size_t i;
     int passed = 1;
 
@@ -2776,6 +2801,226 @@ int stage13_run_ordinary_heap_limitation_tests(void)
     printf("  after hash lookup, worst-case heap location is still O(N).\n");
     printf("Stage 13 conclusion: Part 2 needs a direct resident -> heap-index mapping.\n");
     printf("Stage 13 ordinary-heap limitation validation: %s\n",
+           passed ? "PASS" : "FAIL");
+
+    return passed;
+}
+
+
+
+/* ---------- Stage 14: introduce and maintain heap_index ---------- */
+
+/*
+ * Stage 14 adds the direct reverse mapping identified as missing in Stage 13:
+ *
+ *     CacheEntry * -> entry->heap_index
+ *
+ * The field is metadata only at this checkpoint. Arbitrary rank repair is not
+ * implemented yet.
+ */
+
+int stage14_check_all_heap_indices(const MinHeap *heap)
+{
+    size_t i;
+
+    if (heap == NULL || heap->size > MAX_CACHE_CAPACITY) {
+        return 0;
+    }
+
+    for (i = 0U; i < heap->size; ++i) {
+        if (heap->items[i] == NULL ||
+            heap->items[i]->heap_index != i) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+int stage14_test_push_and_swap_index_maintenance(void)
+{
+    MinHeap heap;
+    CacheEntry entries[] = {
+        {1ULL, 100ULL, 50LL, HEAP_INDEX_NONE},
+        {2ULL, 200ULL, 20LL, HEAP_INDEX_NONE},
+        {3ULL, 300ULL, 80LL, HEAP_INDEX_NONE},
+        {4ULL, 400ULL, 10LL, HEAP_INDEX_NONE},
+        {5ULL, 500ULL, 60LL, HEAP_INDEX_NONE}
+    };
+    size_t i;
+    int passed = 1;
+
+    printf("\n[Stage 14] heap_index maintenance across push/sift/swap\n");
+
+    min_heap_init(&heap);
+
+    for (i = 0U; i < sizeof(entries) / sizeof(entries[0]); ++i) {
+        passed &= check(entries[i].heap_index == HEAP_INDEX_NONE,
+                        "entry begins outside heap with invalid index");
+
+        passed &= check(min_heap_push(&heap, &entries[i]),
+                        "push entry while assigning heap_index");
+
+        passed &= check(stage14_check_all_heap_indices(&heap) &&
+                        min_heap_validate(&heap),
+                        "all heap_index values match array positions after push");
+    }
+
+    passed &= check(min_heap_peek(&heap) == &entries[3] &&
+                    entries[3].heap_index == 0U,
+                    "minimum entry records heap index zero");
+
+    return passed;
+}
+
+int stage14_test_pop_invalidates_and_repairs_indices(void)
+{
+    MinHeap heap;
+    CacheEntry entries[] = {
+        {1ULL, 100ULL, 50LL, HEAP_INDEX_NONE},
+        {2ULL, 200ULL, 20LL, HEAP_INDEX_NONE},
+        {3ULL, 300ULL, 80LL, HEAP_INDEX_NONE},
+        {4ULL, 400ULL, 10LL, HEAP_INDEX_NONE},
+        {5ULL, 500ULL, 60LL, HEAP_INDEX_NONE},
+        {6ULL, 600ULL, 20LL, HEAP_INDEX_NONE}
+    };
+    size_t i;
+    int passed = 1;
+
+    printf("\n[Stage 14] pop invalidates removed index and repairs survivors\n");
+
+    min_heap_init(&heap);
+    for (i = 0U; i < sizeof(entries) / sizeof(entries[0]); ++i) {
+        passed &= check(min_heap_push(&heap, &entries[i]),
+                        "prepare heap_index pop test");
+    }
+
+    while (heap.size > 0U) {
+        CacheEntry *removed = min_heap_pop_min(&heap);
+
+        passed &= check(removed != NULL &&
+                        removed->heap_index == HEAP_INDEX_NONE,
+                        "popped entry receives invalid heap_index");
+
+        passed &= check(stage14_check_all_heap_indices(&heap) &&
+                        min_heap_validate(&heap),
+                        "survivor heap_index values remain synchronized after pop");
+    }
+
+    return passed;
+}
+
+int stage14_test_direct_index_lookup_after_hash_lookup(void)
+{
+    Part1Cache cache;
+    CacheEntry *resident;
+    size_t index;
+    int passed = 1;
+
+    printf("\n[Stage 14] direct resident-to-heap-index mapping\n");
+
+    passed &= check(part1_cache_init(&cache, MAX_CACHE_CAPACITY),
+                    "initialize Stage 14 integrated cache");
+
+    for (CacheKey key = 1ULL;
+         key <= (CacheKey)MAX_CACHE_CAPACITY;
+         ++key) {
+        CacheEntry entry;
+
+        entry.key = key;
+        entry.value = key * 100ULL;
+        entry.rank = (Rank)key;
+        entry.heap_index = HEAP_INDEX_NONE;
+
+        if (!part1_cache_insert(&cache, entry, NULL)) {
+            passed &= check(0, "fill Stage 14 integrated cache");
+            return passed;
+        }
+    }
+
+    passed &= check(part1_cache_validate(&cache),
+                    "Stage 14 integrated cache validates");
+
+    resident = part1_cache_lookup(&cache, 100ULL);
+    passed &= check(resident != NULL && resident->key == 100ULL,
+                    "hash lookup returns resident pointer for key 100");
+
+    index = resident != NULL ? resident->heap_index : HEAP_INDEX_NONE;
+
+    printf("[PROFILE] hash found key 100 resident; direct heap_index=%zu\n",
+           index);
+
+    passed &= check(index == 99U &&
+                    index < cache.min_heap.size &&
+                    cache.min_heap.items[index] == resident,
+                    "heap_index directly identifies the resident heap slot");
+
+    return passed;
+}
+
+int stage14_test_validator_detects_corrupted_heap_index(void)
+{
+    Part1Cache cache;
+    CacheEntry *resident;
+    size_t saved_index;
+    int passed = 1;
+
+    printf("\n[Stage 14] validator detects reverse-index corruption\n");
+
+    passed &= check(part1_cache_init(&cache, 3U),
+                    "initialize reverse-index corruption test");
+
+    passed &= check(part1_cache_get(&cache, 1ULL) != NULL &&
+                    part1_cache_get(&cache, 2ULL) != NULL &&
+                    part1_cache_get(&cache, 3ULL) != NULL &&
+                    part1_cache_validate(&cache),
+                    "prepare valid integrated cache with heap_index");
+
+    resident = part1_cache_lookup(&cache, 2ULL);
+    passed &= check(resident != NULL,
+                    "locate resident for heap_index corruption test");
+
+    if (resident == NULL) {
+        return 0;
+    }
+
+    saved_index = resident->heap_index;
+    resident->heap_index = HEAP_INDEX_NONE;
+
+    passed &= check(!min_heap_validate(&cache.min_heap),
+                    "heap validator rejects corrupted heap_index");
+    passed &= check(!part1_cache_validate(&cache),
+                    "integrated validator rejects corrupted heap_index");
+
+    resident->heap_index = saved_index;
+
+    passed &= check(min_heap_validate(&cache.min_heap) &&
+                    part1_cache_validate(&cache),
+                    "restoring heap_index restores valid integrated state");
+
+    return passed;
+}
+
+int stage14_run_heap_index_tests(void)
+{
+    int passed = 1;
+
+    printf("\n=== Stage 14: introduce heap_index reverse position ===\n");
+
+    passed &= stage14_test_push_and_swap_index_maintenance();
+    passed &= stage14_test_pop_invalidates_and_repairs_indices();
+    passed &= stage14_test_direct_index_lookup_after_hash_lookup();
+    passed &= stage14_test_validator_detects_corrupted_heap_index();
+
+    printf("\nStage 14 findings:\n");
+    printf("  each heap-resident CacheEntry now stores its current heap_index.\n");
+    printf("  min_heap_push assigns heap_index before sift-up.\n");
+    printf("  min_heap_swap updates both moved entries.\n");
+    printf("  min_heap_pop_min invalidates the removed entry index.\n");
+    printf("  surviving entries keep indices synchronized after sift-down.\n");
+    printf("  hash lookup can now reach heap position directly through resident->heap_index.\n");
+    printf("Stage 14 boundary: heap_index is maintained but not yet used for priority repair.\n");
+    printf("Stage 14 heap_index validation: %s\n",
            passed ? "PASS" : "FAIL");
 
     return passed;
@@ -2919,7 +3164,12 @@ int main(void)
 
     all_passed &= stage13_run_ordinary_heap_limitation_tests();
 
-    printf("\nStage 13 validation: %s\n",
+    printf("\nStage 13 regression validation: %s\n",
+           all_passed ? "PASS" : "FAIL");
+
+    all_passed &= stage14_run_heap_index_tests();
+
+    printf("\nStage 14 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;

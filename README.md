@@ -2860,6 +2860,455 @@ It only proves why those capabilities are necessary.
 
 ---
 
+## Stage 14 — Introduce `heap_index`
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 13 proved that the current ordinary heap has no direct way to answer:
+
+```text
+CacheEntry * -> heap array index
+```
+
+and therefore requires an `O(N)` pointer scan to locate an arbitrary resident.
+
+Stage 14 introduces the missing reverse-position metadata directly into `CacheEntry`.
+
+### Updated cache-entry representation
+
+```c
+#define HEAP_INDEX_NONE SIZE_MAX
+
+typedef struct {
+    CacheKey key;
+    unsigned long long value;
+    Rank rank;
+    size_t heap_index;
+} CacheEntry;
+```
+
+`heap_index` has two meanings:
+
+```text
+0 .. heap->size - 1
+    entry is resident in the heap at that exact array index
+
+HEAP_INDEX_NONE
+    entry is not currently resident in a heap
+```
+
+At this checkpoint, `heap_index` is **metadata only**.
+
+Stage 14 does not yet use it to repair an arbitrary priority/rank change.
+
+---
+
+### Heap operations now maintain the reverse index
+
+#### `min_heap_push()`
+
+Before sift-up:
+
+```c
+index = heap->size;
+heap->items[index] = entry;
+entry->heap_index = index;
+++heap->size;
+
+min_heap_sift_up(heap, index);
+```
+
+Any swaps caused by sift-up update the metadata.
+
+Complexity remains:
+
+```text
+O(log N)
+```
+
+#### `min_heap_swap()`
+
+A swap now updates both moved entries:
+
+```c
+heap->items[a]->heap_index = a;
+heap->items[b]->heap_index = b;
+```
+
+This establishes the Stage 14 invariant:
+
+```text
+heap->items[i]->heap_index == i
+```
+
+for every resident heap entry.
+
+The swap itself remains:
+
+```text
+O(1)
+```
+
+#### `min_heap_pop_min()`
+
+When the root is removed:
+
+1. move the final heap item to index `0`,
+2. set the moved entry's `heap_index` to `0`,
+3. sift downward,
+4. update indices during every swap,
+5. mark the removed entry as:
+
+```c
+HEAP_INDEX_NONE
+```
+
+Therefore a popped entry no longer claims to belong to the heap.
+
+Complexity remains:
+
+```text
+O(log N)
+```
+
+---
+
+### Heap validator enhancement
+
+`min_heap_validate()` now checks both:
+
+1. ordinary min-heap ordering, and
+2. reverse-index consistency.
+
+For every resident position:
+
+```c
+heap->items[i] != NULL
+heap->items[i]->heap_index == i
+```
+
+A corrupted `heap_index` therefore causes validation failure even when rank ordering itself is still correct.
+
+---
+
+### Integrated Part 1 cache compatibility
+
+`Part1Cache` already keeps `CacheEntry` objects at stable addresses.
+
+Stage 14 initializes an inserted resident with:
+
+```c
+resident->heap_index = HEAP_INDEX_NONE;
+```
+
+before it enters the heap.
+
+`min_heap_push()` then assigns the actual position.
+
+`part1_cache_validate()` is extended to verify:
+
+```text
+resident->heap_index < min_heap.size
+min_heap.items[resident->heap_index] == resident
+```
+
+in addition to the earlier hash-table/heap/resident consistency checks.
+
+This keeps the Stage 10/11 integrated cache valid while adding the new Part 2 metadata.
+
+---
+
+## Stage 14 Validation
+
+### Test 1 — push/sift/swap index maintenance
+
+Entries with ranks:
+
+```text
+50
+20
+80
+10
+60
+```
+
+are pushed into the heap.
+
+After every push, Stage 14 verifies:
+
+```text
+heap.items[i]->heap_index == i
+```
+
+for every resident.
+
+Because lower-rank entries bubble upward, this exercises the updated `min_heap_swap()` path rather than merely checking append positions.
+
+The final minimum entry:
+
+```text
+key 4
+rank 10
+```
+
+must record:
+
+```text
+heap_index = 0
+```
+
+---
+
+### Test 2 — pop invalidation and survivor repair
+
+A six-entry heap is repeatedly popped until empty.
+
+For every removal Stage 14 verifies:
+
+```text
+removed->heap_index == HEAP_INDEX_NONE
+```
+
+and for every survivor:
+
+```text
+heap.items[i]->heap_index == i
+```
+
+after sift-down.
+
+This validates both sides of the reverse-position lifecycle:
+
+```text
+outside heap
+    HEAP_INDEX_NONE
+
+push
+    valid array index
+
+swaps
+    updated array index
+
+pop
+    HEAP_INDEX_NONE
+```
+
+---
+
+### Test 3 — direct hash-to-heap location
+
+A valid 100-entry integrated cache is built.
+
+The hash table returns:
+
+```text
+key 100 -> CacheEntry *
+```
+
+Stage 13 then required a linear heap scan to recover:
+
+```text
+heap index = 99
+```
+
+Stage 14 obtains it directly:
+
+```c
+index = resident->heap_index;
+```
+
+Validated result:
+
+```text
+key 100 -> resident -> heap_index 99
+```
+
+and:
+
+```c
+cache.min_heap.items[index] == resident
+```
+
+This changes the location step from Stage 13's:
+
+```text
+resident -> heap index = O(N)
+```
+
+to:
+
+```text
+resident -> heap index = O(1)
+```
+
+metadata access.
+
+No priority repair is performed yet.
+
+---
+
+### Test 4 — deliberate reverse-index corruption
+
+Stage 14 deliberately changes one valid resident's metadata to:
+
+```c
+HEAP_INDEX_NONE
+```
+
+while leaving it physically inside the heap.
+
+The tests verify:
+
+```text
+min_heap_validate()    -> fail
+part1_cache_validate() -> fail
+```
+
+After restoring the saved index:
+
+```text
+min_heap_validate()    -> pass
+part1_cache_validate() -> pass
+```
+
+This proves the new invariant is actively checked rather than merely stored.
+
+---
+
+## Stage 14 Complexity
+
+The production heap complexities do not change:
+
+```text
+min_heap_peek()      O(1)
+min_heap_swap()      O(1)
+min_heap_push()      O(log N)
+min_heap_pop_min()   O(log N)
+```
+
+The new reverse position gives:
+
+```text
+CacheEntry * -> heap index    O(1)
+```
+
+instead of the Stage 13 diagnostic:
+
+```text
+CacheEntry * -> heap index    O(N)
+```
+
+However, Stage 14 intentionally stops before implementing:
+
+```text
+new rank
+   |
+   v
+choose sift-up or sift-down
+   |
+   v
+repair arbitrary resident
+```
+
+That remains a later incremental step.
+
+---
+
+## Stage 14 Build and Validation
+
+### Normal build
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    ranked_cache.c \
+    -o ranked_cache14
+```
+
+The build should complete with no warnings.
+
+Run:
+
+```bash
+./ranked_cache14
+```
+
+The Stage 14 section must end with:
+
+```text
+Stage 14 findings:
+  each heap-resident CacheEntry now stores its current heap_index.
+  min_heap_push assigns heap_index before sift-up.
+  min_heap_swap updates both moved entries.
+  min_heap_pop_min invalidates the removed entry index.
+  surviving entries keep indices synchronized after sift-down.
+  hash lookup can now reach heap position directly through resident->heap_index.
+Stage 14 boundary: heap_index is maintained but not yet used for priority repair.
+Stage 14 heap_index validation: PASS
+
+Stage 14 validation: PASS
+```
+
+### UndefinedBehaviorSanitizer
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fsanitize=undefined \
+    ranked_cache.c \
+    -o ranked_cache14_ubsan
+
+./ranked_cache14_ubsan
+```
+
+This checkpoint was validated successfully with UBSan.
+
+### AddressSanitizer + UndefinedBehaviorSanitizer on Node1
+
+Run on the Node1 Ubuntu environment:
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fsanitize=address,undefined \
+    ranked_cache.c \
+    -o ranked_cache14_san
+
+./ranked_cache14_san
+```
+
+The current execution sandbox cannot reserve the AddressSanitizer shadow-memory region, so ASan could not be truthfully validated here. The normal build and UBSan build both pass. Run the combined ASan/UBSan command above on Node1 before committing if you want to preserve the same sanitizer gate used in prior stages.
+
+---
+
+### Stage 14 boundary
+
+Stage 14 does **not** implement:
+
+- arbitrary rank update,
+- indexed priority repair,
+- `min_heap_update_rank()`,
+- sift-up/sift-down selection after a rank change,
+- production Part 2 `cache_get()`,
+- dynamic-rank eviction behavior.
+
+It only introduces and validates the `heap_index` reverse mapping.
+
+---
+
 ## Build Environment
 
 Current target environment:
@@ -2871,7 +3320,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache13
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache14
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -2887,22 +3336,22 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache13
+./ranked_cache14
 ```
 
 ### Expected result
 
-The active Stage 13 test suite must end with:
+The active Stage 14 test suite must end with:
 
 ```text
-Stage 13 validation: PASS
+Stage 14 validation: PASS
 ```
 
 The Stage 10 Part 1 path combines the hash table and min-heap while preserving the earlier linear cache as a regression/reference implementation.
 
 ### Validation result
 
-Stages 0 through 13 have been validated successfully. The active Stage 13 test returns exit status `0`, including the sanitizer validation build.
+Stages 0 through 14 have been validated successfully in the normal build; UBSan also passes. Run the documented combined ASan/UBSan build on Node1 for the Stage 14 sanitizer gate.
 
 ---
 
@@ -2941,12 +3390,16 @@ At this commit, the program can:
 - measure ordinary-heap arbitrary-entry location by pointer,
 - prove first/middle/last heap-position costs of 1/50/100 comparisons,
 - prove missing heap-pointer lookup scales linearly with heap size, and
-- demonstrate that hash lookup still requires an O(N) heap scan to recover the resident's heap index.
+- demonstrate that hash lookup still requires an O(N) heap scan to recover the resident's heap index at the Stage 13 checkpoint,
+- store a `heap_index` reverse position in every heap-resident `CacheEntry`,
+- maintain `heap_index` during heap push, swap, sift, and pop operations,
+- invalidate `heap_index` when an entry leaves the heap,
+- validate direct O(1) resident-to-heap-position metadata, and
+- detect deliberate reverse-index corruption through the heap and integrated validators.
 
 At this commit, the program intentionally does **not** implement:
 
 - production Part 2 rank changes inside `part1_cache_get()`,
-- direct resident-to-heap-index mapping,
 - arbitrary heap-priority update,
 - indexed heap positions for Part 2,
 - concurrent/thread-safe access, or
@@ -3011,6 +3464,10 @@ Stage 13 measures that missing heap-position operation directly. With the curren
 `MinHeap`, locating an arbitrary `CacheEntry *` requires O(N) pointer scanning in the
 worst case. Therefore a hypothetical Part 2 update using the current structures would
 still be O(N) + O(log N), dominated by the O(N) heap-location step.
+
+Stage 14 removes only that location bottleneck by maintaining `CacheEntry.heap_index`.
+Once the hash table returns a resident pointer, reading its current heap position is
+O(1). The priority-update/repair operation itself is intentionally not implemented yet.
 
 ---
 
@@ -3212,4 +3669,20 @@ HASH-TO-HEAP LOCATION GAP PASS
 O(N) ARBITRARY HEAP LOCATION CONFIRMED
 DIRECT RESIDENT-TO-HEAP-INDEX REQUIREMENT CONFIRMED
 ASAN/UBSAN PASS
+
+
+Stage 14
+Introduce heap_index reverse position
+COMPLETE
+BUILD PASS
+RUN PASS
+HEAP_INDEX FIELD PASS
+PUSH INDEX ASSIGNMENT PASS
+SWAP INDEX MAINTENANCE PASS
+POP INDEX INVALIDATION PASS
+SURVIVOR INDEX REPAIR PASS
+DIRECT HASH-TO-HEAP INDEX PASS
+REVERSE-INDEX CORRUPTION DETECTION PASS
+UBSAN PASS
+ASAN/UBSAN NODE1 VALIDATION COMMAND DOCUMENTED
 ```
