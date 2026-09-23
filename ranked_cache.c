@@ -18,6 +18,7 @@
  *   Stage 12 - introduce and validate the Part 2 rank-change contract
  *   Stage 13 - prove ordinary heap lacks direct arbitrary-entry location
  *   Stage 14 - add and maintain CacheEntry.heap_index reverse position
+ *   Stage 15 - harden min_heap_swap() as the indexed-heap consistency primitive
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
@@ -942,19 +943,53 @@ void min_heap_init(MinHeap *heap)
     }
 }
 
-void min_heap_swap(MinHeap *heap, size_t a, size_t b)
+int min_heap_swap(MinHeap *heap, size_t a, size_t b)
 {
-    CacheEntry *tmp = heap->items[a];
-
-    heap->items[a] = heap->items[b];
-    heap->items[b] = tmp;
+    CacheEntry *entry_a;
+    CacheEntry *entry_b;
 
     /*
-     * Stage 14 reverse-position invariant:
-     * every resident heap entry records the array slot that currently owns it.
+     * Stage 15 treats swap as the core indexed-heap consistency primitive.
+     * Refuse malformed requests before touching either the heap array or
+     * reverse-position metadata.
      */
-    heap->items[a]->heap_index = a;
-    heap->items[b]->heap_index = b;
+    if (heap == NULL ||
+        a >= heap->size ||
+        b >= heap->size ||
+        heap->items[a] == NULL ||
+        heap->items[b] == NULL) {
+        return 0;
+    }
+
+    /*
+     * A self-swap is a valid no-op. Reassert the reverse-position invariant
+     * without unnecessarily exchanging pointers.
+     */
+    if (a == b) {
+        heap->items[a]->heap_index = a;
+        return 1;
+    }
+
+    entry_a = heap->items[a];
+    entry_b = heap->items[b];
+
+    /*
+     * Commit both sides of the swap, then synchronize both reverse indices.
+     * After this function returns success:
+     *
+     *     heap->items[a] == entry_b
+     *     entry_b->heap_index == a
+     *
+     *     heap->items[b] == entry_a
+     *     entry_a->heap_index == b
+     */
+    heap->items[a] = entry_b;
+    heap->items[b] = entry_a;
+
+    entry_b->heap_index = a;
+    entry_a->heap_index = b;
+
+    return 1;
 }
 
 void min_heap_sift_up(MinHeap *heap, size_t index)
@@ -966,7 +1001,9 @@ void min_heap_sift_up(MinHeap *heap, size_t index)
             break;
         }
 
-        min_heap_swap(heap, index, parent);
+        if (!min_heap_swap(heap, index, parent)) {
+            return;
+        }
         index = parent;
     }
 }
@@ -992,7 +1029,9 @@ void min_heap_sift_down(MinHeap *heap, size_t index)
             break;
         }
 
-        min_heap_swap(heap, index, smallest);
+        if (!min_heap_swap(heap, index, smallest)) {
+            return;
+        }
         index = smallest;
     }
 }
@@ -3026,6 +3065,248 @@ int stage14_run_heap_index_tests(void)
     return passed;
 }
 
+
+
+/* ---------- Stage 15: harden min_heap_swap() carefully ---------- */
+
+/*
+ * Stage 14 introduced heap_index and made swaps maintain it.
+ * Stage 15 isolates that operation and verifies it as a safe consistency
+ * primitive before any later arbitrary-priority update starts depending on it.
+ */
+
+int stage15_test_non_adjacent_swap_updates_both_indices(void)
+{
+    MinHeap heap;
+    CacheEntry entries[] = {
+        {1ULL, 100ULL, 10LL, HEAP_INDEX_NONE},
+        {2ULL, 200ULL, 20LL, HEAP_INDEX_NONE},
+        {3ULL, 300ULL, 30LL, HEAP_INDEX_NONE},
+        {4ULL, 400ULL, 40LL, HEAP_INDEX_NONE},
+        {5ULL, 500ULL, 50LL, HEAP_INDEX_NONE}
+    };
+    CacheEntry *left_before;
+    CacheEntry *right_before;
+    int passed = 1;
+
+    printf("\n[Stage 15] non-adjacent swap keeps both reverse indices synchronized\n");
+
+    min_heap_init(&heap);
+    for (size_t i = 0U; i < sizeof(entries) / sizeof(entries[0]); ++i) {
+        passed &= check(min_heap_push(&heap, &entries[i]),
+                        "prepare Stage 15 swap heap");
+    }
+
+    passed &= check(min_heap_validate(&heap),
+                    "pre-swap heap is valid");
+
+    left_before = heap.items[1];
+    right_before = heap.items[4];
+
+    passed &= check(min_heap_swap(&heap, 1U, 4U),
+                    "swap non-adjacent heap slots");
+
+    passed &= check(heap.items[1] == right_before &&
+                    right_before->heap_index == 1U &&
+                    heap.items[4] == left_before &&
+                    left_before->heap_index == 4U,
+                    "swap updates both array slots and both heap_index fields");
+
+    /*
+     * The arbitrary test swap may violate rank ordering. Swap back before
+     * asking the heap validator to check the complete heap invariant.
+     */
+    passed &= check(min_heap_swap(&heap, 1U, 4U),
+                    "swap entries back to original positions");
+
+    passed &= check(min_heap_validate(&heap) &&
+                    stage14_check_all_heap_indices(&heap),
+                    "round-trip swap restores valid heap and reverse indices");
+
+    return passed;
+}
+
+int stage15_test_parent_child_swap_indices(void)
+{
+    MinHeap heap;
+    CacheEntry entries[] = {
+        {1ULL, 100ULL, 10LL, HEAP_INDEX_NONE},
+        {2ULL, 200ULL, 20LL, HEAP_INDEX_NONE},
+        {3ULL, 300ULL, 30LL, HEAP_INDEX_NONE}
+    };
+    CacheEntry *root_before;
+    CacheEntry *child_before;
+    int passed = 1;
+
+    printf("\n[Stage 15] parent-child swap updates exact positions\n");
+
+    min_heap_init(&heap);
+    for (size_t i = 0U; i < sizeof(entries) / sizeof(entries[0]); ++i) {
+        passed &= check(min_heap_push(&heap, &entries[i]),
+                        "prepare parent-child swap heap");
+    }
+
+    root_before = heap.items[0];
+    child_before = heap.items[1];
+
+    passed &= check(min_heap_swap(&heap, 0U, 1U),
+                    "swap root and child");
+
+    passed &= check(heap.items[0] == child_before &&
+                    child_before->heap_index == 0U &&
+                    heap.items[1] == root_before &&
+                    root_before->heap_index == 1U,
+                    "root-child swap synchronizes both reverse positions");
+
+    passed &= check(min_heap_swap(&heap, 0U, 1U),
+                    "restore parent-child ordering");
+
+    passed &= check(min_heap_validate(&heap),
+                    "restored parent-child heap validates");
+
+    return passed;
+}
+
+int stage15_test_self_swap_is_safe_noop(void)
+{
+    MinHeap heap;
+    CacheEntry entries[] = {
+        {1ULL, 100ULL, 10LL, HEAP_INDEX_NONE},
+        {2ULL, 200ULL, 20LL, HEAP_INDEX_NONE},
+        {3ULL, 300ULL, 30LL, HEAP_INDEX_NONE}
+    };
+    CacheEntry *before;
+    int passed = 1;
+
+    printf("\n[Stage 15] self-swap is a safe no-op\n");
+
+    min_heap_init(&heap);
+    for (size_t i = 0U; i < sizeof(entries) / sizeof(entries[0]); ++i) {
+        passed &= check(min_heap_push(&heap, &entries[i]),
+                        "prepare self-swap heap");
+    }
+
+    before = heap.items[1];
+
+    passed &= check(min_heap_swap(&heap, 1U, 1U),
+                    "self-swap succeeds");
+
+    passed &= check(heap.items[1] == before &&
+                    before->heap_index == 1U &&
+                    min_heap_validate(&heap),
+                    "self-swap preserves pointer, index, and heap validity");
+
+    return passed;
+}
+
+int stage15_test_invalid_swap_rejected_without_mutation(void)
+{
+    MinHeap heap;
+    CacheEntry entries[] = {
+        {1ULL, 100ULL, 10LL, HEAP_INDEX_NONE},
+        {2ULL, 200ULL, 20LL, HEAP_INDEX_NONE},
+        {3ULL, 300ULL, 30LL, HEAP_INDEX_NONE}
+    };
+    CacheEntry *snapshot[3];
+    size_t index_snapshot[3];
+    int passed = 1;
+
+    printf("\n[Stage 15] invalid swap requests fail without mutation\n");
+
+    min_heap_init(&heap);
+    for (size_t i = 0U; i < sizeof(entries) / sizeof(entries[0]); ++i) {
+        passed &= check(min_heap_push(&heap, &entries[i]),
+                        "prepare invalid-swap heap");
+    }
+
+    for (size_t i = 0U; i < 3U; ++i) {
+        snapshot[i] = heap.items[i];
+        index_snapshot[i] = heap.items[i]->heap_index;
+    }
+
+    passed &= check(!min_heap_swap(NULL, 0U, 1U),
+                    "NULL heap swap is rejected");
+    passed &= check(!min_heap_swap(&heap, heap.size, 0U),
+                    "out-of-range left index is rejected");
+    passed &= check(!min_heap_swap(&heap, 0U, heap.size),
+                    "out-of-range right index is rejected");
+
+    for (size_t i = 0U; i < 3U; ++i) {
+        passed &= check(heap.items[i] == snapshot[i] &&
+                        heap.items[i]->heap_index == index_snapshot[i],
+                        "invalid swap leaves heap array and metadata unchanged");
+    }
+
+    passed &= check(min_heap_validate(&heap),
+                    "heap remains valid after rejected swaps");
+
+    return passed;
+}
+
+int stage15_test_null_slot_swap_rejected(void)
+{
+    MinHeap heap;
+    CacheEntry entries[] = {
+        {1ULL, 100ULL, 10LL, HEAP_INDEX_NONE},
+        {2ULL, 200ULL, 20LL, HEAP_INDEX_NONE},
+        {3ULL, 300ULL, 30LL, HEAP_INDEX_NONE}
+    };
+    CacheEntry *saved;
+    int passed = 1;
+
+    printf("\n[Stage 15] malformed NULL-slot swap is rejected safely\n");
+
+    min_heap_init(&heap);
+    for (size_t i = 0U; i < sizeof(entries) / sizeof(entries[0]); ++i) {
+        passed &= check(min_heap_push(&heap, &entries[i]),
+                        "prepare NULL-slot swap heap");
+    }
+
+    saved = heap.items[2];
+    heap.items[2] = NULL;
+
+    passed &= check(!min_heap_swap(&heap, 0U, 2U),
+                    "swap refuses NULL resident slot");
+
+    passed &= check(heap.items[0] == &entries[0] &&
+                    heap.items[2] == NULL &&
+                    entries[0].heap_index == 0U &&
+                    saved->heap_index == 2U,
+                    "rejected NULL-slot swap performs no partial metadata update");
+
+    heap.items[2] = saved;
+
+    passed &= check(min_heap_validate(&heap),
+                    "restoring malformed slot restores valid heap");
+
+    return passed;
+}
+
+int stage15_run_heap_swap_tests(void)
+{
+    int passed = 1;
+
+    printf("\n=== Stage 15: modify min_heap_swap() carefully ===\n");
+
+    passed &= stage15_test_non_adjacent_swap_updates_both_indices();
+    passed &= stage15_test_parent_child_swap_indices();
+    passed &= stage15_test_self_swap_is_safe_noop();
+    passed &= stage15_test_invalid_swap_rejected_without_mutation();
+    passed &= stage15_test_null_slot_swap_rejected();
+
+    printf("\nStage 15 findings:\n");
+    printf("  swap validates heap, bounds, and resident slots before mutation.\n");
+    printf("  successful swaps update both heap array positions and both heap_index values.\n");
+    printf("  self-swap is an explicit safe no-op.\n");
+    printf("  invalid swaps fail without partially changing heap metadata.\n");
+    printf("  sift-up/down continue to use the same consistency-preserving swap primitive.\n");
+    printf("Stage 15 boundary: swap is hardened; arbitrary rank repair is still not implemented.\n");
+    printf("Stage 15 heap-swap validation: %s\n",
+           passed ? "PASS" : "FAIL");
+
+    return passed;
+}
+
 int main(void)
 {
     Cache cache;
@@ -3169,7 +3450,12 @@ int main(void)
 
     all_passed &= stage14_run_heap_index_tests();
 
-    printf("\nStage 14 validation: %s\n",
+    printf("\nStage 14 regression validation: %s\n",
+           all_passed ? "PASS" : "FAIL");
+
+    all_passed &= stage15_run_heap_swap_tests();
+
+    printf("\nStage 15 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;

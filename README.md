@@ -3309,6 +3309,317 @@ It only introduces and validates the `heap_index` reverse mapping.
 
 ---
 
+## Stage 15 — Modify `min_heap_swap()` Carefully
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 14 introduced `CacheEntry.heap_index` and made the heap maintain the reverse-position metadata.
+
+Stage 15 focuses on one operation only:
+
+```c
+min_heap_swap()
+```
+
+This operation is the consistency primitive that every future indexed-heap repair will depend on.
+
+The Stage 14 implementation already updated both `heap_index` values after a swap, but it assumed:
+
+- `heap` was non-NULL,
+- both indices were inside `heap->size`,
+- both heap slots contained valid `CacheEntry *`,
+- self-swap behavior did not need to be stated explicitly.
+
+Stage 15 hardens those assumptions before any arbitrary-rank repair is allowed to depend on this function.
+
+### Updated swap interface
+
+Stage 15 changes:
+
+```c
+void min_heap_swap(...)
+```
+
+to:
+
+```c
+int min_heap_swap(
+    MinHeap *heap,
+    size_t a,
+    size_t b);
+```
+
+Return value:
+
+```text
+1 -> swap request is valid and completed
+0 -> request is invalid and no swap was performed
+```
+
+### Validation before mutation
+
+The function now rejects the request before touching heap state when:
+
+```text
+heap == NULL
+a >= heap->size
+b >= heap->size
+heap->items[a] == NULL
+heap->items[b] == NULL
+```
+
+This is important because a partial indexed-heap update would be worse than a clean failure.
+
+For an invalid request:
+
+```text
+heap.items[]      unchanged
+entry heap_index  unchanged
+```
+
+### Explicit self-swap behavior
+
+When:
+
+```text
+a == b
+```
+
+the operation is a valid no-op.
+
+Stage 15 reasserts:
+
+```c
+heap->items[a]->heap_index = a;
+```
+
+and returns success.
+
+No pointer movement occurs.
+
+### Successful two-entry swap
+
+For two distinct valid positions:
+
+```text
+before:
+
+heap[a] -> entry_a
+entry_a.heap_index = a
+
+heap[b] -> entry_b
+entry_b.heap_index = b
+```
+
+Stage 15 commits:
+
+```text
+after:
+
+heap[a] -> entry_b
+entry_b.heap_index = a
+
+heap[b] -> entry_a
+entry_a.heap_index = b
+```
+
+The array ownership and reverse metadata therefore move together.
+
+### Sift callers
+
+`min_heap_sift_up()` and `min_heap_sift_down()` continue to use the same swap primitive.
+
+They now acknowledge the swap return value:
+
+```c
+if (!min_heap_swap(...)) {
+    return;
+}
+```
+
+A valid heap should never trigger this failure path, but the code no longer assumes a malformed swap can safely continue.
+
+---
+
+## Stage 15 Validation
+
+### Test 1 — non-adjacent swap
+
+A valid five-entry heap is created.
+
+Positions `1` and `4` are exchanged.
+
+Stage 15 verifies:
+
+```text
+heap[1] == previous heap[4]
+previous heap[4].heap_index == 1
+
+heap[4] == previous heap[1]
+previous heap[1].heap_index == 4
+```
+
+The entries are then swapped back and the full heap validator must pass.
+
+### Test 2 — parent/child swap
+
+Positions `0` and `1` are exchanged.
+
+The test verifies that both pointers and both reverse positions are updated exactly.
+
+The swap is reversed before validating min-heap ordering.
+
+### Test 3 — self-swap
+
+For:
+
+```c
+min_heap_swap(&heap, 1, 1)
+```
+
+Stage 15 verifies:
+
+```text
+same pointer
+same heap_index
+heap remains valid
+```
+
+### Test 4 — invalid indices
+
+Stage 15 verifies rejection of:
+
+```text
+NULL heap
+left index == heap->size
+right index == heap->size
+```
+
+After every rejected request:
+
+```text
+heap array is unchanged
+heap_index metadata is unchanged
+heap remains valid
+```
+
+### Test 5 — malformed NULL slot
+
+A controlled test temporarily places `NULL` into one active heap slot.
+
+`min_heap_swap()` must reject the operation without updating the other entry or the saved entry's `heap_index`.
+
+After restoring the test slot, the heap validator must pass.
+
+---
+
+## Stage 15 Complexity
+
+The swap remains:
+
+```text
+O(1)
+```
+
+The added validation consists only of constant-time pointer, bound, and slot checks.
+
+Heap operation complexity therefore remains:
+
+```text
+min_heap_swap()      O(1)
+min_heap_sift_up()   O(log N)
+min_heap_sift_down() O(log N)
+min_heap_push()      O(log N)
+min_heap_pop_min()   O(log N)
+```
+
+Stage 15 does not implement arbitrary priority updates.
+
+---
+
+## Stage 15 Build and Validation
+
+### Normal build
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    ranked_cache.c \
+    -o ranked_cache15
+
+./ranked_cache15
+```
+
+Expected final lines:
+
+```text
+Stage 15 findings:
+  swap validates heap, bounds, and resident slots before mutation.
+  successful swaps update both heap array positions and both heap_index values.
+  self-swap is an explicit safe no-op.
+  invalid swaps fail without partially changing heap metadata.
+  sift-up/down continue to use the same consistency-preserving swap primitive.
+Stage 15 boundary: swap is hardened; arbitrary rank repair is still not implemented.
+Stage 15 heap-swap validation: PASS
+
+Stage 15 validation: PASS
+```
+
+### UndefinedBehaviorSanitizer
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fsanitize=undefined \
+    ranked_cache.c \
+    -o ranked_cache15_ubsan
+
+./ranked_cache15_ubsan
+```
+
+### AddressSanitizer + UndefinedBehaviorSanitizer
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fsanitize=address,undefined \
+    ranked_cache.c \
+    -o ranked_cache15_san
+
+./ranked_cache15_san
+```
+
+Both sanitizer builds pass for this checkpoint.
+
+---
+
+### Stage 15 boundary
+
+Stage 15 deliberately does **not** implement:
+
+- arbitrary rank change repair,
+- `min_heap_update_rank()`,
+- choosing sift-up versus sift-down after a rank change,
+- production Part 2 `cache_get()`,
+- dynamic-rank eviction behavior.
+
+It only makes `min_heap_swap()` a safer, explicitly validated indexed-heap consistency primitive.
+
+---
+
 ## Build Environment
 
 Current target environment:
@@ -3320,7 +3631,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache14
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache15
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -3336,22 +3647,22 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache14
+./ranked_cache15
 ```
 
 ### Expected result
 
-The active Stage 14 test suite must end with:
+The active Stage 15 test suite must end with:
 
 ```text
-Stage 14 validation: PASS
+Stage 15 validation: PASS
 ```
 
 The Stage 10 Part 1 path combines the hash table and min-heap while preserving the earlier linear cache as a regression/reference implementation.
 
 ### Validation result
 
-Stages 0 through 14 have been validated successfully in the normal build; UBSan also passes. Run the documented combined ASan/UBSan build on Node1 for the Stage 14 sanitizer gate.
+Stages 0 through 15 have been validated successfully. The normal build, UBSan build, and combined ASan/UBSan build all pass for Stage 15.
 
 ---
 
@@ -3395,7 +3706,11 @@ At this commit, the program can:
 - maintain `heap_index` during heap push, swap, sift, and pop operations,
 - invalidate `heap_index` when an entry leaves the heap,
 - validate direct O(1) resident-to-heap-position metadata, and
-- detect deliberate reverse-index corruption through the heap and integrated validators.
+- detect deliberate reverse-index corruption through the heap and integrated validators,
+- reject invalid heap-swap arguments before mutation,
+- treat self-swap as an explicit safe no-op,
+- preserve both pointer ownership and both `heap_index` values across valid swaps, and
+- verify invalid swaps do not partially change reverse-position metadata.
 
 At this commit, the program intentionally does **not** implement:
 
@@ -3468,6 +3783,10 @@ still be O(N) + O(log N), dominated by the O(N) heap-location step.
 Stage 14 removes only that location bottleneck by maintaining `CacheEntry.heap_index`.
 Once the hash table returns a resident pointer, reading its current heap position is
 O(1). The priority-update/repair operation itself is intentionally not implemented yet.
+
+Stage 15 preserves those complexities. `min_heap_swap()` remains O(1); the new
+argument validation is constant-time and establishes a stronger consistency primitive
+for later indexed-heap operations.
 
 ---
 
@@ -3685,4 +4004,21 @@ DIRECT HASH-TO-HEAP INDEX PASS
 REVERSE-INDEX CORRUPTION DETECTION PASS
 UBSAN PASS
 ASAN/UBSAN NODE1 VALIDATION COMMAND DOCUMENTED
+
+
+Stage 15
+Harden min_heap_swap consistency primitive
+COMPLETE
+BUILD PASS
+RUN PASS
+NON-ADJACENT SWAP PASS
+PARENT-CHILD SWAP PASS
+SELF-SWAP PASS
+INVALID-INDEX REJECTION PASS
+NULL-HEAP REJECTION PASS
+NULL-SLOT REJECTION PASS
+NO-PARTIAL-METADATA-MUTATION PASS
+SIFT CALLER REGRESSION PASS
+UBSAN PASS
+ASAN/UBSAN PASS
 ```
