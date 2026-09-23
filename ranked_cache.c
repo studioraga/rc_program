@@ -19,6 +19,7 @@
  *   Stage 13 - prove ordinary heap lacks direct arbitrary-entry location
  *   Stage 14 - add and maintain CacheEntry.heap_index reverse position
  *   Stage 15 - harden min_heap_swap() as the indexed-heap consistency primitive
+ *   Stage 16 - add min_heap_update_rank() for arbitrary resident priority repair
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
@@ -1034,6 +1035,56 @@ void min_heap_sift_down(MinHeap *heap, size_t index)
         }
         index = smallest;
     }
+}
+
+
+/*
+ * Update the rank of one resident already stored in the indexed heap.
+ *
+ * Membership is validated through the Stage 14 reverse position:
+ *
+ *     entry->heap_index
+ *     heap->items[entry->heap_index] == entry
+ *
+ * After changing the rank:
+ *   lower rank  -> repair upward
+ *   higher rank -> repair downward
+ *   same rank   -> no movement
+ *
+ * Complexity: O(log N) worst case.
+ */
+int min_heap_update_rank(MinHeap *heap, CacheEntry *entry, Rank new_rank)
+{
+    size_t index;
+    Rank old_rank;
+
+    if (heap == NULL || entry == NULL) {
+        return 0;
+    }
+
+    index = entry->heap_index;
+
+    if (index == HEAP_INDEX_NONE ||
+        index >= heap->size ||
+        heap->items[index] != entry) {
+        return 0;
+    }
+
+    old_rank = entry->rank;
+
+    if (new_rank == old_rank) {
+        return 1;
+    }
+
+    entry->rank = new_rank;
+
+    if (new_rank < old_rank) {
+        min_heap_sift_up(heap, index);
+    } else {
+        min_heap_sift_down(heap, index);
+    }
+
+    return 1;
 }
 
 /*
@@ -3307,6 +3358,277 @@ int stage15_run_heap_swap_tests(void)
     return passed;
 }
 
+
+
+/* ---------- Stage 16: write min_heap_update_rank() ---------- */
+
+int stage16_prepare_update_heap(MinHeap *heap, CacheEntry entries[], size_t count)
+{
+    size_t i;
+
+    if (heap == NULL || entries == NULL || count == 0U || count > 7U) {
+        return 0;
+    }
+
+    min_heap_init(heap);
+
+    for (i = 0U; i < count; ++i) {
+        entries[i].key = (CacheKey)(i + 1U);
+        entries[i].value = (unsigned long long)(i + 1U) * 100ULL;
+        entries[i].rank = (Rank)((i + 1U) * 10U);
+        entries[i].heap_index = HEAP_INDEX_NONE;
+
+        if (!min_heap_push(heap, &entries[i])) {
+            return 0;
+        }
+    }
+
+    return min_heap_validate(heap);
+}
+
+int stage16_test_rank_decrease_sifts_up(void)
+{
+    MinHeap heap;
+    CacheEntry entries[7];
+    CacheEntry *target;
+    int passed = 1;
+
+    printf("\n[Stage 16] lower rank repairs upward\n");
+
+    passed &= check(stage16_prepare_update_heap(&heap, entries, 7U),
+                    "prepare rank-decrease heap");
+
+    target = &entries[6]; /* key 7, rank 70; initially a leaf */
+
+    passed &= check(target->heap_index == 6U,
+                    "decrease target starts at leaf index 6");
+
+    passed &= check(min_heap_update_rank(&heap, target, 5LL),
+                    "update key 7 rank from 70 to 5");
+
+    passed &= check(target->rank == 5LL &&
+                    target->heap_index == 0U &&
+                    min_heap_peek(&heap) == target,
+                    "lower rank moves target to heap root");
+
+    passed &= check(min_heap_validate(&heap) &&
+                    stage14_check_all_heap_indices(&heap),
+                    "heap and reverse indices validate after sift-up repair");
+
+    return passed;
+}
+
+int stage16_test_rank_increase_sifts_down(void)
+{
+    MinHeap heap;
+    CacheEntry entries[7];
+    CacheEntry *target;
+    int passed = 1;
+
+    printf("\n[Stage 16] higher rank repairs downward\n");
+
+    passed &= check(stage16_prepare_update_heap(&heap, entries, 7U),
+                    "prepare rank-increase heap");
+
+    target = &entries[0]; /* key 1, rank 10; root */
+
+    passed &= check(target->heap_index == 0U &&
+                    min_heap_peek(&heap) == target,
+                    "increase target starts at root");
+
+    passed &= check(min_heap_update_rank(&heap, target, 100LL),
+                    "update key 1 rank from 10 to 100");
+
+    passed &= check(target->rank == 100LL &&
+                    target->heap_index != 0U &&
+                    min_heap_peek(&heap) != target &&
+                    min_heap_peek(&heap)->rank == 20LL,
+                    "higher rank moves former root downward");
+
+    passed &= check(min_heap_validate(&heap) &&
+                    stage14_check_all_heap_indices(&heap),
+                    "heap and reverse indices validate after sift-down repair");
+
+    return passed;
+}
+
+int stage16_test_unchanged_rank_no_movement(void)
+{
+    MinHeap heap;
+    CacheEntry entries[7];
+    CacheEntry *target;
+    size_t before_index;
+    CacheEntry *before_root;
+    int passed = 1;
+
+    printf("\n[Stage 16] unchanged rank requires no movement\n");
+
+    passed &= check(stage16_prepare_update_heap(&heap, entries, 7U),
+                    "prepare unchanged-rank heap");
+
+    target = &entries[3];
+    before_index = target->heap_index;
+    before_root = min_heap_peek(&heap);
+
+    passed &= check(min_heap_update_rank(&heap, target, target->rank),
+                    "update resident with identical rank");
+
+    passed &= check(target->heap_index == before_index &&
+                    min_heap_peek(&heap) == before_root &&
+                    min_heap_validate(&heap),
+                    "unchanged rank preserves heap position and ordering");
+
+    return passed;
+}
+
+int stage16_test_rank_update_tie_ordering(void)
+{
+    MinHeap heap;
+    CacheEntry entries[] = {
+        {10ULL, 1000ULL, 10LL, HEAP_INDEX_NONE},
+        {20ULL, 2000ULL, 20LL, HEAP_INDEX_NONE},
+        {5ULL, 500ULL, 30LL, HEAP_INDEX_NONE}
+    };
+    CacheEntry *target = &entries[2];
+    int passed = 1;
+
+    printf("\n[Stage 16] rank update preserves key tie ordering\n");
+
+    min_heap_init(&heap);
+    for (size_t i = 0U; i < sizeof(entries) / sizeof(entries[0]); ++i) {
+        passed &= check(min_heap_push(&heap, &entries[i]),
+                        "prepare tie-order update heap");
+    }
+
+    /*
+     * Lower key 5 from rank 30 to rank 10. It now ties key 10 on rank and
+     * should precede it because min_heap_entry_less() uses key second.
+     */
+    passed &= check(min_heap_update_rank(&heap, target, 10LL),
+                    "decrease key 5 into equal-rank tie");
+
+    passed &= check(min_heap_peek(&heap) == target &&
+                    target->heap_index == 0U &&
+                    target->rank == 10LL,
+                    "equal rank uses lower key as deterministic minimum");
+
+    passed &= check(min_heap_validate(&heap),
+                    "heap validates after tie-aware rank update");
+
+    return passed;
+}
+
+int stage16_test_invalid_update_rejected_without_mutation(void)
+{
+    MinHeap heap;
+    CacheEntry entries[3];
+    CacheEntry outsider = {999ULL, 99900ULL, 1LL, HEAP_INDEX_NONE};
+    CacheEntry *target;
+    Rank saved_rank;
+    size_t saved_index;
+    int passed = 1;
+
+    printf("\n[Stage 16] invalid rank updates are non-destructive\n");
+
+    passed &= check(stage16_prepare_update_heap(&heap, entries, 3U),
+                    "prepare invalid-update heap");
+
+    target = &entries[1];
+    saved_rank = target->rank;
+    saved_index = target->heap_index;
+
+    passed &= check(!min_heap_update_rank(NULL, target, 1LL),
+                    "NULL heap update is rejected");
+    passed &= check(!min_heap_update_rank(&heap, NULL, 1LL),
+                    "NULL entry update is rejected");
+    passed &= check(!min_heap_update_rank(&heap, &outsider, 0LL),
+                    "non-resident entry update is rejected");
+
+    target->heap_index = HEAP_INDEX_NONE;
+    passed &= check(!min_heap_update_rank(&heap, target, 1LL),
+                    "resident with invalid heap_index is rejected");
+    passed &= check(target->rank == saved_rank,
+                    "failed invalid-index update does not change rank");
+
+    target->heap_index = saved_index;
+    passed &= check(min_heap_validate(&heap),
+                    "restored reverse index returns heap to valid state");
+
+    target->heap_index = (saved_index + 1U) % heap.size;
+    passed &= check(!min_heap_update_rank(&heap, target, 1LL),
+                    "mismatched heap slot backlink is rejected");
+    passed &= check(target->rank == saved_rank,
+                    "failed backlink update does not change rank");
+
+    target->heap_index = saved_index;
+    passed &= check(min_heap_validate(&heap),
+                    "heap remains valid after rejected rank updates");
+
+    return passed;
+}
+
+int stage16_test_update_after_hash_lookup(void)
+{
+    Part1Cache cache;
+    CacheEntry *resident;
+    int passed = 1;
+
+    printf("\n[Stage 16] hash lookup plus indexed rank update\n");
+
+    passed &= check(part1_cache_init(&cache, 5U),
+                    "initialize integrated rank-update cache");
+
+    for (CacheKey key = 1ULL; key <= 5ULL; ++key) {
+        passed &= check(part1_cache_get(&cache, key) != NULL,
+                        "fill integrated cache for rank update");
+    }
+
+    resident = part1_cache_lookup(&cache, 5ULL);
+    passed &= check(resident != NULL &&
+                    resident->rank == 50LL,
+                    "hash lookup finds key 5 resident");
+
+    passed &= check(min_heap_update_rank(&cache.min_heap, resident, 5LL),
+                    "indexed heap updates hash-found resident rank");
+
+    passed &= check(resident->rank == 5LL &&
+                    resident->heap_index == 0U &&
+                    min_heap_peek(&cache.min_heap) == resident,
+                    "hash-found resident reaches heap root without linear scan");
+
+    passed &= check(part1_cache_validate(&cache),
+                    "integrated cache validates after direct heap rank update");
+
+    return passed;
+}
+
+int stage16_run_heap_update_rank_tests(void)
+{
+    int passed = 1;
+
+    printf("\n=== Stage 16: write min_heap_update_rank() ===\n");
+
+    passed &= stage16_test_rank_decrease_sifts_up();
+    passed &= stage16_test_rank_increase_sifts_down();
+    passed &= stage16_test_unchanged_rank_no_movement();
+    passed &= stage16_test_rank_update_tie_ordering();
+    passed &= stage16_test_invalid_update_rejected_without_mutation();
+    passed &= stage16_test_update_after_hash_lookup();
+
+    printf("\nStage 16 findings:\n");
+    printf("  heap_index locates the resident directly in O(1).\n");
+    printf("  lower rank repairs with sift-up.\n");
+    printf("  higher rank repairs with sift-down.\n");
+    printf("  unchanged rank requires no heap movement.\n");
+    printf("  hardened swaps keep heap_index synchronized during repair.\n");
+    printf("  arbitrary resident rank repair is O(log N) worst case.\n");
+    printf("Stage 16 boundary: heap_update_rank exists but production Part 2 cache_get is not wired yet.\n");
+    printf("Stage 16 heap-update-rank validation: %s\n",
+           passed ? "PASS" : "FAIL");
+
+    return passed;
+}
+
 int main(void)
 {
     Cache cache;
@@ -3455,7 +3777,12 @@ int main(void)
 
     all_passed &= stage15_run_heap_swap_tests();
 
-    printf("\nStage 15 validation: %s\n",
+    printf("\nStage 15 regression validation: %s\n",
+           all_passed ? "PASS" : "FAIL");
+
+    all_passed &= stage16_run_heap_update_rank_tests();
+
+    printf("\nStage 16 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;

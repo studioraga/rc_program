@@ -3620,6 +3620,387 @@ It only makes `min_heap_swap()` a safer, explicitly validated indexed-heap consi
 
 ---
 
+## Stage 16 — Write `min_heap_update_rank()`
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 14 introduced `CacheEntry.heap_index`.
+
+Stage 15 hardened `min_heap_swap()` so every heap movement keeps pointer ownership and reverse indices synchronized.
+
+Stage 16 now uses those two prerequisites to implement the first efficient arbitrary-resident rank-repair primitive:
+
+```c
+int min_heap_update_rank(
+    MinHeap *heap,
+    CacheEntry *entry,
+    Rank new_rank);
+```
+
+This stage does **not** yet wire dynamic ranking into production `cache_get()`.
+
+It implements and validates the heap operation only.
+
+### Membership validation
+
+Before changing the rank, `min_heap_update_rank()` verifies:
+
+```text
+heap != NULL
+entry != NULL
+entry->heap_index != HEAP_INDEX_NONE
+entry->heap_index < heap->size
+heap->items[entry->heap_index] == entry
+```
+
+Therefore the operation does not need to scan `heap.items[]`.
+
+The resident position is obtained directly from:
+
+```c
+entry->heap_index
+```
+
+which is:
+
+```text
+O(1)
+```
+
+### Update direction
+
+The function captures the old rank before mutation.
+
+Then:
+
+```text
+new_rank < old_rank
+    |
+    +--> assign new rank
+    +--> min_heap_sift_up()
+
+new_rank > old_rank
+    |
+    +--> assign new rank
+    +--> min_heap_sift_down()
+
+new_rank == old_rank
+    |
+    +--> no heap movement
+```
+
+Because only the rank changes and the key remains fixed, this directional choice is sufficient for the existing rank/key ordering rule.
+
+Worst-case repair complexity:
+
+```text
+O(log N)
+```
+
+### Why `heap_index` matters
+
+Before Stage 14/16, an arbitrary priority update would require:
+
+```text
+key -> resident          expected O(1)
+resident -> heap index   O(N)
+heap repair              O(log N)
+```
+
+Stage 16 changes the middle step to:
+
+```text
+resident -> heap index   O(1)
+```
+
+so the heap update primitive becomes:
+
+```text
+O(log N)
+```
+
+worst case.
+
+---
+
+## Stage 16 Validation
+
+### Test 1 — lower rank sifts upward
+
+A seven-entry heap starts with:
+
+```text
+key 7
+rank 70
+heap_index 6
+```
+
+Stage 16 updates:
+
+```text
+70 -> 5
+```
+
+The entry must move upward until:
+
+```text
+heap_index = 0
+heap root = key 7 / rank 5
+```
+
+The tests then verify:
+
+```text
+min_heap_validate() passes
+all heap_index values match physical positions
+```
+
+### Test 2 — higher rank sifts downward
+
+The root starts as:
+
+```text
+key 1
+rank 10
+heap_index 0
+```
+
+Stage 16 updates:
+
+```text
+10 -> 100
+```
+
+The former root must move downward.
+
+The new root becomes:
+
+```text
+rank 20
+```
+
+and the full heap plus reverse-index invariants must remain valid.
+
+### Test 3 — unchanged rank
+
+For a resident with rank `40`:
+
+```text
+40 -> 40
+```
+
+Stage 16 verifies:
+
+```text
+same heap_index
+same heap root
+heap remains valid
+```
+
+No sift operation is required.
+
+### Test 4 — equal-rank tie ordering
+
+The heap contains:
+
+```text
+key 10 rank 10
+key 20 rank 20
+key 5  rank 30
+```
+
+Update:
+
+```text
+key 5 rank 30 -> 10
+```
+
+Now key `5` ties key `10` on rank.
+
+The existing secondary ordering rule uses the lower key, so:
+
+```text
+key 5 / rank 10
+```
+
+must become the heap root.
+
+This validates that `min_heap_update_rank()` preserves the existing deterministic rank/key ordering rather than only comparing numeric ranks at the final position.
+
+### Test 5 — invalid updates are non-destructive
+
+Stage 16 rejects:
+
+```text
+NULL heap
+NULL entry
+entry not resident in the heap
+entry with HEAP_INDEX_NONE
+entry whose heap_index points to a different heap slot
+```
+
+For rejected requests, the test verifies:
+
+```text
+entry rank unchanged
+heap state unchanged
+```
+
+After restoring controlled test metadata, the heap validator must still pass.
+
+### Test 6 — integrated hash lookup plus indexed rank update
+
+A five-entry integrated `Part1Cache` is filled.
+
+The hash table locates:
+
+```text
+key 5 -> CacheEntry *
+```
+
+with original rank:
+
+```text
+50
+```
+
+Stage 16 then calls:
+
+```c
+min_heap_update_rank(
+    &cache.min_heap,
+    resident,
+    5);
+```
+
+The resident reaches:
+
+```text
+heap_index = 0
+heap root = key 5 / rank 5
+```
+
+without any Stage 13 linear heap-location scan.
+
+Finally:
+
+```c
+part1_cache_validate(&cache)
+```
+
+must pass.
+
+---
+
+## Stage 16 Complexity
+
+```text
+membership check through heap_index   O(1)
+
+unchanged-rank update                 O(1)
+
+rank decrease + sift-up               O(log N)
+
+rank increase + sift-down             O(log N)
+
+overall min_heap_update_rank()        O(log N) worst case
+```
+
+The existing operations remain:
+
+```text
+min_heap_swap()      O(1)
+min_heap_peek()      O(1)
+min_heap_push()      O(log N)
+min_heap_pop_min()   O(log N)
+```
+
+---
+
+## Stage 16 Build and Validation
+
+### Normal build
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    ranked_cache.c \
+    -o ranked_cache16
+
+./ranked_cache16
+```
+
+Expected final Stage 16 lines:
+
+```text
+Stage 16 findings:
+  heap_index locates the resident directly in O(1).
+  lower rank repairs with sift-up.
+  higher rank repairs with sift-down.
+  unchanged rank requires no heap movement.
+  hardened swaps keep heap_index synchronized during repair.
+  arbitrary resident rank repair is O(log N) worst case.
+Stage 16 boundary: heap_update_rank exists but production Part 2 cache_get is not wired yet.
+Stage 16 heap-update-rank validation: PASS
+
+Stage 16 validation: PASS
+```
+
+### UndefinedBehaviorSanitizer
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fsanitize=undefined \
+    ranked_cache.c \
+    -o ranked_cache16_ubsan
+
+./ranked_cache16_ubsan
+```
+
+### AddressSanitizer + UndefinedBehaviorSanitizer
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fsanitize=address,undefined \
+    ranked_cache.c \
+    -o ranked_cache16_san
+
+./ranked_cache16_san
+```
+
+Both sanitizer builds pass for this checkpoint.
+
+---
+
+### Stage 16 boundary
+
+Stage 16 deliberately does **not** implement:
+
+- production Part 2 `cache_get()`,
+- calling `getEntryRank()` automatically on every cache hit,
+- dynamic-rank eviction behavior through the public cache API,
+- rollback around an external rank provider,
+- concurrency.
+
+The stage implements only the indexed heap rank-update primitive.
+
+---
+
 ## Build Environment
 
 Current target environment:
@@ -3631,7 +4012,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache15
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache16
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -3647,22 +4028,22 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache15
+./ranked_cache16
 ```
 
 ### Expected result
 
-The active Stage 15 test suite must end with:
+The active Stage 16 test suite must end with:
 
 ```text
-Stage 15 validation: PASS
+Stage 16 validation: PASS
 ```
 
 The Stage 10 Part 1 path combines the hash table and min-heap while preserving the earlier linear cache as a regression/reference implementation.
 
 ### Validation result
 
-Stages 0 through 15 have been validated successfully. The normal build, UBSan build, and combined ASan/UBSan build all pass for Stage 15.
+Stages 0 through 16 have been validated successfully. The normal build, UBSan build, and combined ASan/UBSan build all pass for Stage 16.
 
 ---
 
@@ -3710,12 +4091,17 @@ At this commit, the program can:
 - reject invalid heap-swap arguments before mutation,
 - treat self-swap as an explicit safe no-op,
 - preserve both pointer ownership and both `heap_index` values across valid swaps, and
-- verify invalid swaps do not partially change reverse-position metadata.
+- verify invalid swaps do not partially change reverse-position metadata,
+- update an arbitrary heap-resident rank through `heap_index`,
+- repair lower ranks with sift-up,
+- repair higher ranks with sift-down,
+- leave unchanged ranks in place,
+- preserve deterministic rank/key tie ordering during updates, and
+- combine hash lookup with direct indexed heap rank repair without a linear heap scan.
 
 At this commit, the program intentionally does **not** implement:
 
 - production Part 2 rank changes inside `part1_cache_get()`,
-- arbitrary heap-priority update,
 - indexed heap positions for Part 2,
 - concurrent/thread-safe access, or
 - later-stage Part 2 optimization.
@@ -3787,6 +4173,9 @@ O(1). The priority-update/repair operation itself is intentionally not implement
 Stage 15 preserves those complexities. `min_heap_swap()` remains O(1); the new
 argument validation is constant-time and establishes a stronger consistency primitive
 for later indexed-heap operations.
+
+Stage 16 uses `heap_index` plus the hardened swap primitive to implement arbitrary
+resident rank repair in O(log N) worst case. The operation performs no linear heap scan.
 
 ---
 
@@ -4019,6 +4408,23 @@ NULL-HEAP REJECTION PASS
 NULL-SLOT REJECTION PASS
 NO-PARTIAL-METADATA-MUTATION PASS
 SIFT CALLER REGRESSION PASS
+UBSAN PASS
+ASAN/UBSAN PASS
+
+
+Stage 16
+Implement min_heap_update_rank
+COMPLETE
+BUILD PASS
+RUN PASS
+RANK-DECREASE SIFT-UP PASS
+RANK-INCREASE SIFT-DOWN PASS
+UNCHANGED-RANK NO-OP PASS
+TIE-ORDER UPDATE PASS
+INVALID-MEMBERSHIP REJECTION PASS
+NON-DESTRUCTIVE FAILURE PASS
+HASH-TO-INDEXED-UPDATE PASS
+INTEGRATED VALIDATOR PASS
 UBSAN PASS
 ASAN/UBSAN PASS
 ```
