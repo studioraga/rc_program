@@ -23,6 +23,7 @@
  *   Stage 17 - test rank-decrease repair independently
  *   Stage 18 - test rank-increase repair independently
  *   Stage 19 - integrate dynamic rank repair into cache hits
+ *   Stage 20 - add integrated cache runtime statistics
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
@@ -1283,6 +1284,45 @@ int stage9_run_min_heap_tests(void)
 /* ---------- Stage 10: combine hash table + heap for Part 1 ---------- */
 
 /*
+ * Stage 20 runtime statistics for the integrated cache path.
+ *
+ * These counters deliberately live above the low-level hash/heap validators so
+ * debug validation does not contaminate user-visible cache-operation metrics.
+ */
+typedef struct {
+    uint64_t accesses;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t db_reads;
+    uint64_t insertions;
+    uint64_t evictions;
+    uint64_t rank_provider_calls;
+    uint64_t rank_updates;
+    uint64_t rank_decreases;
+    uint64_t rank_unchanged;
+    uint64_t rank_increases;
+} CacheStats;
+
+void cache_stats_zero(CacheStats *stats)
+{
+    if (stats == NULL) {
+        return;
+    }
+
+    stats->accesses = 0U;
+    stats->hits = 0U;
+    stats->misses = 0U;
+    stats->db_reads = 0U;
+    stats->insertions = 0U;
+    stats->evictions = 0U;
+    stats->rank_provider_calls = 0U;
+    stats->rank_updates = 0U;
+    stats->rank_decreases = 0U;
+    stats->rank_unchanged = 0U;
+    stats->rank_increases = 0U;
+}
+
+/*
  * Fixed-rank Part 1 cache.
  *
  * The resident entry array provides stable addresses for CacheEntry objects.
@@ -1303,6 +1343,7 @@ typedef struct {
     size_t capacity;
     HashTable index;
     MinHeap min_heap;
+    CacheStats stats;
 } Part1Cache;
 
 int part1_cache_init(Part1Cache *cache, size_t capacity)
@@ -1332,7 +1373,29 @@ int part1_cache_init(Part1Cache *cache, size_t capacity)
 
     hash_table_init(&cache->index);
     min_heap_init(&cache->min_heap);
+    cache_stats_zero(&cache->stats);
     return 1;
+}
+
+void part1_cache_stats_reset(Part1Cache *cache)
+{
+    if (cache == NULL) {
+        return;
+    }
+
+    cache_stats_zero(&cache->stats);
+}
+
+CacheStats part1_cache_stats_snapshot(const Part1Cache *cache)
+{
+    CacheStats snapshot;
+
+    cache_stats_zero(&snapshot);
+    if (cache != NULL) {
+        snapshot = cache->stats;
+    }
+
+    return snapshot;
 }
 
 int part1_cache_is_full(const Part1Cache *cache)
@@ -1395,6 +1458,7 @@ int part1_cache_insert(Part1Cache *cache,
     }
 
     ++cache->size;
+    ++cache->stats.insertions;
 
     if (inserted_entry != NULL) {
         *inserted_entry = resident;
@@ -1444,6 +1508,7 @@ int part1_cache_evict_min(Part1Cache *cache, CacheEntry *evicted_entry)
     cache->active[(size_t)slot_index] = 0U;
     cache->free_stack[cache->free_count++] = (size_t)slot_index;
     --cache->size;
+    ++cache->stats.evictions;
     return 1;
 }
 
@@ -1466,11 +1531,16 @@ CacheEntry *part1_cache_get(Part1Cache *cache, CacheKey key)
         return NULL;
     }
 
+    ++cache->stats.accesses;
+
     resident = part1_cache_lookup(cache, key);
     if (resident != NULL) {
+        ++cache->stats.hits;
         return resident;
     }
 
+    ++cache->stats.misses;
+    ++cache->stats.db_reads;
     fetched = db_read_entry(key);
 
     if (part1_cache_is_full(cache)) {
@@ -4181,14 +4251,32 @@ CacheEntry *part2_cache_get(Part1Cache *cache,
         /*
          * Stage 19 changes hits only. Miss fetch/eviction/insertion semantics
          * remain exactly those of the validated Part 1 implementation.
+         * part1_cache_get() owns the miss/access statistics for this path.
          */
         return part1_cache_get(cache, key);
     }
 
-    new_rank = rank_provider(resident, rank_context);
+    ++cache->stats.accesses;
+    ++cache->stats.hits;
+    ++cache->stats.rank_provider_calls;
 
-    if (!min_heap_update_rank(&cache->min_heap, resident, new_rank)) {
-        return NULL;
+    {
+        Rank old_rank = resident->rank;
+
+        new_rank = rank_provider(resident, rank_context);
+
+        if (!min_heap_update_rank(&cache->min_heap, resident, new_rank)) {
+            return NULL;
+        }
+
+        ++cache->stats.rank_updates;
+        if (new_rank < old_rank) {
+            ++cache->stats.rank_decreases;
+        } else if (new_rank > old_rank) {
+            ++cache->stats.rank_increases;
+        } else {
+            ++cache->stats.rank_unchanged;
+        }
     }
 
     return resident;
@@ -4519,6 +4607,266 @@ int stage19_run_dynamic_hit_integration_tests(void)
     return passed;
 }
 
+
+
+/* ---------- Stage 20: add integrated cache statistics ---------- */
+
+int stage20_stats_are_zero(const CacheStats *stats)
+{
+    return stats != NULL &&
+           stats->accesses == 0U &&
+           stats->hits == 0U &&
+           stats->misses == 0U &&
+           stats->db_reads == 0U &&
+           stats->insertions == 0U &&
+           stats->evictions == 0U &&
+           stats->rank_provider_calls == 0U &&
+           stats->rank_updates == 0U &&
+           stats->rank_decreases == 0U &&
+           stats->rank_unchanged == 0U &&
+           stats->rank_increases == 0U;
+}
+
+int stage20_test_initial_and_reset_statistics(void)
+{
+    Part1Cache cache;
+    CacheStats stats;
+    int passed = 1;
+
+    printf("\n[Stage 20] statistics initialize and reset deterministically\n");
+
+    passed &= check(part1_cache_init(&cache, 3U),
+                    "initialize Stage 20 statistics cache");
+
+    stats = part1_cache_stats_snapshot(&cache);
+    passed &= check(stage20_stats_are_zero(&stats),
+                    "fresh cache statistics are all zero");
+
+    passed &= check(part1_cache_get(&cache, 1ULL) != NULL,
+                    "perform one miss before reset");
+    passed &= check(part1_cache_get(&cache, 1ULL) != NULL,
+                    "perform one hit before reset");
+
+    stats = part1_cache_stats_snapshot(&cache);
+    passed &= check(stats.accesses == 2U &&
+                    stats.hits == 1U &&
+                    stats.misses == 1U &&
+                    stats.db_reads == 1U &&
+                    stats.insertions == 1U,
+                    "statistics record pre-reset activity");
+
+    part1_cache_stats_reset(&cache);
+    stats = part1_cache_stats_snapshot(&cache);
+
+    passed &= check(stage20_stats_are_zero(&stats),
+                    "statistics reset clears every counter");
+    passed &= check(cache.size == 1U &&
+                    part1_cache_lookup(&cache, 1ULL) != NULL &&
+                    part1_cache_validate(&cache),
+                    "statistics reset does not change cache contents");
+
+    return passed;
+}
+
+int stage20_test_part1_access_statistics(void)
+{
+    Part1Cache cache;
+    CacheStats stats;
+    int passed = 1;
+
+    printf("\n[Stage 20] Part 1 hit/miss/DB/insert/eviction statistics\n");
+
+    passed &= check(part1_cache_init(&cache, 2U),
+                    "initialize capacity-two statistics cache");
+
+    passed &= check(part1_cache_get(&cache, 1ULL) != NULL,
+                    "GET 1 records first miss");
+    passed &= check(part1_cache_get(&cache, 1ULL) != NULL,
+                    "GET 1 records hit");
+    passed &= check(part1_cache_get(&cache, 2ULL) != NULL,
+                    "GET 2 records second miss");
+    passed &= check(part1_cache_get(&cache, 3ULL) != NULL,
+                    "GET 3 records miss, eviction, and insertion");
+
+    stats = part1_cache_stats_snapshot(&cache);
+
+    passed &= check(stats.accesses == 4U &&
+                    stats.hits == 1U &&
+                    stats.misses == 3U &&
+                    stats.db_reads == 3U &&
+                    stats.insertions == 3U &&
+                    stats.evictions == 1U,
+                    "Part 1 operation counters match exact access sequence");
+
+    passed &= check(stats.rank_provider_calls == 0U &&
+                    stats.rank_updates == 0U &&
+                    stats.rank_decreases == 0U &&
+                    stats.rank_unchanged == 0U &&
+                    stats.rank_increases == 0U,
+                    "Part 1 accesses do not increment dynamic-rank counters");
+
+    passed &= check(part1_cache_lookup(&cache, 1ULL) == NULL &&
+                    part1_cache_lookup(&cache, 2ULL) != NULL &&
+                    part1_cache_lookup(&cache, 3ULL) != NULL &&
+                    part1_cache_validate(&cache),
+                    "Part 1 statistics do not alter eviction semantics");
+
+    return passed;
+}
+
+int stage20_test_dynamic_rank_statistics(void)
+{
+    Part1Cache cache;
+    Stage19RankContext context = {PART2_RANK_DECREASE, 0U};
+    CacheStats stats;
+    CacheEntry *resident;
+    int passed = 1;
+
+    printf("\n[Stage 20] Part 2 dynamic-rank direction statistics\n");
+
+    passed &= check(stage19_prepare_dynamic_hit_cache(&cache),
+                    "prepare dynamic statistics cache");
+    part1_cache_stats_reset(&cache);
+
+    resident = part2_cache_get(&cache, 3ULL, stage19_rank_provider, &context);
+    passed &= check(resident != NULL && resident->rank == 0LL,
+                    "dynamic decrease hit succeeds");
+
+    context.scenario = PART2_RANK_UNCHANGED;
+    resident = part2_cache_get(&cache, 3ULL, stage19_rank_provider, &context);
+    passed &= check(resident != NULL && resident->rank == 0LL,
+                    "dynamic unchanged hit succeeds");
+
+    context.scenario = PART2_RANK_INCREASE;
+    resident = part2_cache_get(&cache, 3ULL, stage19_rank_provider, &context);
+    passed &= check(resident != NULL && resident->rank == 30LL,
+                    "dynamic increase hit succeeds");
+
+    stats = part1_cache_stats_snapshot(&cache);
+
+    passed &= check(stats.accesses == 3U &&
+                    stats.hits == 3U &&
+                    stats.misses == 0U &&
+                    stats.db_reads == 0U &&
+                    stats.insertions == 0U &&
+                    stats.evictions == 0U,
+                    "dynamic-hit accesses do not contaminate miss counters");
+
+    passed &= check(stats.rank_provider_calls == 3U &&
+                    stats.rank_updates == 3U &&
+                    stats.rank_decreases == 1U &&
+                    stats.rank_unchanged == 1U &&
+                    stats.rank_increases == 1U &&
+                    context.calls == 3U,
+                    "dynamic-rank counters classify decrease/equal/increase exactly");
+
+    passed &= check(part1_cache_validate(&cache),
+                    "dynamic statistics preserve integrated cache validity");
+
+    return passed;
+}
+
+int stage20_test_part2_miss_statistics(void)
+{
+    Part1Cache cache;
+    Stage19RankContext context = {PART2_RANK_DECREASE, 0U};
+    CacheStats stats;
+    CacheEntry *resident;
+    int passed = 1;
+
+    printf("\n[Stage 20] Part 2 miss is counted once by the existing miss path\n");
+
+    passed &= check(part1_cache_init(&cache, 2U),
+                    "initialize Part 2 miss statistics cache");
+    passed &= check(part1_cache_get(&cache, 1ULL) != NULL &&
+                    part1_cache_get(&cache, 2ULL) != NULL,
+                    "fill Part 2 miss statistics cache");
+
+    part1_cache_stats_reset(&cache);
+
+    resident = part2_cache_get(&cache, 3ULL, stage19_rank_provider, &context);
+    passed &= check(resident != NULL && resident->key == 3ULL,
+                    "Part 2 miss inserts requested key");
+
+    stats = part1_cache_stats_snapshot(&cache);
+
+    passed &= check(stats.accesses == 1U &&
+                    stats.hits == 0U &&
+                    stats.misses == 1U &&
+                    stats.db_reads == 1U &&
+                    stats.insertions == 1U &&
+                    stats.evictions == 1U,
+                    "Part 2 miss is counted exactly once");
+
+    passed &= check(stats.rank_provider_calls == 0U &&
+                    stats.rank_updates == 0U &&
+                    context.calls == 0U,
+                    "Part 2 miss does not invoke or count rank provider");
+
+    passed &= check(part1_cache_validate(&cache),
+                    "Part 2 miss statistics preserve integrated validity");
+
+    return passed;
+}
+
+int stage20_test_statistics_snapshot_is_non_mutating(void)
+{
+    Part1Cache cache;
+    CacheStats first;
+    CacheStats second;
+    int passed = 1;
+
+    printf("\n[Stage 20] statistics snapshot is read-only\n");
+
+    passed &= check(part1_cache_init(&cache, 2U),
+                    "initialize snapshot statistics cache");
+    passed &= check(part1_cache_get(&cache, 1ULL) != NULL,
+                    "create statistics before snapshot");
+
+    first = part1_cache_stats_snapshot(&cache);
+    second = part1_cache_stats_snapshot(&cache);
+
+    passed &= check(first.accesses == second.accesses &&
+                    first.hits == second.hits &&
+                    first.misses == second.misses &&
+                    first.db_reads == second.db_reads &&
+                    first.insertions == second.insertions &&
+                    first.evictions == second.evictions &&
+                    first.rank_provider_calls == second.rank_provider_calls &&
+                    first.rank_updates == second.rank_updates &&
+                    first.rank_decreases == second.rank_decreases &&
+                    first.rank_unchanged == second.rank_unchanged &&
+                    first.rank_increases == second.rank_increases,
+                    "taking a statistics snapshot does not change counters");
+
+    return passed;
+}
+
+int stage20_run_statistics_tests(void)
+{
+    int passed = 1;
+
+    printf("\n=== Stage 20: add integrated cache statistics ===\n");
+
+    passed &= stage20_test_initial_and_reset_statistics();
+    passed &= stage20_test_part1_access_statistics();
+    passed &= stage20_test_dynamic_rank_statistics();
+    passed &= stage20_test_part2_miss_statistics();
+    passed &= stage20_test_statistics_snapshot_is_non_mutating();
+
+    printf("\nStage 20 findings:\n");
+    printf("  integrated cache accesses now expose deterministic runtime counters.\n");
+    printf("  hits/misses/DB reads/insertions/evictions are counted at operation boundaries.\n");
+    printf("  Part 2 hits classify rank decrease/equal/increase independently.\n");
+    printf("  Part 2 misses are counted once and do not invoke the rank provider.\n");
+    printf("  reset clears counters without changing cache contents.\n");
+    printf("  snapshot reads statistics without mutating them.\n");
+    printf("Stage 20 boundary: statistics add observability only; cache policy is unchanged.\n");
+    printf("Stage 20 statistics validation: %s\n", passed ? "PASS" : "FAIL");
+
+    return passed;
+}
+
 int main(void)
 {
     Cache cache;
@@ -4687,7 +5035,12 @@ int main(void)
 
     all_passed &= stage19_run_dynamic_hit_integration_tests();
 
-    printf("\nStage 19 validation: %s\n",
+    printf("\nStage 19 regression validation: %s\n",
+           all_passed ? "PASS" : "FAIL");
+
+    all_passed &= stage20_run_statistics_tests();
+
+    printf("\nStage 20 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;

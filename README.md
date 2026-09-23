@@ -5135,6 +5135,457 @@ This checkpoint integrates dynamic rank changes into **cache hits only**.
 
 ---
 
+## Stage 20 — Add Runtime Statistics
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 20 adds observability only.
+
+It does not change:
+
+- cache lookup policy,
+- hash-table behavior,
+- heap ordering,
+- eviction policy,
+- Part 1 fixed-rank semantics,
+- Part 2 dynamic-rank semantics.
+
+The statistics are stored directly in the integrated `Part1Cache` so each cache instance owns its own counters.
+
+### Statistics structure
+
+Stage 20 adds:
+
+```c
+typedef struct {
+    uint64_t accesses;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t db_reads;
+    uint64_t insertions;
+    uint64_t evictions;
+    uint64_t rank_provider_calls;
+    uint64_t rank_updates;
+    uint64_t rank_decreases;
+    uint64_t rank_unchanged;
+    uint64_t rank_increases;
+} CacheStats;
+```
+
+and extends:
+
+```c
+Part1Cache
+```
+
+with:
+
+```c
+CacheStats stats;
+```
+
+### Counter meanings
+
+```text
+accesses
+    completed cache access attempts through part1_cache_get() or
+    successful-hit processing through part2_cache_get()
+
+hits
+    requested key was already resident
+
+misses
+    requested key was not resident and entered the existing miss path
+
+db_reads
+    backing-store reads issued for cache misses
+
+insertions
+    successful integrated cache insertions
+
+evictions
+    successful minimum-rank evictions
+
+rank_provider_calls
+    Part 2 hit calls made to the external dynamic-rank provider
+
+rank_updates
+    successful Part 2 heap-rank updates after provider execution
+
+rank_decreases
+    successful Part 2 hit updates where new rank < old rank
+
+rank_unchanged
+    successful Part 2 hit updates where new rank == old rank
+
+rank_increases
+    successful Part 2 hit updates where new rank > old rank
+```
+
+### Why counters are not inside low-level lookup helpers
+
+Stage 20 intentionally does **not** increment runtime access counters inside:
+
+```c
+part1_cache_lookup()
+hash_table_lookup()
+part1_cache_validate()
+min_heap_validate()
+```
+
+Those functions are also used by validators and internal consistency checks.
+
+Counting there would make debug/test validation artificially increase operational metrics.
+
+Instead, counters are updated only at meaningful cache-operation boundaries.
+
+---
+
+## Statistics APIs
+
+Stage 20 adds:
+
+```c
+void part1_cache_stats_reset(Part1Cache *cache);
+```
+
+and:
+
+```c
+CacheStats part1_cache_stats_snapshot(
+    const Part1Cache *cache);
+```
+
+### Reset
+
+`part1_cache_stats_reset()` clears only counters.
+
+It does not modify:
+
+- resident entries,
+- cache size,
+- hash table,
+- min-heap,
+- `heap_index`,
+- free-slot state.
+
+### Snapshot
+
+`part1_cache_stats_snapshot()` returns a copy.
+
+Reading statistics therefore does not mutate the counters.
+
+For a `NULL` cache, the snapshot is an all-zero `CacheStats`.
+
+---
+
+## Part 1 statistics
+
+`part1_cache_get()` now records:
+
+### Hit
+
+```text
+accesses += 1
+hits     += 1
+```
+
+### Miss
+
+```text
+accesses += 1
+misses   += 1
+db_reads += 1
+```
+
+A successful miss insertion also increments:
+
+```text
+insertions += 1
+```
+
+If the cache is full and minimum eviction succeeds:
+
+```text
+evictions += 1
+```
+
+The existing cache behavior is unchanged.
+
+---
+
+## Part 2 statistics
+
+For a Part 2 hit:
+
+```text
+accesses            += 1
+hits                += 1
+rank_provider_calls += 1
+```
+
+After a successful indexed heap update:
+
+```text
+rank_updates += 1
+```
+
+Exactly one direction counter also increments:
+
+```text
+new < old -> rank_decreases += 1
+new = old -> rank_unchanged += 1
+new > old -> rank_increases += 1
+```
+
+### Part 2 miss accounting
+
+A Part 2 miss still delegates to:
+
+```c
+part1_cache_get()
+```
+
+Therefore the miss is counted **once**, by the existing miss path.
+
+The dynamic rank provider is not invoked on a miss.
+
+This avoids double-counting:
+
+```text
+part2_cache_get()
+    miss
+      |
+      v
+part1_cache_get()
+      |
+      +--> accesses +1
+      +--> misses +1
+      +--> db_reads +1
+```
+
+---
+
+## Stage 20 Validation
+
+### Test 1 — initialization and reset
+
+A newly initialized integrated cache must report all counters as zero.
+
+After:
+
+```text
+GET 1 -> miss
+GET 1 -> hit
+```
+
+the expected subset is:
+
+```text
+accesses   = 2
+hits       = 1
+misses     = 1
+db_reads   = 1
+insertions = 1
+```
+
+After:
+
+```c
+part1_cache_stats_reset(&cache);
+```
+
+every counter returns to zero while key `1` remains resident and the cache validator still passes.
+
+### Test 2 — exact Part 1 sequence
+
+Capacity:
+
+```text
+2
+```
+
+Sequence:
+
+```text
+GET 1 -> miss
+GET 1 -> hit
+GET 2 -> miss
+GET 3 -> miss/full -> evict minimum -> insert
+```
+
+Expected counters:
+
+```text
+accesses   = 4
+hits       = 1
+misses     = 3
+db_reads   = 3
+insertions = 3
+evictions  = 1
+```
+
+Dynamic-rank counters remain zero.
+
+### Test 3 — dynamic rank directions
+
+After preparing a five-entry dynamic cache, statistics are reset.
+
+Three hits are performed on the same resident:
+
+```text
+decrease
+unchanged
+increase
+```
+
+Expected:
+
+```text
+accesses            = 3
+hits                = 3
+misses              = 0
+rank_provider_calls = 3
+rank_updates        = 3
+rank_decreases      = 1
+rank_unchanged      = 1
+rank_increases      = 1
+```
+
+No DB read, insertion, or eviction is counted.
+
+### Test 4 — Part 2 miss counted once
+
+A full capacity-two cache receives a Part 2 request for a missing key.
+
+Expected:
+
+```text
+accesses            = 1
+hits                = 0
+misses              = 1
+db_reads            = 1
+insertions          = 1
+evictions           = 1
+rank_provider_calls = 0
+rank_updates        = 0
+```
+
+This confirms the Part 2 wrapper does not double-count the delegated miss.
+
+### Test 5 — snapshot is non-mutating
+
+Two consecutive statistics snapshots must contain identical values when no cache operation occurs between them.
+
+---
+
+## Stage 20 Complexity
+
+Counter updates are constant-time integer increments.
+
+Therefore Stage 20 does not change asymptotic cache complexity.
+
+```text
+statistics reset              O(1)
+statistics snapshot           O(1)
+
+Part 1 hit                    expected O(1)
+Part 1 miss                   unchanged
+
+Part 2 dynamic hit            O(log N) worst case
+statistics overhead           O(1)
+```
+
+Memory overhead is one fixed-size `CacheStats` object per integrated cache instance.
+
+---
+
+## Stage 20 Build and Validation
+
+### Normal build
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    ranked_cache.c \
+    -o ranked_cache20
+
+./ranked_cache20
+```
+
+Expected Stage 20 ending:
+
+```text
+Stage 20 findings:
+  integrated cache accesses now expose deterministic runtime counters.
+  hits/misses/DB reads/insertions/evictions are counted at operation boundaries.
+  Part 2 hits classify rank decrease/equal/increase independently.
+  Part 2 misses are counted once and do not invoke the rank provider.
+  reset clears counters without changing cache contents.
+  snapshot reads statistics without mutating them.
+Stage 20 boundary: statistics add observability only; cache policy is unchanged.
+Stage 20 statistics validation: PASS
+
+Stage 20 validation: PASS
+```
+
+### UndefinedBehaviorSanitizer
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fsanitize=undefined \
+    ranked_cache.c \
+    -o ranked_cache20_ubsan
+
+./ranked_cache20_ubsan
+```
+
+### AddressSanitizer + UndefinedBehaviorSanitizer
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fsanitize=address,undefined \
+    ranked_cache.c \
+    -o ranked_cache20_san
+
+./ranked_cache20_san
+```
+
+Both sanitizer builds pass.
+
+---
+
+### Stage 20 boundary
+
+Stage 20 deliberately does **not** add:
+
+- new eviction behavior,
+- new ranking behavior,
+- timing/profiling measurements,
+- hit-rate calculations,
+- percentages or derived metrics,
+- persistence/export of statistics,
+- concurrency/atomic counters.
+
+It adds deterministic counters and snapshot/reset APIs only.
+
+---
+
 ## Build Environment
 
 Current target environment:
@@ -5146,7 +5597,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache19
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache20
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -5162,22 +5613,22 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache19
+./ranked_cache20
 ```
 
 ### Expected result
 
-The active Stage 19 test suite must end with:
+The active Stage 20 test suite must end with:
 
 ```text
-Stage 19 validation: PASS
+Stage 20 validation: PASS
 ```
 
 The Stage 10 Part 1 path combines the hash table and min-heap while preserving the earlier linear cache as a regression/reference implementation.
 
 ### Validation result
 
-Stages 0 through 19 have been validated successfully. The normal build, UBSan build, and combined ASan/UBSan build all pass for Stage 19.
+Stages 0 through 20 have been validated successfully. The normal build, UBSan build, and combined ASan/UBSan build all pass for Stage 20.
 
 ---
 
@@ -5247,7 +5698,12 @@ At this commit, the program can:
 - preserve resident pointer identity across dynamic hit repair,
 - reuse maintained `heap_index` across repeated dynamic hits,
 - preserve the existing Part 1 miss path, and
-- verify repaired hit ranks immediately affect later eviction ordering.
+- verify repaired hit ranks immediately affect later eviction ordering,
+- expose per-cache access/hit/miss/DB/insert/eviction counters,
+- expose Part 2 rank-provider and rank-direction counters,
+- reset statistics without changing cache state,
+- snapshot statistics without mutating counters, and
+- verify Part 2 delegated misses are counted exactly once.
 
 At this commit, the program intentionally does **not** implement:
 
@@ -5338,6 +5794,9 @@ preserving the same O(log N) worst-case repair complexity.
 Stage 19 integrates the already validated rank-update primitive into cache hits. The
 hash lookup remains expected O(1), heap position lookup is O(1) through `heap_index`,
 and dynamic hit repair is O(log N) worst case, excluding the external rank-provider cost.
+
+Stage 20 adds only O(1) counter updates around those existing operation boundaries.
+It does not change any lookup, heap, insertion, or eviction asymptotic complexity.
 
 ---
 
@@ -5637,6 +6096,26 @@ REPEATED-DYNAMIC-HIT PASS
 MISS-PATH COMPATIBILITY PASS
 DYNAMIC-RANK EVICTION EFFECT PASS
 INVALID-API REJECTION PASS
+INTEGRATED VALIDATOR PASS
+UBSAN PASS
+ASAN/UBSAN PASS
+
+
+Stage 20
+Add integrated cache statistics
+COMPLETE
+BUILD PASS
+RUN PASS
+INITIAL-ZERO STATS PASS
+STATS RESET PASS
+PART1 HIT/MISS COUNTERS PASS
+DB-READ COUNTER PASS
+INSERTION COUNTER PASS
+EVICTION COUNTER PASS
+RANK-PROVIDER COUNTER PASS
+RANK-DIRECTION COUNTERS PASS
+PART2 MISS SINGLE-COUNT PASS
+SNAPSHOT NON-MUTATING PASS
 INTEGRATED VALIDATOR PASS
 UBSAN PASS
 ASAN/UBSAN PASS
