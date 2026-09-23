@@ -6627,6 +6627,342 @@ It establishes the optimized binary only after the correctness binary is already
 
 ---
 
+## Stage 24 — Benchmark Fixed Rank First
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 24 introduces the first wall-clock benchmark.
+
+The scope is deliberately limited to **fixed-rank Part 1**.
+
+It does not benchmark:
+
+- dynamic rank providers,
+- `min_heap_update_rank()` on hits,
+- Part 2 rank decrease/increase behavior,
+- concurrent access.
+
+The benchmark compares the two fixed-rank implementations already present in `ranked_cache.c`:
+
+```text
+reference:
+    linear Cache
+    linear key lookup
+    linear minimum-rank victim selection
+
+optimized Part 1:
+    Part1Cache
+    hash-table key lookup
+    indexed min-heap eviction
+```
+
+Both implementations consume the exact same deterministic pre-generated key sequence.
+
+### Benchmark clock
+
+Stage 24 uses:
+
+```c
+clock_gettime(CLOCK_MONOTONIC, ...)
+```
+
+with:
+
+```c
+#define _POSIX_C_SOURCE 200809L
+```
+
+The monotonic clock is used so elapsed time is not affected by wall-clock adjustments.
+
+### Fixed benchmark configuration
+
+The Stage 24 benchmark uses:
+
+```text
+cache capacity      = 100
+key space           = 200
+warmup operations   = 20,000
+measured operations = 200,000
+measured repeats    = 5
+seed                = 0x9e3779b97f4a7c15
+```
+
+The key stream is generated before the measured region.
+
+Only fixed-rank cache operations are executed inside the measured loop.
+
+### Warmup
+
+Warmup is performed before measured repetitions:
+
+```text
+deterministic key generation
+        |
+        v
+warm linear path
+warm Part 1 path
+        |
+        v
+begin measured repetitions
+```
+
+Each measured repetition still initializes a fresh cache so every repetition sees the same logical starting state.
+
+### Alternating execution order
+
+To reduce a fixed first/second ordering bias:
+
+```text
+repeat 1: linear -> Part1
+repeat 2: Part1  -> linear
+repeat 3: linear -> Part1
+repeat 4: Part1  -> linear
+repeat 5: linear -> Part1
+```
+
+The benchmark remains deterministic.
+
+### Correctness guards
+
+Timing is not allowed to replace correctness.
+
+Every measured repetition verifies:
+
+```text
+linear checksum == Part1 checksum
+```
+
+and:
+
+```text
+final linear logical state == final Part1 logical state
+```
+
+The final caches are also validated structurally.
+
+A volatile checksum sink prevents the benchmark result from becoming dead work from the compiler's perspective.
+
+### Median reporting
+
+Each measured run reports:
+
+```text
+nanoseconds per operation
+```
+
+Stage 24 then sorts the five samples and reports the median for each implementation.
+
+It also reports:
+
+```text
+linear median / Part1 median
+```
+
+as an observational ratio.
+
+No specific ratio or speedup is required for PASS.
+
+Absolute timing depends on:
+
+- CPU,
+- frequency scaling,
+- scheduler activity,
+- cache hierarchy,
+- compiler version,
+- operating-system load,
+- virtualization/container environment.
+
+---
+
+## Stage 24 Validation
+
+### Test 1 — deterministic fixed-rank key stream
+
+Stage 24 validates that:
+
+```text
+same seed -> same key stream
+different seed -> different stream
+all keys remain within configured key space
+```
+
+Only keys are generated for this benchmark; Part 2 rank scenarios are not consumed.
+
+### Test 2 — fixed-rank semantic equivalence
+
+A 1000-operation deterministic fixed-rank workload is executed through:
+
+```text
+linear Cache
+Part1Cache
+```
+
+Stage 24 verifies:
+
+```text
+identical checksum
+identical resident key/value/rank state
+valid linear cache
+valid integrated Part1 cache
+```
+
+### Test 3 — correctness build regression
+
+The Stage 22 correctness configuration is re-run against the Stage 24 source:
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -Werror \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fno-omit-frame-pointer \
+    -DRANKED_CACHE_CORRECTNESS_BUILD=1 \
+    -fsanitize=address,undefined \
+    ranked_cache.c \
+    -o ranked_cache24_correctness
+```
+
+Run:
+
+```bash
+ASAN_OPTIONS=detect_leaks=1 \
+UBSAN_OPTIONS=halt_on_error=1 \
+./ranked_cache24_correctness
+```
+
+The fixed-rank semantic-equivalence tests run, while benchmark timing is skipped because this is not the optimized build.
+
+### Test 4 — optimized fixed-rank benchmark
+
+Build:
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -Werror \
+    -std=c11 \
+    -O3 \
+    -DNDEBUG \
+    -DRANKED_CACHE_OPTIMIZED_BUILD=1 \
+    ranked_cache.c \
+    -o ranked_cache24_optimized
+```
+
+Run:
+
+```bash
+./ranked_cache24_optimized
+```
+
+The benchmark reports five measurements and their median.
+
+---
+
+## Stage 24 Observed Result in the Validation Sandbox
+
+One validation run produced:
+
+```text
+repeat 1: linear=127.84 ns/op  Part1=328.76 ns/op
+repeat 2: linear=156.62 ns/op  Part1=327.74 ns/op
+repeat 3: linear=126.87 ns/op  Part1=332.04 ns/op
+repeat 4: linear=122.72 ns/op  Part1=315.05 ns/op
+repeat 5: linear=153.16 ns/op  Part1=319.07 ns/op
+
+median:
+linear = 127.84 ns/op
+Part1  = 327.74 ns/op
+
+linear / Part1 median ratio = 0.390x
+```
+
+This means that on this specific validation host and with the current maximum cache capacity of only 100 entries, the simple linear reference was faster.
+
+This is not treated as a benchmark failure.
+
+The result is technically plausible because the hash table and heap introduce extra pointer chasing, hashing, metadata maintenance, and branch overhead, while a linear scan across at most 100 compact entries can be cache-friendly.
+
+Stage 24 therefore demonstrates an important performance-engineering rule:
+
+> Better asymptotic complexity does not guarantee lower latency at a small fixed problem size.
+
+The benchmark should be rerun on Node1 and the measured values from that machine should be treated as the authoritative local performance evidence.
+
+No Stage 24 correctness decision depends on one implementation being faster.
+
+---
+
+## Stage 24 Complexity Context
+
+Reference fixed-rank cache:
+
+```text
+hit lookup                  O(N)
+miss victim selection       O(N)
+```
+
+Integrated Part 1:
+
+```text
+hash lookup                 expected O(1)
+heap minimum                O(1)
+heap insert/pop             O(log N)
+```
+
+Stage 24 measures actual constant-factor behavior for:
+
+```text
+N <= 100
+```
+
+rather than assuming the asymptotic design must already be faster at that size.
+
+---
+
+## Stage 24 Expected Ending
+
+```text
+Stage 24 findings:
+  fixed-rank benchmark compares the linear reference with integrated Part 1.
+  both implementations consume the same pre-generated deterministic key stream.
+  workload generation and warmup are outside the measured operation interval.
+  repeated runs alternate execution order and report median ns/op.
+  checksums and final logical state guard benchmark correctness.
+  timing values are observational and are not used as a correctness threshold.
+Stage 24 boundary: fixed-rank benchmark only; dynamic-rank benchmarking comes later.
+Stage 24 fixed-rank benchmark validation: PASS
+
+Stage 24 validation: PASS
+```
+
+---
+
+### Stage 24 boundary
+
+Stage 24 deliberately does **not** benchmark:
+
+- Part 2 dynamic-rank hits,
+- rank-provider cost,
+- rank decrease repair,
+- rank increase repair,
+- mixed fixed/dynamic workload comparisons,
+- multithreading,
+- CPU affinity,
+- `-march=native`,
+- LTO,
+- PGO,
+- hardware performance counters.
+
+It establishes the fixed-rank benchmark first.
+
+---
+
 ## Build Environment
 
 Current target environment:
@@ -6638,7 +6974,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -Werror -std=c11 -O3 -DNDEBUG -DRANKED_CACHE_OPTIMIZED_BUILD=1 ranked_cache.c -o ranked_cache23_optimized
+gcc -Wall -Wextra -Wpedantic -Werror -std=c11 -O3 -DNDEBUG -DRANKED_CACHE_OPTIMIZED_BUILD=1 ranked_cache.c -o ranked_cache24_optimized
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -6654,22 +6990,22 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache23_optimized
+./ranked_cache24_optimized
 ```
 
 ### Expected result
 
-The active Stage 23 optimized test suite must end with:
+The active Stage 24 fixed-rank benchmark suite must end with:
 
 ```text
-Stage 23 validation: PASS
+Stage 24 validation: PASS
 ```
 
 The Stage 10 Part 1 path combines the hash table and min-heap while preserving the earlier linear cache as a regression/reference implementation.
 
 ### Validation result
 
-Stages 0 through 23 have been validated successfully. The Stage 22 correctness build still passes with assertions and ASan/UBSan, and the Stage 23 optimized build passes with -O3, NDEBUG, deterministic golden equivalence, and final invariant validation.
+Stages 0 through 24 have been validated successfully. The Stage 22 correctness build still passes with assertions and ASan/UBSan, the Stage 23 optimized build still passes, and Stage 24 adds a deterministic fixed-rank benchmark with correctness guards and median CLOCK_MONOTONIC timing.
 
 ---
 
@@ -6758,7 +7094,12 @@ At this commit, the program can:
 - enforce mutually exclusive correctness/optimized build markers,
 - keep the optimized build warning-clean under `-O3 -DNDEBUG -Werror`,
 - validate optimized output against a correctness-baseline golden outcome, and
-- replay deterministic optimized workloads without per-operation debug validation.
+- replay deterministic optimized workloads without per-operation debug validation,
+- benchmark the linear reference and integrated Part 1 using the same fixed-rank key stream,
+- pre-generate workload keys and keep warmup outside the measured interval,
+- alternate benchmark execution order across repeated runs,
+- report median fixed-rank nanoseconds per operation, and
+- verify benchmark checksums and final logical state before accepting timing output.
 
 At this commit, the program intentionally does **not** implement:
 
@@ -6863,6 +7204,9 @@ from later performance measurements.
 Stage 23 changes compiler configuration only. The optimized workload path omits the
 Stage 22 per-operation debug validator and verifies final state instead, but this stage
 still reports no timing or performance result.
+
+Stage 24 adds the first `CLOCK_MONOTONIC` timing harness, limited to fixed-rank Part 1.
+Measured values are observational only and never determine correctness PASS/FAIL.
 
 ---
 
@@ -7239,4 +7583,20 @@ GOLDEN-HEAP-MINIMUM PASS
 OPTIMIZED REPLAY PASS
 FINAL INVARIANT VALIDATION PASS
 NO TIMING/BENCHMARK INTRODUCED
+
+
+Stage 24
+Benchmark fixed rank first
+COMPLETE
+CORRECTNESS BUILD REGRESSION PASS
+OPTIMIZED BUILD REGRESSION PASS
+DETERMINISTIC FIXED-KEY STREAM PASS
+FIXED-RANK SEMANTIC EQUIVALENCE PASS
+CHECKSUM GUARD PASS
+FINAL-STATE GUARD PASS
+CLOCK_MONOTONIC TIMING PASS
+WARMUP-OUTSIDE-MEASUREMENT PASS
+5-REPEAT BENCHMARK PASS
+MEDIAN NS/OP REPORT PASS
+DYNAMIC-RANK BENCHMARK NOT INTRODUCED
 ```

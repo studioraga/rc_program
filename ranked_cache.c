@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 /* ranked_cache.c
  *
  * Incremental ranked-cache implementation.
@@ -27,6 +29,7 @@
  *   Stage 21 - add deterministic workload generation
  *   Stage 22 - add a correctness-first debug/sanitizer workload gate
  *   Stage 23 - add optimized build configuration after correctness gate
+ *   Stage 24 - benchmark fixed-rank reference versus optimized Part 1
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
@@ -87,6 +90,8 @@
 #include <stddef.h>
 #include <assert.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <time.h>
 
 #if defined(RANKED_CACHE_CORRECTNESS_BUILD) && defined(RANKED_CACHE_OPTIMIZED_BUILD)
 #error "correctness and optimized build markers are mutually exclusive"
@@ -5895,6 +5900,482 @@ int stage23_run_optimized_build_tests(void)
     return passed;
 }
 
+
+
+/* ---------- Stage 24: benchmark fixed rank first ---------- */
+
+#define STAGE24_BENCH_CAPACITY 100U
+#define STAGE24_BENCH_KEY_SPACE 200ULL
+#define STAGE24_BENCH_WARMUP_OPS 20000U
+#define STAGE24_BENCH_MEASURED_OPS 200000U
+#define STAGE24_BENCH_REPEATS 5U
+#define STAGE24_BENCH_SEED UINT64_C(0x9e3779b97f4a7c15)
+
+typedef struct {
+    double seconds;
+    double ns_per_op;
+    uint64_t checksum;
+} Stage24Timing;
+
+static volatile uint64_t g_stage24_checksum_sink;
+
+int stage24_generate_fixed_keys(CacheKey keys[],
+                                size_t count,
+                                uint64_t seed,
+                                CacheKey key_space)
+{
+    WorkloadGenerator generator;
+    size_t i;
+
+    if ((keys == NULL && count != 0U) ||
+        key_space == 0ULL ||
+        !workload_generator_init(&generator, seed, key_space)) {
+        return 0;
+    }
+
+    for (i = 0U; i < count; ++i) {
+        keys[i] = (CacheKey)(
+            (workload_generator_next_u64(&generator) % (uint64_t)key_space) +
+            UINT64_C(1));
+    }
+
+    return 1;
+}
+
+double stage24_elapsed_seconds(const struct timespec *start,
+                               const struct timespec *end)
+{
+    time_t sec;
+    long nsec;
+
+    if (start == NULL || end == NULL) {
+        return 0.0;
+    }
+
+    sec = end->tv_sec - start->tv_sec;
+    nsec = end->tv_nsec - start->tv_nsec;
+
+    if (nsec < 0L) {
+        --sec;
+        nsec += 1000000000L;
+    }
+
+    return (double)sec + ((double)nsec / 1000000000.0);
+}
+
+int stage24_run_linear_fixed_workload(const CacheKey keys[],
+                                      size_t count,
+                                      Stage24Timing *timing,
+                                      Cache *final_cache)
+{
+    CacheEntry *entry;
+    struct timespec start;
+    struct timespec end;
+    uint64_t checksum = 0U;
+    size_t i;
+
+    if (keys == NULL ||
+        timing == NULL ||
+        final_cache == NULL ||
+        !cache_init(final_cache, STAGE24_BENCH_CAPACITY)) {
+        return 0;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        return 0;
+    }
+
+    for (i = 0U; i < count; ++i) {
+        entry = cache_get(final_cache, keys[i]);
+        if (entry == NULL) {
+            return 0;
+        }
+
+        checksum ^= (uint64_t)entry->key;
+        checksum += (uint64_t)entry->value;
+        checksum ^= (uint64_t)entry->rank;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+        return 0;
+    }
+
+    timing->seconds = stage24_elapsed_seconds(&start, &end);
+    timing->ns_per_op = count == 0U
+        ? 0.0
+        : (timing->seconds * 1000000000.0) / (double)count;
+    timing->checksum = checksum;
+
+    g_stage24_checksum_sink ^= checksum;
+
+    return 1;
+}
+
+int stage24_run_part1_fixed_workload(const CacheKey keys[],
+                                     size_t count,
+                                     Stage24Timing *timing,
+                                     Part1Cache *final_cache)
+{
+    CacheEntry *entry;
+    struct timespec start;
+    struct timespec end;
+    uint64_t checksum = 0U;
+    size_t i;
+
+    if (keys == NULL ||
+        timing == NULL ||
+        final_cache == NULL ||
+        !part1_cache_init(final_cache, STAGE24_BENCH_CAPACITY)) {
+        return 0;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        return 0;
+    }
+
+    for (i = 0U; i < count; ++i) {
+        entry = part1_cache_get(final_cache, keys[i]);
+        if (entry == NULL) {
+            return 0;
+        }
+
+        checksum ^= (uint64_t)entry->key;
+        checksum += (uint64_t)entry->value;
+        checksum ^= (uint64_t)entry->rank;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+        return 0;
+    }
+
+    timing->seconds = stage24_elapsed_seconds(&start, &end);
+    timing->ns_per_op = count == 0U
+        ? 0.0
+        : (timing->seconds * 1000000000.0) / (double)count;
+    timing->checksum = checksum;
+
+    g_stage24_checksum_sink ^= checksum;
+
+    return 1;
+}
+
+int stage24_fixed_caches_logically_equal(const Cache *linear,
+                                         const Part1Cache *part1,
+                                         CacheKey key_space)
+{
+    CacheKey key;
+
+    if (linear == NULL || part1 == NULL) {
+        return 0;
+    }
+
+    for (key = 1ULL; key <= key_space; ++key) {
+        CacheEntry *linear_entry = cache_lookup((Cache *)linear, key);
+        CacheEntry *part1_entry = part1_cache_lookup((Part1Cache *)part1, key);
+
+        if ((linear_entry == NULL) != (part1_entry == NULL)) {
+            return 0;
+        }
+
+        if (linear_entry != NULL &&
+            (linear_entry->key != part1_entry->key ||
+             linear_entry->value != part1_entry->value ||
+             linear_entry->rank != part1_entry->rank)) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+double stage24_median_ns_per_op(const Stage24Timing timings[],
+                                size_t count)
+{
+    double values[STAGE24_BENCH_REPEATS];
+    size_t i;
+    size_t j;
+
+    if (timings == NULL ||
+        count == 0U ||
+        count > STAGE24_BENCH_REPEATS) {
+        return 0.0;
+    }
+
+    for (i = 0U; i < count; ++i) {
+        values[i] = timings[i].ns_per_op;
+    }
+
+    for (i = 1U; i < count; ++i) {
+        double current = values[i];
+        j = i;
+
+        while (j > 0U && values[j - 1U] > current) {
+            values[j] = values[j - 1U];
+            --j;
+        }
+
+        values[j] = current;
+    }
+
+    return values[count / 2U];
+}
+
+int stage24_test_fixed_workload_generation(void)
+{
+    CacheKey first[32];
+    CacheKey second[32];
+    CacheKey different[32];
+    size_t i;
+    int saw_difference = 0;
+    int passed = 1;
+
+    printf("\n[Stage 24] deterministic fixed-rank benchmark workload\n");
+
+    passed &= check(stage24_generate_fixed_keys(
+                        first, 32U, STAGE24_BENCH_SEED, 17ULL),
+                    "generate first fixed-rank key stream");
+    passed &= check(stage24_generate_fixed_keys(
+                        second, 32U, STAGE24_BENCH_SEED, 17ULL),
+                    "replay fixed-rank key stream");
+    passed &= check(stage24_generate_fixed_keys(
+                        different, 32U, STAGE24_BENCH_SEED + UINT64_C(1), 17ULL),
+                    "generate different-seed fixed-rank key stream");
+
+    for (i = 0U; i < 32U; ++i) {
+        passed &= check(first[i] == second[i],
+                        "same seed reproduces fixed-rank benchmark key");
+        passed &= check(first[i] >= 1ULL && first[i] <= 17ULL,
+                        "fixed-rank benchmark key stays inside key space");
+
+        if (first[i] != different[i]) {
+            saw_difference = 1;
+        }
+    }
+
+    passed &= check(saw_difference,
+                    "different seed changes fixed-rank benchmark stream");
+
+    return passed;
+}
+
+int stage24_test_fixed_rank_equivalence(void)
+{
+    CacheKey keys[1000];
+    Cache linear;
+    Part1Cache part1;
+    Stage24Timing linear_timing = {0.0, 0.0, 0U};
+    Stage24Timing part1_timing = {0.0, 0.0, 0U};
+    int passed = 1;
+
+    printf("\n[Stage 24] fixed-rank reference/optimized equivalence\n");
+
+    passed &= check(stage24_generate_fixed_keys(
+                        keys,
+                        sizeof(keys) / sizeof(keys[0]),
+                        STAGE24_BENCH_SEED,
+                        STAGE24_BENCH_KEY_SPACE),
+                    "generate fixed-rank equivalence workload");
+
+    passed &= check(stage24_run_linear_fixed_workload(
+                        keys,
+                        sizeof(keys) / sizeof(keys[0]),
+                        &linear_timing,
+                        &linear),
+                    "execute linear fixed-rank equivalence workload");
+
+    passed &= check(stage24_run_part1_fixed_workload(
+                        keys,
+                        sizeof(keys) / sizeof(keys[0]),
+                        &part1_timing,
+                        &part1),
+                    "execute integrated fixed-rank equivalence workload");
+
+    passed &= check(linear_timing.checksum == part1_timing.checksum,
+                    "fixed-rank implementations produce identical checksum");
+
+    passed &= check(stage24_fixed_caches_logically_equal(
+                        &linear,
+                        &part1,
+                        STAGE24_BENCH_KEY_SPACE),
+                    "fixed-rank implementations end in identical logical state");
+
+    passed &= check(cache_validate(&linear) &&
+                    part1_cache_validate(&part1),
+                    "fixed-rank equivalence caches satisfy invariants");
+
+    return passed;
+}
+
+int stage24_run_fixed_rank_benchmark(void)
+{
+#ifdef RANKED_CACHE_OPTIMIZED_BUILD
+    const size_t total_keys =
+        STAGE24_BENCH_WARMUP_OPS + STAGE24_BENCH_MEASURED_OPS;
+    CacheKey *keys;
+    Stage24Timing linear_timings[STAGE24_BENCH_REPEATS] = {{0.0, 0.0, 0U}};
+    Stage24Timing part1_timings[STAGE24_BENCH_REPEATS] = {{0.0, 0.0, 0U}};
+    Cache warm_linear;
+    Part1Cache warm_part1;
+    Cache measured_linear;
+    Part1Cache measured_part1;
+    Stage24Timing warm_linear_timing = {0.0, 0.0, 0U};
+    Stage24Timing warm_part1_timing = {0.0, 0.0, 0U};
+    size_t repeat;
+    double linear_median;
+    double part1_median;
+    double ratio;
+    int passed = 1;
+
+    printf("\n[Stage 24] optimized fixed-rank benchmark\n");
+
+    keys = (CacheKey *)malloc(total_keys * sizeof(*keys));
+    passed &= check(keys != NULL,
+                    "allocate deterministic fixed-rank benchmark keys");
+
+    if (keys == NULL) {
+        return 0;
+    }
+
+    passed &= check(stage24_generate_fixed_keys(
+                        keys,
+                        total_keys,
+                        STAGE24_BENCH_SEED,
+                        STAGE24_BENCH_KEY_SPACE),
+                    "generate deterministic fixed-rank benchmark workload");
+
+    /*
+     * Warmup is explicitly outside the measured workload.
+     * It warms code/data paths only; each measured repetition starts from a
+     * newly initialized cache so every repetition has the same semantics.
+     */
+    passed &= check(stage24_run_linear_fixed_workload(
+                        keys,
+                        STAGE24_BENCH_WARMUP_OPS,
+                        &warm_linear_timing,
+                        &warm_linear),
+                    "warm up linear fixed-rank path");
+
+    passed &= check(stage24_run_part1_fixed_workload(
+                        keys,
+                        STAGE24_BENCH_WARMUP_OPS,
+                        &warm_part1_timing,
+                        &warm_part1),
+                    "warm up integrated fixed-rank path");
+
+    printf("  workload: capacity=%u key_space=%llu measured_ops=%u repeats=%u\n",
+           STAGE24_BENCH_CAPACITY,
+           (unsigned long long)STAGE24_BENCH_KEY_SPACE,
+           STAGE24_BENCH_MEASURED_OPS,
+           STAGE24_BENCH_REPEATS);
+
+    for (repeat = 0U; repeat < STAGE24_BENCH_REPEATS; ++repeat) {
+        const CacheKey *measured_keys = keys + STAGE24_BENCH_WARMUP_OPS;
+
+        /*
+         * Alternate execution order to reduce a fixed first/second ordering
+         * bias without introducing nondeterminism.
+         */
+        if ((repeat % 2U) == 0U) {
+            passed &= check(stage24_run_linear_fixed_workload(
+                                measured_keys,
+                                STAGE24_BENCH_MEASURED_OPS,
+                                &linear_timings[repeat],
+                                &measured_linear),
+                            "measure linear fixed-rank path");
+            passed &= check(stage24_run_part1_fixed_workload(
+                                measured_keys,
+                                STAGE24_BENCH_MEASURED_OPS,
+                                &part1_timings[repeat],
+                                &measured_part1),
+                            "measure integrated fixed-rank path");
+        } else {
+            passed &= check(stage24_run_part1_fixed_workload(
+                                measured_keys,
+                                STAGE24_BENCH_MEASURED_OPS,
+                                &part1_timings[repeat],
+                                &measured_part1),
+                            "measure integrated fixed-rank path");
+            passed &= check(stage24_run_linear_fixed_workload(
+                                measured_keys,
+                                STAGE24_BENCH_MEASURED_OPS,
+                                &linear_timings[repeat],
+                                &measured_linear),
+                            "measure linear fixed-rank path");
+        }
+
+        passed &= check(linear_timings[repeat].checksum ==
+                        part1_timings[repeat].checksum,
+                        "measured implementations produce identical checksum");
+
+        passed &= check(stage24_fixed_caches_logically_equal(
+                            &measured_linear,
+                            &measured_part1,
+                            STAGE24_BENCH_KEY_SPACE),
+                        "measured implementations end in identical logical state");
+
+        printf("  repeat %zu: linear=%10.2f ns/op  part1=%10.2f ns/op\n",
+               repeat + 1U,
+               linear_timings[repeat].ns_per_op,
+               part1_timings[repeat].ns_per_op);
+    }
+
+    linear_median = stage24_median_ns_per_op(
+        linear_timings, STAGE24_BENCH_REPEATS);
+    part1_median = stage24_median_ns_per_op(
+        part1_timings, STAGE24_BENCH_REPEATS);
+
+    ratio = part1_median > 0.0
+        ? linear_median / part1_median
+        : 0.0;
+
+    printf("  median:   linear=%10.2f ns/op  part1=%10.2f ns/op\n",
+           linear_median,
+           part1_median);
+    printf("  median ratio (linear / part1): %.3f x\n", ratio);
+    printf("  checksum sink: %llu\n",
+           (unsigned long long)g_stage24_checksum_sink);
+
+    /*
+     * Timing values are observational only. Correctness, not a specific
+     * speedup threshold, decides PASS/FAIL because absolute performance varies
+     * by host, scheduler, CPU frequency, and system load.
+     */
+    passed &= check(linear_median > 0.0 && part1_median > 0.0,
+                    "fixed-rank benchmark records positive elapsed time");
+
+    free(keys);
+    return passed;
+#else
+    printf("\n[Stage 24] fixed-rank benchmark timing skipped in non-optimized build\n");
+    printf("[INFO] Build with RANKED_CACHE_OPTIMIZED_BUILD=1 and -O3 -DNDEBUG.\n");
+    return 1;
+#endif
+}
+
+int stage24_run_fixed_rank_benchmark_tests(void)
+{
+    int passed = 1;
+
+    printf("\n=== Stage 24: benchmark fixed rank first ===\n");
+
+    passed &= stage24_test_fixed_workload_generation();
+    passed &= stage24_test_fixed_rank_equivalence();
+    passed &= stage24_run_fixed_rank_benchmark();
+
+    printf("\nStage 24 findings:\n");
+    printf("  fixed-rank benchmark compares the linear reference with integrated Part 1.\n");
+    printf("  both implementations consume the same pre-generated deterministic key stream.\n");
+    printf("  workload generation and warmup are outside the measured operation interval.\n");
+    printf("  repeated runs alternate execution order and report median ns/op.\n");
+    printf("  checksums and final logical state guard benchmark correctness.\n");
+    printf("  timing values are observational and are not used as a correctness threshold.\n");
+    printf("Stage 24 boundary: fixed-rank benchmark only; dynamic-rank benchmarking comes later.\n");
+    printf("Stage 24 fixed-rank benchmark validation: %s\n",
+           passed ? "PASS" : "FAIL");
+
+    return passed;
+}
+
 int main(void)
 {
     Cache cache;
@@ -6083,7 +6564,12 @@ int main(void)
 
     all_passed &= stage23_run_optimized_build_tests();
 
-    printf("\nStage 23 validation: %s\n",
+    printf("\nStage 23 regression validation: %s\n",
+           all_passed ? "PASS" : "FAIL");
+
+    all_passed &= stage24_run_fixed_rank_benchmark_tests();
+
+    printf("\nStage 24 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;
