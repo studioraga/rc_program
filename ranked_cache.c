@@ -20,6 +20,7 @@
  *   Stage 14 - add and maintain CacheEntry.heap_index reverse position
  *   Stage 15 - harden min_heap_swap() as the indexed-heap consistency primitive
  *   Stage 16 - add min_heap_update_rank() for arbitrary resident priority repair
+ *   Stage 17 - test rank-decrease repair independently
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
@@ -3487,9 +3488,10 @@ int stage16_test_rank_update_tie_ordering(void)
     CacheEntry entries[] = {
         {10ULL, 1000ULL, 10LL, HEAP_INDEX_NONE},
         {20ULL, 2000ULL, 20LL, HEAP_INDEX_NONE},
-        {5ULL, 500ULL, 30LL, HEAP_INDEX_NONE}
+        {30ULL, 3000ULL, 30LL, HEAP_INDEX_NONE},
+        {5ULL, 500ULL, 40LL, HEAP_INDEX_NONE}
     };
-    CacheEntry *target = &entries[2];
+    CacheEntry *target = &entries[3];
     int passed = 1;
 
     printf("\n[Stage 16] rank update preserves key tie ordering\n");
@@ -3624,6 +3626,253 @@ int stage16_run_heap_update_rank_tests(void)
     printf("  arbitrary resident rank repair is O(log N) worst case.\n");
     printf("Stage 16 boundary: heap_update_rank exists but production Part 2 cache_get is not wired yet.\n");
     printf("Stage 16 heap-update-rank validation: %s\n",
+           passed ? "PASS" : "FAIL");
+
+    return passed;
+}
+
+
+
+/* ---------- Stage 17: test rank decrease independently ---------- */
+
+/*
+ * Stage 16 implemented min_heap_update_rank(). Stage 17 makes no production
+ * changes; it exercises only the new-rank < old-rank branch in greater depth.
+ */
+
+int stage17_test_decrease_without_movement(void)
+{
+    MinHeap heap;
+    CacheEntry entries[7];
+    CacheEntry *target;
+    size_t original_index;
+    int passed = 1;
+
+    printf("\n[Stage 17] rank decrease that does not require movement\n");
+
+    passed &= check(stage16_prepare_update_heap(&heap, entries, 7U),
+                    "prepare no-move decrease heap");
+
+    target = &entries[6]; /* key 7, rank 70, index 6, parent rank 30 */
+    original_index = target->heap_index;
+
+    passed &= check(min_heap_update_rank(&heap, target, 65LL),
+                    "decrease key 7 rank from 70 to 65");
+
+    passed &= check(target->rank == 65LL &&
+                    target->heap_index == original_index,
+                    "smaller rank still above parent threshold stays in place");
+
+    passed &= check(min_heap_validate(&heap) &&
+                    stage14_check_all_heap_indices(&heap),
+                    "no-move decrease preserves heap and reverse indices");
+
+    return passed;
+}
+
+int stage17_test_decrease_one_level(void)
+{
+    MinHeap heap;
+    CacheEntry entries[7];
+    CacheEntry *target;
+    int passed = 1;
+
+    printf("\n[Stage 17] rank decrease moves exactly one level upward\n");
+
+    passed &= check(stage16_prepare_update_heap(&heap, entries, 7U),
+                    "prepare one-level decrease heap");
+
+    target = &entries[6]; /* index 6, parent index 2 rank 30 */
+
+    passed &= check(target->heap_index == 6U,
+                    "one-level target starts at index 6");
+
+    passed &= check(min_heap_update_rank(&heap, target, 25LL),
+                    "decrease key 7 rank from 70 to 25");
+
+    passed &= check(target->rank == 25LL &&
+                    target->heap_index == 2U &&
+                    heap.items[2] == target,
+                    "decrease crosses parent rank and moves to index 2");
+
+    passed &= check(heap.items[0]->rank == 10LL &&
+                    target->rank > heap.items[0]->rank,
+                    "target stops below root when root still has lower rank");
+
+    passed &= check(min_heap_validate(&heap) &&
+                    stage14_check_all_heap_indices(&heap),
+                    "one-level decrease preserves all invariants");
+
+    return passed;
+}
+
+int stage17_test_decrease_multiple_levels_to_root(void)
+{
+    MinHeap heap;
+    CacheEntry entries[7];
+    CacheEntry *target;
+    int passed = 1;
+
+    printf("\n[Stage 17] rank decrease moves through multiple levels to root\n");
+
+    passed &= check(stage16_prepare_update_heap(&heap, entries, 7U),
+                    "prepare multi-level decrease heap");
+
+    target = &entries[6];
+
+    passed &= check(min_heap_update_rank(&heap, target, 5LL),
+                    "decrease key 7 rank from 70 to 5");
+
+    passed &= check(target->heap_index == 0U &&
+                    min_heap_peek(&heap) == target &&
+                    target->rank == 5LL,
+                    "multi-level decrease reaches heap root");
+
+    passed &= check(min_heap_validate(&heap) &&
+                    stage14_check_all_heap_indices(&heap),
+                    "multi-level decrease preserves heap/index consistency");
+
+    return passed;
+}
+
+int stage17_test_decrease_equal_rank_key_tie(void)
+{
+    MinHeap heap;
+    CacheEntry entries[] = {
+        {10ULL, 1000ULL, 10LL, HEAP_INDEX_NONE},
+        {20ULL, 2000ULL, 20LL, HEAP_INDEX_NONE},
+        {30ULL, 3000ULL, 30LL, HEAP_INDEX_NONE},
+        {5ULL, 500ULL, 40LL, HEAP_INDEX_NONE}
+    };
+    CacheEntry *target = &entries[3];
+    int passed = 1;
+
+    printf("\n[Stage 17] rank decrease respects equal-rank key tie ordering\n");
+
+    min_heap_init(&heap);
+    for (size_t i = 0U; i < sizeof(entries) / sizeof(entries[0]); ++i) {
+        passed &= check(min_heap_push(&heap, &entries[i]),
+                        "prepare tie-order decrease heap");
+    }
+
+    passed &= check(target->heap_index == 3U,
+                    "tie-order target starts at index 3");
+
+    passed &= check(min_heap_update_rank(&heap, target, 20LL),
+                    "decrease key 5 rank from 40 to 20");
+
+    passed &= check(target->rank == 20LL &&
+                    target->heap_index == 1U &&
+                    heap.items[1] == target &&
+                    min_heap_peek(&heap)->key == 10ULL,
+                    "equal rank uses lower key to cross parent, then stops below lower-rank root");
+
+    passed &= check(min_heap_validate(&heap) &&
+                    stage14_check_all_heap_indices(&heap),
+                    "tie-order decrease leaves heap valid");
+
+    return passed;
+}
+
+int stage17_test_repeated_decreases_use_updated_heap_index(void)
+{
+    MinHeap heap;
+    CacheEntry entries[7];
+    CacheEntry *target;
+    int passed = 1;
+
+    printf("\n[Stage 17] repeated decreases use the resident's updated heap_index\n");
+
+    passed &= check(stage16_prepare_update_heap(&heap, entries, 7U),
+                    "prepare repeated-decrease heap");
+
+    target = &entries[6];
+
+    passed &= check(min_heap_update_rank(&heap, target, 25LL),
+                    "first decrease moves key 7 from index 6 to index 2");
+    passed &= check(target->heap_index == 2U,
+                    "first decrease updates heap_index to 2");
+
+    passed &= check(min_heap_update_rank(&heap, target, 5LL),
+                    "second decrease uses new index and moves key 7 to root");
+    passed &= check(target->heap_index == 0U &&
+                    min_heap_peek(&heap) == target,
+                    "second decrease reaches root through updated reverse index");
+
+    passed &= check(min_heap_validate(&heap) &&
+                    stage14_check_all_heap_indices(&heap),
+                    "repeated decreases preserve heap/index consistency");
+
+    return passed;
+}
+
+int stage17_test_integrated_hash_found_rank_decrease(void)
+{
+    Part1Cache cache;
+    CacheEntry entry;
+    CacheEntry *resident;
+    CacheKey key;
+    int passed = 1;
+
+    printf("\n[Stage 17] integrated hash-found resident rank decrease\n");
+
+    passed &= check(part1_cache_init(&cache, 5U),
+                    "initialize integrated decrease cache");
+
+    for (key = 1ULL; key <= 5ULL; ++key) {
+        entry.key = key;
+        entry.value = key * 100ULL;
+        entry.rank = (Rank)(key * 10ULL);
+        entry.heap_index = HEAP_INDEX_NONE;
+
+        passed &= check(part1_cache_insert(&cache, entry, NULL),
+                        "fill integrated decrease cache");
+    }
+
+    resident = part1_cache_lookup(&cache, 5ULL);
+    passed &= check(resident != NULL &&
+                    resident->rank == 50LL,
+                    "hash lookup finds key 5 before decrease");
+
+    passed &= check(min_heap_update_rank(&cache.min_heap, resident, 5LL),
+                    "decrease hash-found key 5 rank from 50 to 5");
+
+    passed &= check(resident->heap_index == 0U &&
+                    min_heap_peek(&cache.min_heap) == resident &&
+                    resident->rank == 5LL,
+                    "integrated decrease moves hash-found resident to root");
+
+    passed &= check(part1_cache_lookup(&cache, 5ULL) == resident,
+                    "hash index still points to same resident after decrease");
+
+    passed &= check(part1_cache_validate(&cache),
+                    "integrated cache validates after independent decrease repair");
+
+    return passed;
+}
+
+int stage17_run_rank_decrease_tests(void)
+{
+    int passed = 1;
+
+    printf("\n=== Stage 17: test rank decrease independently ===\n");
+
+    passed &= stage17_test_decrease_without_movement();
+    passed &= stage17_test_decrease_one_level();
+    passed &= stage17_test_decrease_multiple_levels_to_root();
+    passed &= stage17_test_decrease_equal_rank_key_tie();
+    passed &= stage17_test_repeated_decreases_use_updated_heap_index();
+    passed &= stage17_test_integrated_hash_found_rank_decrease();
+
+    printf("\nStage 17 findings:\n");
+    printf("  a smaller rank does not always require movement.\n");
+    printf("  when needed, decrease repair moves only upward.\n");
+    printf("  one-level and multi-level sift-up paths both preserve heap_index.\n");
+    printf("  equal-rank ordering still uses the deterministic key tie-break.\n");
+    printf("  repeated decreases use the resident's newly maintained heap_index.\n");
+    printf("  a hash-found resident can be decreased and repaired without a heap scan.\n");
+    printf("Stage 17 boundary: only rank-decrease behavior is expanded here.\n");
+    printf("Stage 17 rank-decrease validation: %s\n",
            passed ? "PASS" : "FAIL");
 
     return passed;
@@ -3782,7 +4031,12 @@ int main(void)
 
     all_passed &= stage16_run_heap_update_rank_tests();
 
-    printf("\nStage 16 validation: %s\n",
+    printf("\nStage 16 regression validation: %s\n",
+           all_passed ? "PASS" : "FAIL");
+
+    all_passed &= stage17_run_rank_decrease_tests();
+
+    printf("\nStage 17 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;

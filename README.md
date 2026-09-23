@@ -4001,6 +4001,372 @@ The stage implements only the indexed heap rank-update primitive.
 
 ---
 
+## Stage 17 — Test Rank Decrease Independently
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 16 implemented:
+
+```c
+min_heap_update_rank()
+```
+
+with three branches:
+
+```text
+new rank < old rank  -> sift up
+new rank = old rank  -> no movement
+new rank > old rank  -> sift down
+```
+
+Stage 17 changes **no production heap algorithm**.
+
+Its purpose is to isolate the rank-decrease branch and validate it more thoroughly before moving to the separate rank-increase test stage.
+
+The production function under test remains unchanged.
+
+---
+
+### Test 1 — decrease with no movement
+
+A seven-entry heap contains:
+
+```text
+key 7
+rank 70
+heap_index 6
+parent rank 30
+```
+
+Update:
+
+```text
+70 -> 65
+```
+
+Although the rank became smaller, it is still larger than the parent rank.
+
+Therefore:
+
+```text
+heap_index remains 6
+```
+
+This validates an important rule:
+
+> A rank decrease does not automatically imply a heap swap.
+
+The heap and every reverse index must remain valid.
+
+---
+
+### Test 2 — decrease exactly one level
+
+Start again with:
+
+```text
+key 7
+rank 70
+heap_index 6
+parent at index 2 with rank 30
+root rank 10
+```
+
+Update:
+
+```text
+70 -> 25
+```
+
+The new rank is smaller than the parent rank `30`, so the resident crosses one parent:
+
+```text
+heap_index 6 -> 2
+```
+
+But rank `25` is still greater than root rank `10`, so repair stops there.
+
+Expected result:
+
+```text
+key 7
+rank 25
+heap_index 2
+```
+
+This validates a bounded one-level sift-up path.
+
+---
+
+### Test 3 — decrease through multiple levels to root
+
+Update the same leaf-style resident:
+
+```text
+70 -> 5
+```
+
+The new rank is lower than every ancestor.
+
+Expected result:
+
+```text
+heap_index 6 -> 2 -> 0
+heap root = key 7 / rank 5
+```
+
+The heap-order and `heap_index` invariants must both remain valid after the multi-level repair.
+
+---
+
+### Test 4 — equal-rank key tie during decrease
+
+The test heap contains:
+
+```text
+key 10 rank 10
+key 20 rank 20
+key 30 rank 30
+key 5  rank 40
+```
+
+Key `5` begins below key `20`.
+
+Update:
+
+```text
+key 5
+rank 40 -> 20
+```
+
+The new rank ties the parent:
+
+```text
+key 5  rank 20
+key 20 rank 20
+```
+
+The existing deterministic secondary ordering uses the lower key, so key `5` must cross key `20`.
+
+Expected result:
+
+```text
+key 5 -> heap_index 1
+```
+
+It then stops below the root because:
+
+```text
+root key 10 rank 10
+```
+
+still has a lower rank.
+
+This validates that the rank-decrease path preserves the complete rank/key ordering rule.
+
+---
+
+### Test 5 — repeated decreases use the updated reverse index
+
+A resident begins at:
+
+```text
+heap_index 6
+rank 70
+```
+
+First update:
+
+```text
+70 -> 25
+heap_index 6 -> 2
+```
+
+Second update on the **same resident**:
+
+```text
+25 -> 5
+heap_index 2 -> 0
+```
+
+The second operation must use the newly maintained:
+
+```c
+entry->heap_index
+```
+
+rather than relying on the original position.
+
+This verifies the Stage 14/15 reverse-index maintenance is sufficient for repeated indexed updates.
+
+---
+
+### Test 6 — integrated hash-found decrease
+
+A five-entry integrated `Part1Cache` contains:
+
+```text
+key 1 rank 10
+key 2 rank 20
+key 3 rank 30
+key 4 rank 40
+key 5 rank 50
+```
+
+The hash table locates:
+
+```text
+key 5 -> CacheEntry *
+```
+
+Then Stage 17 calls:
+
+```c
+min_heap_update_rank(
+    &cache.min_heap,
+    resident,
+    5);
+```
+
+Expected result:
+
+```text
+key 5
+rank 5
+heap_index 0
+heap root = key 5
+```
+
+The test also verifies:
+
+```text
+hash lookup still returns the same resident
+part1_cache_validate() passes
+```
+
+No linear heap scan is required.
+
+---
+
+## Stage 17 Findings
+
+The independent decrease tests establish:
+
+```text
+smaller rank may require:
+    no movement
+    one-level movement
+    multi-level movement
+
+repair direction:
+    upward only
+
+reverse position:
+    heap_index remains synchronized after every swap
+
+tie behavior:
+    equal ranks still use key ordering
+
+repeated updates:
+    use the newly updated heap_index
+
+integrated lookup:
+    hash-found resident can be decreased directly
+```
+
+The asymptotic complexity remains:
+
+```text
+membership / heap position   O(1)
+rank decrease repair         O(log N) worst case
+```
+
+---
+
+## Stage 17 Build and Validation
+
+### Normal build
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    ranked_cache.c \
+    -o ranked_cache17
+
+./ranked_cache17
+```
+
+Expected Stage 17 ending:
+
+```text
+Stage 17 findings:
+  a smaller rank does not always require movement.
+  when needed, decrease repair moves only upward.
+  one-level and multi-level sift-up paths both preserve heap_index.
+  equal-rank ordering still uses the deterministic key tie-break.
+  repeated decreases use the resident's newly maintained heap_index.
+  a hash-found resident can be decreased and repaired without a heap scan.
+Stage 17 boundary: only rank-decrease behavior is expanded here.
+Stage 17 rank-decrease validation: PASS
+
+Stage 17 validation: PASS
+```
+
+### UndefinedBehaviorSanitizer
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fsanitize=undefined \
+    ranked_cache.c \
+    -o ranked_cache17_ubsan
+
+./ranked_cache17_ubsan
+```
+
+### AddressSanitizer + UndefinedBehaviorSanitizer
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fsanitize=address,undefined \
+    ranked_cache.c \
+    -o ranked_cache17_san
+
+./ranked_cache17_san
+```
+
+Both sanitizer builds pass.
+
+---
+
+### Stage 17 boundary
+
+Stage 17 deliberately does **not** add:
+
+- new production rank-update logic,
+- new sift-down behavior,
+- a production Part 2 `cache_get()`,
+- automatic `getEntryRank()` invocation,
+- dynamic-rank eviction through the public cache API.
+
+It only expands validation of the rank-decrease branch already introduced in Stage 16.
+
+---
+
 ## Build Environment
 
 Current target environment:
@@ -4012,7 +4378,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache16
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache17
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -4028,22 +4394,22 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache16
+./ranked_cache17
 ```
 
 ### Expected result
 
-The active Stage 16 test suite must end with:
+The active Stage 17 test suite must end with:
 
 ```text
-Stage 16 validation: PASS
+Stage 17 validation: PASS
 ```
 
 The Stage 10 Part 1 path combines the hash table and min-heap while preserving the earlier linear cache as a regression/reference implementation.
 
 ### Validation result
 
-Stages 0 through 16 have been validated successfully. The normal build, UBSan build, and combined ASan/UBSan build all pass for Stage 16.
+Stages 0 through 17 have been validated successfully. The normal build, UBSan build, and combined ASan/UBSan build all pass for Stage 17.
 
 ---
 
@@ -4097,7 +4463,12 @@ At this commit, the program can:
 - repair higher ranks with sift-down,
 - leave unchanged ranks in place,
 - preserve deterministic rank/key tie ordering during updates, and
-- combine hash lookup with direct indexed heap rank repair without a linear heap scan.
+- combine hash lookup with direct indexed heap rank repair without a linear heap scan,
+- validate a rank decrease that requires no movement,
+- validate one-level and multi-level sift-up repairs,
+- validate equal-rank key ordering during a decrease,
+- validate repeated decreases through the updated `heap_index`, and
+- validate an integrated hash-found resident rank decrease.
 
 At this commit, the program intentionally does **not** implement:
 
@@ -4176,6 +4547,10 @@ for later indexed-heap operations.
 
 Stage 16 uses `heap_index` plus the hardened swap primitive to implement arbitrary
 resident rank repair in O(log N) worst case. The operation performs no linear heap scan.
+
+Stage 17 does not change that complexity. It independently stress-tests only the
+rank-decrease/sift-up branch, including the valid case where a smaller rank does not
+cross its parent and therefore requires no movement.
 
 ---
 
@@ -4424,6 +4799,23 @@ TIE-ORDER UPDATE PASS
 INVALID-MEMBERSHIP REJECTION PASS
 NON-DESTRUCTIVE FAILURE PASS
 HASH-TO-INDEXED-UPDATE PASS
+INTEGRATED VALIDATOR PASS
+UBSAN PASS
+ASAN/UBSAN PASS
+
+
+Stage 17
+Test rank decrease independently
+COMPLETE
+BUILD PASS
+RUN PASS
+DECREASE-NO-MOVEMENT PASS
+DECREASE-ONE-LEVEL PASS
+DECREASE-MULTI-LEVEL PASS
+DECREASE-TIE-ORDER PASS
+REPEATED-DECREASE PASS
+HASH-FOUND-DECREASE PASS
+HEAP_INDEX CONSISTENCY PASS
 INTEGRATED VALIDATOR PASS
 UBSAN PASS
 ASAN/UBSAN PASS
