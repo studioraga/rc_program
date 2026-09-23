@@ -16,6 +16,7 @@
  *   Stage 10 - integrated hash table + min-heap cache for fixed-rank Part 1
  *   Stage 11 - thorough fixed-rank Part 1 validation
  *   Stage 12 - introduce and validate the Part 2 rank-change contract
+ *   Stage 13 - prove ordinary heap lacks direct arbitrary-entry location
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
@@ -52,6 +53,11 @@
  * may return a lower, unchanged, or higher rank after a lookup. Stage 12
  * deliberately does not repair the ordinary heap after such a change; instead,
  * it proves why an arbitrary-priority update mechanism is required next.
+ *
+ * Stage 13 identifies the exact missing ordinary-heap capability. The hash table
+ * can return CacheEntry * by key, but MinHeap stores only an array of pointers and
+ * records no reverse mapping from CacheEntry * to heap index. Locating an arbitrary
+ * resident in the heap therefore requires a linear scan at this checkpoint.
  */
 
 #include <stdio.h>
@@ -2431,6 +2437,350 @@ int stage12_run_part2_contract_tests(void)
     return passed;
 }
 
+
+
+/* ---------- Stage 13: recognize why the ordinary heap is insufficient ---------- */
+
+/*
+ * Stage 12 proved that an arbitrary resident rank change can invalidate the
+ * ordinary heap. Stage 13 isolates the next problem:
+ *
+ *   the hash table can find CacheEntry * by key,
+ *   but the ordinary heap has no O(1) way to answer:
+ *
+ *       "At which heap array index is this CacheEntry * stored?"
+ *
+ * The following instrumentation measures a diagnostic linear scan over the
+ * heap. It is deliberately NOT a production priority-update implementation.
+ */
+
+typedef struct {
+    uint64_t locate_calls;
+    uint64_t pointer_comparisons;
+    uint64_t locate_hits;
+    uint64_t locate_misses;
+} HeapLocateStats;
+
+static HeapLocateStats g_heap_locate_stats;
+
+void heap_locate_stats_reset(void)
+{
+    g_heap_locate_stats.locate_calls = 0U;
+    g_heap_locate_stats.pointer_comparisons = 0U;
+    g_heap_locate_stats.locate_hits = 0U;
+    g_heap_locate_stats.locate_misses = 0U;
+}
+
+HeapLocateStats heap_locate_stats_snapshot(void)
+{
+    return g_heap_locate_stats;
+}
+
+/*
+ * Diagnostic Stage 13 helper: find an arbitrary entry pointer in the ordinary
+ * heap by scanning heap.items[] from index 0 upward.
+ *
+ * Complexity:
+ *   best case:  O(1)
+ *   worst case: O(N)
+ *   miss:       O(N)
+ *
+ * No reverse index is maintained by MinHeap at this stage.
+ */
+int stage13_find_heap_index_linear(const MinHeap *heap,
+                                   const CacheEntry *target,
+                                   size_t *index_out)
+{
+    size_t i;
+
+    ++g_heap_locate_stats.locate_calls;
+
+    if (heap == NULL || target == NULL) {
+        ++g_heap_locate_stats.locate_misses;
+        return 0;
+    }
+
+    for (i = 0U; i < heap->size; ++i) {
+        ++g_heap_locate_stats.pointer_comparisons;
+
+        if (heap->items[i] == target) {
+            if (index_out != NULL) {
+                *index_out = i;
+            }
+
+            ++g_heap_locate_stats.locate_hits;
+            return 1;
+        }
+    }
+
+    ++g_heap_locate_stats.locate_misses;
+    return 0;
+}
+
+/*
+ * Build a deterministic valid heap whose array position is predictable.
+ *
+ * Entries have monotonically increasing rank and key:
+ *   heap[0] rank 1
+ *   heap[1] rank 2
+ *   ...
+ *
+ * Because every parent index is smaller than each child index, the min-heap
+ * invariant holds without calling push/sift functions. This is test scaffolding
+ * only and avoids contaminating the location-cost experiment with heap build
+ * operations.
+ */
+int stage13_prepare_positioned_heap(MinHeap *heap,
+                                    CacheEntry entries[],
+                                    size_t count)
+{
+    size_t i;
+
+    if (heap == NULL ||
+        entries == NULL ||
+        count == 0U ||
+        count > MAX_CACHE_CAPACITY) {
+        return 0;
+    }
+
+    min_heap_init(heap);
+
+    for (i = 0U; i < count; ++i) {
+        entries[i].key = (CacheKey)(i + 1U);
+        entries[i].value = (unsigned long long)(i + 1U) * 100ULL;
+        entries[i].rank = (Rank)(i + 1U);
+
+        heap->items[i] = &entries[i];
+    }
+
+    heap->size = count;
+    return min_heap_validate(heap);
+}
+
+int stage13_check_location_cost(MinHeap *heap,
+                                CacheEntry *target,
+                                size_t expected_index,
+                                uint64_t expected_comparisons,
+                                int expected_found,
+                                const char *label)
+{
+    HeapLocateStats stats;
+    size_t actual_index = SIZE_MAX;
+    int found;
+    int passed;
+
+    heap_locate_stats_reset();
+    found = stage13_find_heap_index_linear(heap, target, &actual_index);
+    stats = heap_locate_stats_snapshot();
+
+    printf("[PROFILE] %-30s size=%zu comparisons=%llu result=%s",
+           label,
+           heap != NULL ? heap->size : 0U,
+           (unsigned long long)stats.pointer_comparisons,
+           found ? "FOUND" : "MISS");
+
+    if (found) {
+        printf(" index=%zu", actual_index);
+    }
+
+    printf("\n");
+
+    passed = found == expected_found &&
+             stats.locate_calls == 1U &&
+             stats.pointer_comparisons == expected_comparisons;
+
+    if (expected_found) {
+        passed = passed &&
+                 stats.locate_hits == 1U &&
+                 stats.locate_misses == 0U &&
+                 actual_index == expected_index;
+    } else {
+        passed = passed &&
+                 stats.locate_hits == 0U &&
+                 stats.locate_misses == 1U;
+    }
+
+    return check(passed, label);
+}
+
+int stage13_test_heap_position_profiles(void)
+{
+    MinHeap heap;
+    CacheEntry entries[MAX_CACHE_CAPACITY];
+    CacheEntry missing = {9999ULL, 999900ULL, 9999LL};
+    int passed = 1;
+
+    printf("\n[Stage 13] ordinary-heap arbitrary-entry location profiles\n");
+
+    passed &= check(stage13_prepare_positioned_heap(
+                        &heap, entries, MAX_CACHE_CAPACITY),
+                    "prepare deterministic 100-entry ordinary heap");
+
+    passed &= stage13_check_location_cost(
+        &heap,
+        &entries[0],
+        0U,
+        1U,
+        1,
+        "first heap entry");
+
+    passed &= stage13_check_location_cost(
+        &heap,
+        &entries[49],
+        49U,
+        50U,
+        1,
+        "middle heap entry");
+
+    passed &= stage13_check_location_cost(
+        &heap,
+        &entries[99],
+        99U,
+        100U,
+        1,
+        "last heap entry");
+
+    passed &= stage13_check_location_cost(
+        &heap,
+        &missing,
+        SIZE_MAX,
+        100U,
+        0,
+        "missing heap entry");
+
+    return passed;
+}
+
+int stage13_test_heap_location_scaling(void)
+{
+    size_t sizes[] = {1U, 10U, 25U, 50U, 100U};
+    MinHeap heap;
+    CacheEntry entries[MAX_CACHE_CAPACITY];
+    CacheEntry missing = {8888ULL, 888800ULL, 8888LL};
+    size_t i;
+    int passed = 1;
+
+    printf("\nStage 13 heap-location scaling (missing pointer):\n");
+    printf("  size    pointer-comparisons\n");
+
+    for (i = 0U; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+        HeapLocateStats stats;
+        size_t n = sizes[i];
+        size_t ignored_index = SIZE_MAX;
+        int found;
+
+        passed &= check(stage13_prepare_positioned_heap(
+                            &heap, entries, n),
+                        "prepare heap-location scaling case");
+
+        heap_locate_stats_reset();
+        found = stage13_find_heap_index_linear(
+            &heap, &missing, &ignored_index);
+        stats = heap_locate_stats_snapshot();
+
+        printf("  %4zu    %llu\n",
+               n,
+               (unsigned long long)stats.pointer_comparisons);
+
+        passed &= check(!found &&
+                        stats.locate_calls == 1U &&
+                        stats.locate_misses == 1U &&
+                        stats.pointer_comparisons == (uint64_t)n,
+                        "missing heap pointer comparisons equal heap size");
+    }
+
+    return passed;
+}
+
+int stage13_test_hash_to_heap_location_gap(void)
+{
+    Part1Cache cache;
+    CacheEntry entry;
+    CacheEntry *resident;
+    HeapLocateStats stats;
+    size_t heap_index = SIZE_MAX;
+    CacheKey key;
+    int found;
+    int passed = 1;
+
+    printf("\n[Stage 13] hash lookup versus ordinary-heap location gap\n");
+
+    passed &= check(part1_cache_init(&cache, MAX_CACHE_CAPACITY),
+                    "initialize integrated 100-entry Part 1 cache");
+
+    /*
+     * Increasing ranks preserve insertion order in the heap:
+     * key 1 is at heap index 0 and key 100 is at heap index 99.
+     */
+    for (key = 1ULL; key <= (CacheKey)MAX_CACHE_CAPACITY; ++key) {
+        entry.key = key;
+        entry.value = key * 100ULL;
+        entry.rank = (Rank)key;
+
+        if (!part1_cache_insert(&cache, entry, NULL)) {
+            passed &= check(0,
+                            "fill integrated cache for heap-location test");
+            return passed;
+        }
+    }
+
+    passed &= check(part1_cache_validate(&cache),
+                    "integrated 100-entry cache validates");
+
+    /*
+     * Stage 10 hash table gives the resident pointer directly.
+     * Stage 13 then asks the ordinary heap where that pointer is located.
+     */
+    resident = part1_cache_lookup(&cache, 100ULL);
+
+    passed &= check(resident != NULL &&
+                    resident->key == 100ULL,
+                    "hash table returns resident pointer for key 100");
+
+    heap_locate_stats_reset();
+    found = stage13_find_heap_index_linear(
+        &cache.min_heap, resident, &heap_index);
+    stats = heap_locate_stats_snapshot();
+
+    printf("[PROFILE] hash found key 100 resident; ordinary heap location "
+           "comparisons=%llu index=%zu\n",
+           (unsigned long long)stats.pointer_comparisons,
+           heap_index);
+
+    passed &= check(found &&
+                    heap_index == 99U &&
+                    stats.locate_calls == 1U &&
+                    stats.locate_hits == 1U &&
+                    stats.pointer_comparisons == 100U,
+                    "ordinary heap requires linear scan to locate hash-found resident");
+
+    return passed;
+}
+
+int stage13_run_ordinary_heap_limitation_tests(void)
+{
+    int passed = 1;
+
+    printf("\n=== Stage 13: recognize why ordinary heap is insufficient ===\n");
+
+    passed &= stage13_test_heap_position_profiles();
+    passed &= stage13_test_heap_location_scaling();
+    passed &= stage13_test_hash_to_heap_location_gap();
+
+    printf("\nStage 13 findings:\n");
+    printf("  hash table maps key -> CacheEntry * in expected O(1).\n");
+    printf("  ordinary MinHeap stores CacheEntry * but no reverse heap position.\n");
+    printf("  locating an arbitrary resident therefore requires scanning heap.items[].\n");
+    printf("  first/middle/last lookup costs 1/50/100 comparisons in a 100-entry heap.\n");
+    printf("  a missing resident requires N pointer comparisons for heap size N.\n");
+    printf("  after hash lookup, worst-case heap location is still O(N).\n");
+    printf("Stage 13 conclusion: Part 2 needs a direct resident -> heap-index mapping.\n");
+    printf("Stage 13 ordinary-heap limitation validation: %s\n",
+           passed ? "PASS" : "FAIL");
+
+    return passed;
+}
+
 int main(void)
 {
     Cache cache;
@@ -2564,7 +2914,12 @@ int main(void)
 
     all_passed &= stage12_run_part2_contract_tests();
 
-    printf("\nStage 12 validation: %s\n",
+    printf("\nStage 12 regression validation: %s\n",
+           all_passed ? "PASS" : "FAIL");
+
+    all_passed &= stage13_run_ordinary_heap_limitation_tests();
+
+    printf("\nStage 13 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;

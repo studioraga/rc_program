@@ -2545,6 +2545,321 @@ This checkpoint only establishes and validates the Part 2 problem that the next 
 
 ---
 
+## Stage 13 — Recognize Why the Ordinary Heap Is Insufficient
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 12 proved that changing the rank of an arbitrary cached resident can make the ordinary Part 1 heap stale.
+
+Stage 13 isolates the next missing capability:
+
+> The hash table can locate a resident by key, but the ordinary heap does not record where that resident is stored in the heap array.
+
+The current `MinHeap` contains:
+
+```c
+typedef struct {
+    CacheEntry *items[MAX_CACHE_CAPACITY];
+    size_t size;
+} MinHeap;
+```
+
+It has no reverse mapping such as:
+
+```text
+CacheEntry * -> heap index
+```
+
+Therefore, after the hash table returns a `CacheEntry *`, the only general way to discover that resident's heap position with the current structure is to scan:
+
+```text
+heap.items[0]
+heap.items[1]
+...
+heap.items[N-1]
+```
+
+This Stage 13 checkpoint measures that cost without adding any indexed-heap solution.
+
+### Diagnostic heap-location instrumentation
+
+Stage 13 introduces:
+
+```c
+typedef struct {
+    uint64_t locate_calls;
+    uint64_t pointer_comparisons;
+    uint64_t locate_hits;
+    uint64_t locate_misses;
+} HeapLocateStats;
+```
+
+with:
+
+```c
+heap_locate_stats_reset()
+heap_locate_stats_snapshot()
+stage13_find_heap_index_linear()
+```
+
+`stage13_find_heap_index_linear()` is deliberately a **diagnostic helper**, not a production priority-update API.
+
+Its behavior is:
+
+```text
+scan heap.items[] from index 0
+
+if heap.items[i] == target:
+    return i
+
+otherwise:
+    continue until heap.size
+```
+
+Current complexity:
+
+```text
+best case:  O(1)
+worst hit:  O(N)
+miss:       O(N)
+```
+
+### Deterministic positioned heap
+
+To measure exact position cost, Stage 13 builds a valid heap with monotonically increasing key and rank:
+
+```text
+heap[0]  -> key 1   rank 1
+heap[1]  -> key 2   rank 2
+...
+heap[99] -> key 100 rank 100
+```
+
+This layout is a valid min-heap because every parent has a smaller rank than its children.
+
+The direct layout is test scaffolding only. It allows exact heap-position measurements without mixing heap-construction cost into the location experiment.
+
+### Position experiment
+
+For a 100-entry heap:
+
+```text
+target position    pointer comparisons
+
+first              1
+middle             50
+last               100
+missing            100
+```
+
+Validated output:
+
+```text
+[PROFILE] first heap entry   size=100 comparisons=1   result=FOUND index=0
+[PROFILE] middle heap entry  size=100 comparisons=50  result=FOUND index=49
+[PROFILE] last heap entry    size=100 comparisons=100 result=FOUND index=99
+[PROFILE] missing heap entry size=100 comparisons=100 result=MISS
+```
+
+This demonstrates that the ordinary heap provides no direct arbitrary-entry access.
+
+### Scaling experiment
+
+Stage 13 also searches for a missing pointer with heap sizes:
+
+```text
+1
+10
+25
+50
+100
+```
+
+The comparison counts are exactly:
+
+```text
+heap size    pointer comparisons
+
+1            1
+10           10
+25           25
+50           50
+100          100
+```
+
+Therefore:
+
+```text
+missing arbitrary-entry location cost = N pointer comparisons
+```
+
+which confirms:
+
+```text
+O(N)
+```
+
+heap-location complexity for the current ordinary heap.
+
+### Hash lookup versus heap location
+
+Stage 13 then combines the observation with the integrated Part 1 cache.
+
+A valid 100-entry `Part1Cache` is constructed with monotonically increasing ranks.
+
+The hash table can directly return:
+
+```text
+key 100 -> CacheEntry *
+```
+
+using the Stage 10 hash index.
+
+But the ordinary heap still has no stored position for that resident.
+
+The diagnostic scan reports:
+
+```text
+hash found key 100 resident
+ordinary heap location comparisons = 100
+heap index = 99
+```
+
+So the complete Part 2 problem at this checkpoint is:
+
+```text
+key
+ |
+ v
+HashTable
+ |
+ | expected O(1)
+ v
+CacheEntry *
+ |
+ | ordinary heap has no reverse position
+ v
+linear heap scan
+ |
+ | O(N)
+ v
+heap index
+```
+
+This defeats the intended efficient arbitrary-priority update path.
+
+## Stage 13 Conclusion
+
+The current structures solve different parts of the problem:
+
+```text
+HashTable:
+    key -> CacheEntry *
+    expected O(1)
+
+MinHeap:
+    minimum -> heap[0]
+    O(1)
+
+MinHeap push/pop:
+    O(log N)
+
+Missing capability:
+    CacheEntry * -> heap index
+```
+
+Without that missing mapping, an arbitrary resident rank update would require:
+
+```text
+hash lookup              expected O(1)
+linear heap location     O(N)
+heap repair              O(log N)
+```
+
+and therefore remains dominated by:
+
+```text
+O(N)
+```
+
+Stage 13 establishes the requirement:
+
+> Part 2 needs a direct resident-to-heap-index mapping before arbitrary rank repair can be efficient.
+
+That mapping is intentionally **not implemented in Stage 13**.
+
+---
+
+## Stage 13 Validation
+
+### Normal build
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    ranked_cache.c \
+    -o ranked_cache13
+```
+
+### Run
+
+```bash
+./ranked_cache13
+```
+
+The Stage 13 section must end with:
+
+```text
+Stage 13 findings:
+  hash table maps key -> CacheEntry * in expected O(1).
+  ordinary MinHeap stores CacheEntry * but no reverse heap position.
+  locating an arbitrary resident therefore requires scanning heap.items[].
+  first/middle/last lookup costs 1/50/100 comparisons in a 100-entry heap.
+  a missing resident requires N pointer comparisons for heap size N.
+  after hash lookup, worst-case heap location is still O(N).
+Stage 13 conclusion: Part 2 needs a direct resident -> heap-index mapping.
+Stage 13 ordinary-heap limitation validation: PASS
+
+Stage 13 validation: PASS
+```
+
+### Sanitizer build
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fsanitize=address,undefined \
+    ranked_cache.c \
+    -o ranked_cache13_san
+
+./ranked_cache13_san
+```
+
+The sanitizer build completes with exit status `0` and no AddressSanitizer or UndefinedBehaviorSanitizer diagnostics.
+
+### Stage 13 boundary
+
+Stage 13 does **not** introduce:
+
+- a `heap_index` field in `CacheEntry`,
+- a reverse heap-position table,
+- indexed-heap swap maintenance,
+- arbitrary priority repair,
+- production Part 2 `cache_get()` behavior,
+- any sift-up/sift-down update decision for an arbitrary resident.
+
+It only proves why those capabilities are necessary.
+
+---
+
 ## Build Environment
 
 Current target environment:
@@ -2556,7 +2871,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache12
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache13
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -2572,22 +2887,22 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache12
+./ranked_cache13
 ```
 
 ### Expected result
 
-The active Stage 12 test suite must end with:
+The active Stage 13 test suite must end with:
 
 ```text
-Stage 12 validation: PASS
+Stage 13 validation: PASS
 ```
 
 The Stage 10 Part 1 path combines the hash table and min-heap while preserving the earlier linear cache as a regression/reference implementation.
 
 ### Validation result
 
-Stages 0 through 12 have been validated successfully. The active Stage 12 test returns exit status `0`, including the sanitizer validation build.
+Stages 0 through 13 have been validated successfully. The active Stage 13 test returns exit status `0`, including the sanitizer validation build.
 
 ---
 
@@ -2622,11 +2937,16 @@ At this commit, the program can:
 - apply an arbitrary resident rank change through the integrated hash lookup,
 - prove an unrepaired rank decrease can stale the ordinary heap,
 - prove an unrepaired rank increase can stale the ordinary heap, and
-- verify an unchanged rank leaves the existing heap valid.
+- verify an unchanged rank leaves the existing heap valid,
+- measure ordinary-heap arbitrary-entry location by pointer,
+- prove first/middle/last heap-position costs of 1/50/100 comparisons,
+- prove missing heap-pointer lookup scales linearly with heap size, and
+- demonstrate that hash lookup still requires an O(N) heap scan to recover the resident's heap index.
 
 At this commit, the program intentionally does **not** implement:
 
 - production Part 2 rank changes inside `part1_cache_get()`,
+- direct resident-to-heap-index mapping,
 - arbitrary heap-priority update,
 - indexed heap positions for Part 2,
 - concurrent/thread-safe access, or
@@ -2686,6 +3006,11 @@ Stage 12 also does not change production complexity. It demonstrates that after 
 arbitrary rank change, the existing ordinary heap may become invalid. Hash lookup still
 locates the resident in expected O(1), but Stage 12 intentionally provides no efficient
 way to locate that resident's heap position or repair the heap yet.
+
+Stage 13 measures that missing heap-position operation directly. With the current
+`MinHeap`, locating an arbitrary `CacheEntry *` requires O(N) pointer scanning in the
+worst case. Therefore a hypothetical Part 2 update using the current structures would
+still be O(N) + O(log N), dominated by the O(N) heap-location step.
 
 ---
 
@@ -2872,5 +3197,19 @@ STALE-HEAP INCREASE DETECTION PASS
 UNCHANGED-RANK HEAP VALIDITY PASS
 PART 1 STATE RESTORE PASS
 PART 2 UPDATE PROBLEM CONFIRMED
+ASAN/UBSAN PASS
+
+
+Stage 13
+Recognize ordinary-heap arbitrary-entry limitation
+COMPLETE
+BUILD PASS
+RUN PASS
+HEAP POSITION INSTRUMENTATION PASS
+FIRST/MIDDLE/LAST LOCATION PROFILE PASS
+MISSING-POINTER SCALING PASS
+HASH-TO-HEAP LOCATION GAP PASS
+O(N) ARBITRARY HEAP LOCATION CONFIRMED
+DIRECT RESIDENT-TO-HEAP-INDEX REQUIREMENT CONFIRMED
 ASAN/UBSAN PASS
 ```
