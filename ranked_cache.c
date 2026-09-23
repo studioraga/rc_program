@@ -24,6 +24,8 @@
  *   Stage 18 - test rank-increase repair independently
  *   Stage 19 - integrate dynamic rank repair into cache hits
  *   Stage 20 - add integrated cache runtime statistics
+ *   Stage 21 - add deterministic workload generation
+ *   Stage 22 - add a correctness-first debug/sanitizer workload gate
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
@@ -74,6 +76,10 @@
  * Stage 17 independently stress-tests only the rank-decrease/sift-up branch of
  * min_heap_update_rank(). Stage 18 now mirrors that discipline for the
  * rank-increase/sift-down branch without changing production heap logic.
+ *
+ * Stage 22 introduces no timing or optimization. It defines a correctness-first
+ * build gate and deterministic stress runner that validates the integrated cache
+ * after every generated operation under assertions and sanitizers.
  */
 
 #include <stdio.h>
@@ -5365,6 +5371,276 @@ int stage21_run_deterministic_workload_tests(void)
     return passed;
 }
 
+
+
+/* ---------- Stage 22: correctness build first ---------- */
+
+/*
+ * Stage 22 intentionally adds no clock, timing, throughput, or optimization.
+ *
+ * The goal is to establish a correctness-first gate before any later
+ * performance build:
+ *
+ *   - assertions enabled
+ *   - -O0 + debug symbols
+ *   - warnings promoted to errors
+ *   - ASan/UBSan
+ *   - deterministic workload replay
+ *   - integrated invariant validation after every operation
+ *
+ * The RANKED_CACHE_CORRECTNESS_BUILD macro is supplied by the documented
+ * Stage 22 build command. The source remains buildable without that macro so
+ * earlier compilation workflows continue to work.
+ */
+
+int stage22_assertions_enabled(void)
+{
+#ifdef NDEBUG
+    return 0;
+#else
+    return 1;
+#endif
+}
+
+int stage22_correctness_build_marker_enabled(void)
+{
+#ifdef RANKED_CACHE_CORRECTNESS_BUILD
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+/*
+ * Execute one deterministic Part 2 workload and validate the complete
+ * integrated cache after every operation.
+ *
+ * This is intentionally not a benchmark runner.
+ */
+int stage22_execute_checked_workload(Part1Cache *cache,
+                                     uint64_t seed,
+                                     CacheKey key_space,
+                                     size_t operation_count)
+{
+    WorkloadGenerator generator;
+    Stage19RankContext rank_context;
+    WorkloadOp operation;
+    size_t i;
+
+    if (cache == NULL ||
+        key_space == 0ULL ||
+        !workload_generator_init(&generator, seed, key_space)) {
+        return 0;
+    }
+
+    for (i = 0U; i < operation_count; ++i) {
+        if (!workload_generator_next(&generator, &operation)) {
+            return 0;
+        }
+
+        rank_context.scenario = operation.scenario;
+        rank_context.calls = 0U;
+
+        if (part2_cache_get(cache,
+                            operation.key,
+                            stage19_rank_provider,
+                            &rank_context) == NULL) {
+            return 0;
+        }
+
+        /*
+         * The explicit validator gives a testable failure result.
+         * assert() adds fail-fast behavior in the correctness build.
+         */
+        if (!part1_cache_validate(cache)) {
+            return 0;
+        }
+
+        assert(part1_cache_validate(cache));
+    }
+
+    return 1;
+}
+
+int stage22_test_build_contract(void)
+{
+    int passed = 1;
+
+    printf("\n[Stage 22] correctness-build contract\n");
+
+    passed &= check(stage22_assertions_enabled(),
+                    "assertions are enabled for correctness validation");
+
+#ifdef RANKED_CACHE_CORRECTNESS_BUILD
+    passed &= check(stage22_correctness_build_marker_enabled(),
+                    "correctness-build compile marker is enabled");
+#else
+    printf("[INFO] RANKED_CACHE_CORRECTNESS_BUILD is not defined in this build.\n");
+    printf("[INFO] Use the documented Stage 22 correctness command for the full gate.\n");
+#endif
+
+    return passed;
+}
+
+int stage22_test_checked_replay(void)
+{
+    Part1Cache first;
+    Part1Cache second;
+    CacheStats first_stats;
+    CacheStats second_stats;
+    const uint64_t seed = UINT64_C(0x6a09e667f3bcc909);
+    const CacheKey key_space = 32ULL;
+    const size_t operation_count = 1000U;
+    int passed = 1;
+
+    printf("\n[Stage 22] checked deterministic replay\n");
+
+    passed &= check(part1_cache_init(&first, 16U),
+                    "initialize first correctness cache");
+    passed &= check(part1_cache_init(&second, 16U),
+                    "initialize replay correctness cache");
+
+    passed &= check(stage22_execute_checked_workload(
+                        &first, seed, key_space, operation_count),
+                    "execute first invariant-checked workload");
+
+    passed &= check(stage22_execute_checked_workload(
+                        &second, seed, key_space, operation_count),
+                    "execute replayed invariant-checked workload");
+
+    first_stats = part1_cache_stats_snapshot(&first);
+    second_stats = part1_cache_stats_snapshot(&second);
+
+    passed &= check(stage21_stats_equal(first_stats, second_stats),
+                    "checked replay produces identical statistics");
+
+    passed &= check(first_stats.accesses == operation_count &&
+                    second_stats.accesses == operation_count,
+                    "checked workloads record the exact operation count");
+
+    passed &= check(stage21_cache_logical_state_equal(
+                        &first, &second, key_space),
+                    "checked replay produces identical logical cache state");
+
+    passed &= check(part1_cache_validate(&first) &&
+                    part1_cache_validate(&second),
+                    "checked replay ends with valid integrated caches");
+
+    return passed;
+}
+
+int stage22_test_multiple_deterministic_seeds(void)
+{
+    static const uint64_t seeds[] = {
+        UINT64_C(0x243f6a8885a308d3),
+        UINT64_C(0x13198a2e03707344),
+        UINT64_C(0xa4093822299f31d0),
+        UINT64_C(0x082efa98ec4e6c89)
+    };
+    size_t i;
+    int passed = 1;
+
+    printf("\n[Stage 22] multiple deterministic correctness workloads\n");
+
+    for (i = 0U; i < sizeof(seeds) / sizeof(seeds[0]); ++i) {
+        Part1Cache cache;
+        CacheStats stats;
+
+        passed &= check(part1_cache_init(&cache, 24U),
+                        "initialize multi-seed correctness cache");
+
+        passed &= check(stage22_execute_checked_workload(
+                            &cache,
+                            seeds[i],
+                            48ULL,
+                            750U),
+                        "execute invariant-checked multi-seed workload");
+
+        stats = part1_cache_stats_snapshot(&cache);
+
+        passed &= check(stats.accesses == 750U,
+                        "multi-seed workload records exact access count");
+
+        passed &= check(stats.hits + stats.misses == stats.accesses,
+                        "multi-seed hit/miss accounting balances accesses");
+
+        passed &= check(stats.db_reads == stats.misses,
+                        "multi-seed database reads equal misses");
+
+        passed &= check(part1_cache_validate(&cache),
+                        "multi-seed workload preserves integrated invariants");
+    }
+
+    return passed;
+}
+
+int stage22_test_corruption_is_detected(void)
+{
+    Part1Cache cache;
+    CacheEntry *resident;
+    size_t saved_index;
+    int passed = 1;
+
+    printf("\n[Stage 22] correctness validator detects controlled corruption\n");
+
+    passed &= check(part1_cache_init(&cache, 4U),
+                    "initialize corruption-detection cache");
+
+    passed &= check(part1_cache_get(&cache, 1ULL) != NULL &&
+                    part1_cache_get(&cache, 2ULL) != NULL &&
+                    part1_cache_get(&cache, 3ULL) != NULL,
+                    "populate corruption-detection cache");
+
+    resident = part1_cache_lookup(&cache, 2ULL);
+    passed &= check(resident != NULL,
+                    "locate resident for controlled corruption");
+
+    if (resident == NULL) {
+        return 0;
+    }
+
+    saved_index = resident->heap_index;
+    resident->heap_index = HEAP_INDEX_NONE;
+
+    passed &= check(!min_heap_validate(&cache.min_heap),
+                    "heap validator detects corrupted reverse index");
+    passed &= check(!part1_cache_validate(&cache),
+                    "integrated validator detects corrupted reverse index");
+
+    resident->heap_index = saved_index;
+
+    passed &= check(min_heap_validate(&cache.min_heap) &&
+                    part1_cache_validate(&cache),
+                    "restoring metadata restores valid cache state");
+
+    return passed;
+}
+
+int stage22_run_correctness_build_tests(void)
+{
+    int passed = 1;
+
+    printf("\n=== Stage 22: correctness build first ===\n");
+
+    passed &= stage22_test_build_contract();
+    passed &= stage22_test_checked_replay();
+    passed &= stage22_test_multiple_deterministic_seeds();
+    passed &= stage22_test_corruption_is_detected();
+
+    printf("\nStage 22 findings:\n");
+    printf("  correctness validation runs with assertions enabled.\n");
+    printf("  deterministic workloads validate invariants after every operation.\n");
+    printf("  same-seed checked replay reproduces statistics and logical state.\n");
+    printf("  multiple fixed seeds exercise the integrated Part 2 path reproducibly.\n");
+    printf("  controlled metadata corruption is detected before performance work begins.\n");
+    printf("  no timing or optimization is introduced in the correctness gate.\n");
+    printf("Stage 22 boundary: correctness build only; performance build comes later.\n");
+    printf("Stage 22 correctness-build validation: %s\n",
+           passed ? "PASS" : "FAIL");
+
+    return passed;
+}
+
 int main(void)
 {
     Cache cache;
@@ -5543,7 +5819,12 @@ int main(void)
 
     all_passed &= stage21_run_deterministic_workload_tests();
 
-    printf("\nStage 21 validation: %s\n",
+    printf("\nStage 21 regression validation: %s\n",
+           all_passed ? "PASS" : "FAIL");
+
+    all_passed &= stage22_run_correctness_build_tests();
+
+    printf("\nStage 22 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;

@@ -5926,6 +5926,334 @@ It adds deterministic workload generation and replay only.
 
 ---
 
+## Stage 22 — Correctness Build First
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 22 establishes a correctness gate before any later performance-oriented build.
+
+It deliberately does **not** add:
+
+- wall-clock timing,
+- throughput measurement,
+- latency measurement,
+- `-O2` / `-O3`,
+- benchmark warmup,
+- performance tuning.
+
+The Stage 22 correctness build instead prioritizes:
+
+```text
+warnings as errors
+assertions enabled
+-O0
+debug symbols
+frame pointers
+ASan
+UBSan
+deterministic workload replay
+invariant validation after every operation
+```
+
+### Correctness-build marker
+
+Stage 22 supports the compile-time marker:
+
+```c
+RANKED_CACHE_CORRECTNESS_BUILD
+```
+
+through:
+
+```c
+int stage22_correctness_build_marker_enabled(void);
+```
+
+The documented correctness command defines this marker explicitly.
+
+The source can still compile without the marker so earlier development commands remain usable.
+
+### Assertions
+
+Stage 22 verifies that:
+
+```text
+NDEBUG is not defined
+```
+
+for the correctness build.
+
+That keeps the existing `assert()` checks active.
+
+The Stage 22 checked workload combines:
+
+```c
+if (!part1_cache_validate(cache)) {
+    return 0;
+}
+
+assert(part1_cache_validate(cache));
+```
+
+after **every generated cache operation**.
+
+The explicit validator provides a normal test failure path.
+
+The assertion adds fail-fast debug behavior.
+
+---
+
+## Stage 22 Checked Workload Runner
+
+Stage 22 adds:
+
+```c
+int stage22_execute_checked_workload(
+    Part1Cache *cache,
+    uint64_t seed,
+    CacheKey key_space,
+    size_t operation_count);
+```
+
+For every deterministic Stage 21 operation:
+
+```text
+generate WorkloadOp
+        |
+        v
+part2_cache_get()
+        |
+        v
+part1_cache_validate()
+        |
+        v
+assert(part1_cache_validate())
+```
+
+No timing information is collected.
+
+---
+
+## Stage 22 Validation
+
+### Test 1 — correctness-build contract
+
+The Stage 22 correctness configuration verifies:
+
+```text
+assertions enabled
+RANKED_CACHE_CORRECTNESS_BUILD enabled
+```
+
+The dedicated build also uses:
+
+```text
+-Wall
+-Wextra
+-Wpedantic
+-Werror
+-O0
+-g3
+-fno-omit-frame-pointer
+-fsanitize=address,undefined
+```
+
+### Test 2 — checked deterministic replay
+
+Two independent caches execute:
+
+```text
+seed            = 0x6a09e667f3bcc909
+key_space       = 32
+cache capacity  = 16
+operation_count = 1000
+```
+
+Every operation is immediately followed by a complete integrated invariant check.
+
+The two runs must produce:
+
+```text
+1000 accesses each
+identical CacheStats
+identical logical cache state
+valid integrated invariants
+```
+
+### Test 3 — multiple deterministic seeds
+
+Stage 22 executes four additional fixed seeds:
+
+```text
+0x243f6a8885a308d3
+0x13198a2e03707344
+0xa4093822299f31d0
+0x082efa98ec4e6c89
+```
+
+For each seed:
+
+```text
+key_space       = 48
+cache capacity  = 24
+operation_count = 750
+```
+
+After every operation:
+
+```c
+part1_cache_validate()
+```
+
+must pass.
+
+The final statistics must also satisfy:
+
+```text
+accesses = 750
+
+hits + misses = accesses
+
+db_reads = misses
+```
+
+### Test 4 — controlled corruption detection
+
+Stage 22 deliberately corrupts one resident's:
+
+```c
+heap_index
+```
+
+to:
+
+```c
+HEAP_INDEX_NONE
+```
+
+while leaving the resident physically present in the heap.
+
+The tests verify:
+
+```text
+min_heap_validate()    -> fail
+part1_cache_validate() -> fail
+```
+
+After restoring the original index:
+
+```text
+min_heap_validate()    -> pass
+part1_cache_validate() -> pass
+```
+
+This verifies the correctness gate actively detects a known structural violation.
+
+---
+
+## Stage 22 Correctness Build
+
+Use this build **before** any later optimized/performance build:
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -Werror \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fno-omit-frame-pointer \
+    -DRANKED_CACHE_CORRECTNESS_BUILD=1 \
+    -fsanitize=address,undefined \
+    ranked_cache.c \
+    -o ranked_cache22_correctness
+```
+
+Run:
+
+```bash
+ASAN_OPTIONS=detect_leaks=1 \
+UBSAN_OPTIONS=halt_on_error=1 \
+./ranked_cache22_correctness
+```
+
+Expected Stage 22 ending:
+
+```text
+Stage 22 findings:
+  correctness validation runs with assertions enabled.
+  deterministic workloads validate invariants after every operation.
+  same-seed checked replay reproduces statistics and logical state.
+  multiple fixed seeds exercise the integrated Part 2 path reproducibly.
+  controlled metadata corruption is detected before performance work begins.
+  no timing or optimization is introduced in the correctness gate.
+Stage 22 boundary: correctness build only; performance build comes later.
+Stage 22 correctness-build validation: PASS
+
+Stage 22 validation: PASS
+```
+
+The correctness build completes with:
+
+```text
+no compiler warnings
+no compiler errors
+no AddressSanitizer diagnostics
+no UndefinedBehaviorSanitizer diagnostics
+exit status 0
+```
+
+### Compatibility warning build
+
+The Stage 22 source also remains valid with the ordinary warning build:
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -Werror \
+    -std=c11 \
+    ranked_cache.c \
+    -o ranked_cache22
+```
+
+This is useful for source compatibility, but it is **not** a substitute for the correctness build above.
+
+---
+
+## Stage 22 Complexity
+
+Stage 22 does not change production cache complexity.
+
+The additional invariant checking belongs to the correctness/test configuration.
+
+`part1_cache_validate()` includes debug-oriented cross-structure validation, so the checked workload intentionally prioritizes correctness rather than speed.
+
+That cost must **not** be included in a later performance comparison.
+
+---
+
+### Stage 22 boundary
+
+Stage 22 deliberately does **not** add:
+
+- optimized compiler flags,
+- `NDEBUG`,
+- wall-clock clocks,
+- timing harnesses,
+- operations-per-second calculations,
+- latency percentiles,
+- performance comparison,
+- benchmark result files,
+- optimization changes.
+
+The correctness build is established first. Performance measurement remains a later stage.
+
+---
+
 ## Build Environment
 
 Current target environment:
@@ -5937,7 +6265,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache21
+gcc -Wall -Wextra -Wpedantic -Werror -std=c11 -O0 -g3 -fno-omit-frame-pointer -DRANKED_CACHE_CORRECTNESS_BUILD=1 -fsanitize=address,undefined ranked_cache.c -o ranked_cache22_correctness
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -5953,22 +6281,22 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache21
+./ranked_cache22_correctness
 ```
 
 ### Expected result
 
-The active Stage 21 test suite must end with:
+The active Stage 22 correctness test suite must end with:
 
 ```text
-Stage 21 validation: PASS
+Stage 22 validation: PASS
 ```
 
 The Stage 10 Part 1 path combines the hash table and min-heap while preserving the earlier linear cache as a regression/reference implementation.
 
 ### Validation result
 
-Stages 0 through 21 have been validated successfully. The normal build, UBSan build, and combined ASan/UBSan build all pass for Stage 21.
+Stages 0 through 22 have been validated successfully. Stage 22 passes the warning-as-error compatibility build and the dedicated correctness build with assertions, ASan, UBSan, deterministic replay, and invariant checks after every operation.
 
 ---
 
@@ -6048,7 +6376,11 @@ At this commit, the program can:
 - replay an identical workload by resetting or reusing the same seed,
 - validate a fixed golden operation sequence,
 - verify generated key/scenario bounds, and
-- reproduce identical cache statistics and logical state from identical workloads.
+- reproduce identical cache statistics and logical state from identical workloads,
+- run deterministic Part 2 workloads with invariant validation after every operation,
+- enforce a correctness build with assertions, `-Werror`, `-O0`, debug symbols, and frame pointers,
+- validate deterministic checked replay across multiple fixed seeds, and
+- verify controlled structural corruption is detected before performance work begins.
 
 At this commit, the program intentionally does **not** implement:
 
@@ -6145,6 +6477,10 @@ It does not change any lookup, heap, insertion, or eviction asymptotic complexit
 
 Stage 21 adds O(1) deterministic generation work per operation. It does not add
 timing or alter any cache data-structure complexity.
+
+Stage 22 changes no production asymptotic complexity. Its per-operation integrated
+validator is intentionally correctness-oriented debug overhead and must be excluded
+from later performance measurements.
 
 ---
 
@@ -6486,4 +6822,22 @@ DETERMINISTIC-CACHE-STATE PASS
 INTEGRATED VALIDATOR PASS
 UBSAN PASS
 ASAN/UBSAN PASS
+
+
+Stage 22
+Correctness build first
+COMPLETE
+-WERROR BUILD PASS
+ASSERTIONS ENABLED PASS
+CORRECTNESS-BUILD MARKER PASS
+-O0 DEBUG BUILD PASS
+FRAME-POINTER BUILD PASS
+CHECKED 1000-OP REPLAY PASS
+MULTI-SEED CHECKED WORKLOAD PASS
+PER-OP INVARIANT VALIDATION PASS
+STATISTICS ACCOUNTING PASS
+CONTROLLED-CORRUPTION DETECTION PASS
+ASAN PASS
+UBSAN PASS
+NO TIMING/OPTIMIZATION INTRODUCED
 ```

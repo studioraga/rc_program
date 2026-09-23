@@ -43,3 +43,8 @@ ranked_cache20_san
 ranked_cache21
 ranked_cache21_ubsan
 ranked_cache21_san
+ranked_cache22
+ranked_cache22_normal
+ranked_cache22_correctness
+ranked_cache22_ubsan
+ranked_cache22_san
