@@ -26,6 +26,7 @@
  *   Stage 20 - add integrated cache runtime statistics
  *   Stage 21 - add deterministic workload generation
  *   Stage 22 - add a correctness-first debug/sanitizer workload gate
+ *   Stage 23 - add optimized build configuration after correctness gate
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
@@ -86,6 +87,10 @@
 #include <stddef.h>
 #include <assert.h>
 #include <stdint.h>
+
+#if defined(RANKED_CACHE_CORRECTNESS_BUILD) && defined(RANKED_CACHE_OPTIMIZED_BUILD)
+#error "correctness and optimized build markers are mutually exclusive"
+#endif
 
 #define MAX_CACHE_CAPACITY 100U
 #define HASH_TABLE_CAPACITY 211U
@@ -465,6 +470,8 @@ int cache_validate(const Cache *cache)
  */
 void cache_assert_invariants(const Cache *cache)
 {
+    /* Keep the parameter referenced when NDEBUG compiles assert() away. */
+    (void)cache;
     assert(cache_validate(cache));
 }
 
@@ -2454,10 +2461,10 @@ int stage12_test_rank_direction_contract(void)
 int stage12_test_decrease_can_stale_heap(void)
 {
     Part1Cache cache;
-    CacheEntry *resident;
+    CacheEntry *resident = NULL;
     CacheEntry *heap_root;
-    Rank old_rank;
-    Rank new_rank;
+    Rank old_rank = 0LL;
+    Rank new_rank = 0LL;
     int passed = 1;
 
     printf("\n[Stage 12] decreasing a non-root rank can stale the ordinary heap\n");
@@ -2513,10 +2520,10 @@ int stage12_test_decrease_can_stale_heap(void)
 int stage12_test_increase_can_stale_heap(void)
 {
     Part1Cache cache;
-    CacheEntry *resident;
+    CacheEntry *resident = NULL;
     CacheEntry *heap_root;
-    Rank old_rank;
-    Rank new_rank;
+    Rank old_rank = 0LL;
+    Rank new_rank = 0LL;
     int passed = 1;
 
     printf("\n[Stage 12] increasing the root rank can stale the ordinary heap\n");
@@ -2570,11 +2577,11 @@ int stage12_test_increase_can_stale_heap(void)
 int stage12_test_unchanged_rank_needs_no_repair(void)
 {
     Part1Cache cache;
-    CacheEntry *resident;
+    CacheEntry *resident = NULL;
     CacheEntry *before_root;
     CacheEntry *after_root;
-    Rank old_rank;
-    Rank new_rank;
+    Rank old_rank = 0LL;
+    Rank new_rank = 0LL;
     int passed = 1;
 
     printf("\n[Stage 12] unchanged rank preserves ordinary heap validity\n");
@@ -5468,6 +5475,12 @@ int stage22_test_build_contract(void)
 
     printf("\n[Stage 22] correctness-build contract\n");
 
+#ifdef RANKED_CACHE_OPTIMIZED_BUILD
+    /* Stage 23 intentionally uses NDEBUG. */
+    passed &= check(!stage22_assertions_enabled(),
+                    "optimized build intentionally disables assertions");
+    printf("[INFO] Stage 22 assertion requirement applies to the dedicated correctness build.\n");
+#else
     passed &= check(stage22_assertions_enabled(),
                     "assertions are enabled for correctness validation");
 
@@ -5477,6 +5490,7 @@ int stage22_test_build_contract(void)
 #else
     printf("[INFO] RANKED_CACHE_CORRECTNESS_BUILD is not defined in this build.\n");
     printf("[INFO] Use the documented Stage 22 correctness command for the full gate.\n");
+#endif
 #endif
 
     return passed;
@@ -5636,6 +5650,246 @@ int stage22_run_correctness_build_tests(void)
     printf("  no timing or optimization is introduced in the correctness gate.\n");
     printf("Stage 22 boundary: correctness build only; performance build comes later.\n");
     printf("Stage 22 correctness-build validation: %s\n",
+           passed ? "PASS" : "FAIL");
+
+    return passed;
+}
+
+
+
+/* ---------- Stage 23: optimized build second ---------- */
+
+/*
+ * Stage 23 introduces the optimized build configuration only after the
+ * Stage 22 correctness gate exists. It deliberately adds no clock or timing.
+ *
+ * Target configuration:
+ *   -O3 -DNDEBUG -DRANKED_CACHE_OPTIMIZED_BUILD=1
+ *
+ * Functional equivalence is checked with deterministic golden outcomes before
+ * any later performance measurement is allowed.
+ */
+
+int stage23_assertions_disabled(void)
+{
+#ifdef NDEBUG
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int stage23_optimized_build_marker_enabled(void)
+{
+#ifdef RANKED_CACHE_OPTIMIZED_BUILD
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int stage23_compiler_optimization_enabled(void)
+{
+#ifdef __OPTIMIZE__
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int stage23_execute_optimized_workload(Part1Cache *cache,
+                                       uint64_t seed,
+                                       CacheKey key_space,
+                                       size_t operation_count)
+{
+    WorkloadGenerator generator;
+    Stage19RankContext rank_context;
+    WorkloadOp operation;
+    size_t i;
+
+    if (cache == NULL ||
+        key_space == 0ULL ||
+        !workload_generator_init(&generator, seed, key_space)) {
+        return 0;
+    }
+
+    for (i = 0U; i < operation_count; ++i) {
+        if (!workload_generator_next(&generator, &operation)) {
+            return 0;
+        }
+
+        rank_context.scenario = operation.scenario;
+        rank_context.calls = 0U;
+
+        if (part2_cache_get(cache,
+                            operation.key,
+                            stage19_rank_provider,
+                            &rank_context) == NULL) {
+            return 0;
+        }
+    }
+
+    return part1_cache_validate(cache);
+}
+
+int stage23_test_optimized_build_contract(void)
+{
+    int passed = 1;
+
+    printf("\n[Stage 23] optimized-build contract\n");
+
+#ifdef RANKED_CACHE_OPTIMIZED_BUILD
+    passed &= check(stage23_optimized_build_marker_enabled(),
+                    "optimized-build compile marker is enabled");
+    passed &= check(stage23_assertions_disabled(),
+                    "optimized build disables assertions with NDEBUG");
+    passed &= check(stage23_compiler_optimization_enabled(),
+                    "compiler reports optimization enabled");
+#else
+    printf("[INFO] RANKED_CACHE_OPTIMIZED_BUILD is not defined in this build.\n");
+    printf("[INFO] Use the documented Stage 23 optimized command for the full gate.\n");
+#endif
+
+    return passed;
+}
+
+int stage23_test_golden_optimized_outcome(void)
+{
+    Part1Cache cache;
+    CacheStats stats;
+    CacheEntry *resident;
+    static const struct {
+        CacheKey key;
+        Rank rank;
+    } expected_residents[] = {
+        {1ULL, -20LL},
+        {3ULL, 0LL},
+        {5ULL, 50LL},
+        {7ULL, -110LL},
+        {9ULL, 120LL},
+        {11ULL, 350LL},
+        {13ULL, 10LL},
+        {15ULL, 150LL}
+    };
+    size_t i;
+    CacheKey key;
+    int passed = 1;
+
+    printf("\n[Stage 23] optimized build matches correctness golden outcome\n");
+
+    passed &= check(part1_cache_init(&cache, 8U),
+                    "initialize optimized golden cache");
+
+    passed &= check(stage23_execute_optimized_workload(
+                        &cache,
+                        UINT64_C(0x3141592653589793),
+                        16ULL,
+                        200U),
+                    "execute optimized golden workload");
+
+    stats = part1_cache_stats_snapshot(&cache);
+
+    passed &= check(stats.accesses == 200U &&
+                    stats.hits == 192U &&
+                    stats.misses == 8U &&
+                    stats.db_reads == 8U &&
+                    stats.insertions == 8U &&
+                    stats.evictions == 0U &&
+                    stats.rank_provider_calls == 192U &&
+                    stats.rank_updates == 192U &&
+                    stats.rank_decreases == 65U &&
+                    stats.rank_unchanged == 65U &&
+                    stats.rank_increases == 62U,
+                    "optimized workload matches correctness-build golden statistics");
+
+    for (i = 0U; i < sizeof(expected_residents) / sizeof(expected_residents[0]); ++i) {
+        resident = part1_cache_lookup(&cache, expected_residents[i].key);
+        passed &= check(resident != NULL &&
+                        resident->rank == expected_residents[i].rank,
+                        "optimized workload matches golden resident rank");
+    }
+
+    for (key = 1ULL; key <= 16ULL; ++key) {
+        int expected_present = (key % 2ULL) == 1ULL;
+        resident = part1_cache_lookup(&cache, key);
+        passed &= check((resident != NULL) == expected_present,
+                        "optimized workload matches golden resident membership");
+    }
+
+    resident = min_heap_peek(&cache.min_heap);
+    passed &= check(resident != NULL &&
+                    resident->key == 7ULL &&
+                    resident->rank == -110LL,
+                    "optimized workload matches golden heap minimum");
+
+    passed &= check(part1_cache_validate(&cache),
+                    "optimized golden cache satisfies integrated invariants");
+
+    return passed;
+}
+
+int stage23_test_optimized_replay(void)
+{
+    Part1Cache first;
+    Part1Cache second;
+    CacheStats first_stats;
+    CacheStats second_stats;
+    const uint64_t seed = UINT64_C(0x6a09e667f3bcc909);
+    const CacheKey key_space = 32ULL;
+    const size_t operation_count = 1000U;
+    int passed = 1;
+
+    printf("\n[Stage 23] optimized deterministic replay\n");
+
+    passed &= check(part1_cache_init(&first, 16U),
+                    "initialize first optimized replay cache");
+    passed &= check(part1_cache_init(&second, 16U),
+                    "initialize second optimized replay cache");
+
+    passed &= check(stage23_execute_optimized_workload(
+                        &first, seed, key_space, operation_count),
+                    "execute first optimized replay workload");
+    passed &= check(stage23_execute_optimized_workload(
+                        &second, seed, key_space, operation_count),
+                    "execute second optimized replay workload");
+
+    first_stats = part1_cache_stats_snapshot(&first);
+    second_stats = part1_cache_stats_snapshot(&second);
+
+    passed &= check(stage21_stats_equal(first_stats, second_stats),
+                    "optimized replay produces identical statistics");
+    passed &= check(first_stats.accesses == operation_count &&
+                    second_stats.accesses == operation_count,
+                    "optimized replay records exact access count");
+    passed &= check(stage21_cache_logical_state_equal(
+                        &first, &second, key_space),
+                    "optimized replay produces identical logical cache state");
+    passed &= check(part1_cache_validate(&first) &&
+                    part1_cache_validate(&second),
+                    "optimized replay ends with valid integrated caches");
+
+    return passed;
+}
+
+int stage23_run_optimized_build_tests(void)
+{
+    int passed = 1;
+
+    printf("\n=== Stage 23: optimized build second ===\n");
+
+    passed &= stage23_test_optimized_build_contract();
+    passed &= stage23_test_golden_optimized_outcome();
+    passed &= stage23_test_optimized_replay();
+
+    printf("\nStage 23 findings:\n");
+    printf("  optimized build is explicitly separated from the correctness build.\n");
+    printf("  the optimized configuration uses -O3 and NDEBUG after correctness validation.\n");
+    printf("  deterministic golden statistics and resident state match the correctness baseline.\n");
+    printf("  same-seed optimized replay reproduces statistics and logical state.\n");
+    printf("  final integrated invariants remain valid without per-operation correctness checks.\n");
+    printf("  no clocks, throughput, or latency measurements are introduced yet.\n");
+    printf("Stage 23 boundary: optimized build established; performance measurement comes later.\n");
+    printf("Stage 23 optimized-build validation: %s\n",
            passed ? "PASS" : "FAIL");
 
     return passed;
@@ -5824,7 +6078,12 @@ int main(void)
 
     all_passed &= stage22_run_correctness_build_tests();
 
-    printf("\nStage 22 validation: %s\n",
+    printf("\nStage 22 regression validation: %s\n",
+           all_passed ? "PASS" : "FAIL");
+
+    all_passed &= stage23_run_optimized_build_tests();
+
+    printf("\nStage 23 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;

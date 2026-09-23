@@ -6254,6 +6254,379 @@ The correctness build is established first. Performance measurement remains a la
 
 ---
 
+## Stage 23 — Optimized Build Second
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 22 established the correctness build first:
+
+```text
+-O0
+assertions enabled
+-Werror
+debug symbols
+frame pointers
+ASan
+UBSan
+per-operation invariant validation
+```
+
+Stage 23 now adds the second build configuration:
+
+```text
+optimized build
+```
+
+without adding any timing or benchmarking.
+
+The Stage 23 target uses:
+
+```bash
+-O3
+-DNDEBUG
+-DRANKED_CACHE_OPTIMIZED_BUILD=1
+```
+
+while retaining:
+
+```bash
+-Wall
+-Wextra
+-Wpedantic
+-Werror
+-std=c11
+```
+
+The purpose of Stage 23 is not to claim a speedup.
+
+It is to prove that the source can be compiled in an optimized production-style configuration **after** the correctness gate has passed, while preserving deterministic functional behavior.
+
+### Build-mode separation
+
+Stage 23 adds a compile-time guard:
+
+```c
+#if defined(RANKED_CACHE_CORRECTNESS_BUILD) && \
+    defined(RANKED_CACHE_OPTIMIZED_BUILD)
+#error "correctness and optimized build markers are mutually exclusive"
+#endif
+```
+
+This prevents accidentally mixing the two configurations.
+
+The intended sequence is:
+
+```text
+Stage 22
+correctness build
+        |
+        +--> assertions
+        +--> ASan/UBSan
+        +--> per-op validation
+        |
+        v
+PASS
+        |
+        v
+Stage 23
+optimized build
+        |
+        +--> -O3
+        +--> -DNDEBUG
+        +--> no sanitizer instrumentation
+        +--> no per-op correctness assertions
+```
+
+### Optimized-build contract
+
+Stage 23 adds helpers that verify:
+
+```text
+RANKED_CACHE_OPTIMIZED_BUILD is defined
+NDEBUG is defined
+compiler optimization is enabled
+```
+
+For GCC/Clang-style builds, the optimized test also checks:
+
+```c
+__OPTIMIZE__
+```
+
+so accidentally compiling the Stage 23 target at `-O0` does not satisfy the full optimized-build contract.
+
+### NDEBUG build hygiene
+
+The first Stage 23 optimized compile exposed warnings that do not appear in the Stage 22 correctness build.
+
+Stage 23 fixes those configuration-specific hazards without changing cache behavior:
+
+- `cache_assert_invariants()` explicitly references its parameter even when `assert()` is compiled away by `NDEBUG`;
+- Stage 12 probe variables are explicitly initialized so optimized data-flow analysis cannot report possible uninitialized use;
+- Stage 22's build-contract test becomes build-mode aware so it still requires assertions in the correctness build but does not incorrectly reject the later optimized configuration.
+
+These are build-hygiene changes only.
+
+No cache algorithm is changed.
+
+---
+
+## Stage 23 Optimized Workload Path
+
+Stage 22 intentionally validates the cache after every generated operation.
+
+That is correct for a debug gate, but that validation overhead must not become part of a later performance workload.
+
+Stage 23 therefore adds:
+
+```c
+stage23_execute_optimized_workload()
+```
+
+Its operation flow is:
+
+```text
+generate WorkloadOp
+        |
+        v
+part2_cache_get()
+        |
+        v
+next operation
+```
+
+There is no per-operation:
+
+```text
+part1_cache_validate()
+assert()
+```
+
+inside this Stage 23 workload loop.
+
+After the complete workload finishes, Stage 23 performs a final integrated validation.
+
+This establishes the future optimized execution path without measuring it yet.
+
+---
+
+## Golden Correctness-Baseline Outcome
+
+Stage 23 protects semantic equivalence using a deterministic workload whose expected outcome was established from the correctness baseline.
+
+Configuration:
+
+```text
+seed            = 0x3141592653589793
+key_space       = 16
+cache capacity  = 8
+operation_count = 200
+```
+
+The optimized build must produce exactly:
+
+```text
+accesses            = 200
+hits                = 192
+misses              = 8
+db_reads            = 8
+insertions          = 8
+evictions           = 0
+
+rank_provider_calls = 192
+rank_updates        = 192
+rank_decreases      = 65
+rank_unchanged      = 65
+rank_increases      = 62
+```
+
+The final resident key/rank state must be exactly:
+
+```text
+key 1   rank  -20
+key 3   rank    0
+key 5   rank   50
+key 7   rank -110
+key 9   rank  120
+key 11  rank  350
+key 13  rank   10
+key 15  rank  150
+```
+
+Keys:
+
+```text
+2, 4, 6, 8, 10, 12, 14, 16
+```
+
+must be absent.
+
+The final heap minimum must be:
+
+```text
+key 7 / rank -110
+```
+
+This makes the Stage 23 optimized build fail if compiler/build changes alter observable cache semantics.
+
+---
+
+## Optimized Replay Validation
+
+Stage 23 also performs a same-seed replay using:
+
+```text
+seed            = 0x6a09e667f3bcc909
+key_space       = 32
+cache capacity  = 16
+operation_count = 1000
+```
+
+Two independent optimized workload executions must produce:
+
+```text
+identical CacheStats
+exactly 1000 accesses each
+identical logical resident state
+valid final integrated caches
+```
+
+This is still a correctness/equivalence test.
+
+No clock is read.
+
+---
+
+## Stage 23 Builds
+
+### 1. Re-run the correctness build
+
+Before accepting the optimized target, verify the Stage 22 gate still passes with the Stage 23 source:
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -Werror \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fno-omit-frame-pointer \
+    -DRANKED_CACHE_CORRECTNESS_BUILD=1 \
+    -fsanitize=address,undefined \
+    ranked_cache.c \
+    -o ranked_cache23_correctness
+
+ASAN_OPTIONS=detect_leaks=1 \
+UBSAN_OPTIONS=halt_on_error=1 \
+./ranked_cache23_correctness
+```
+
+This build must retain:
+
+```text
+assertions enabled
+ASan enabled
+UBSan enabled
+Stage 22 correctness gate passing
+Stage 23 deterministic equivalence checks passing
+```
+
+### 2. Build the optimized target
+
+Only after the correctness build passes:
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -Werror \
+    -std=c11 \
+    -O3 \
+    -DNDEBUG \
+    -DRANKED_CACHE_OPTIMIZED_BUILD=1 \
+    ranked_cache.c \
+    -o ranked_cache23_optimized
+```
+
+Run:
+
+```bash
+./ranked_cache23_optimized
+```
+
+Expected Stage 23 ending:
+
+```text
+Stage 23 findings:
+  optimized build is explicitly separated from the correctness build.
+  the optimized configuration uses -O3 and NDEBUG after correctness validation.
+  deterministic golden statistics and resident state match the correctness baseline.
+  same-seed optimized replay reproduces statistics and logical state.
+  final integrated invariants remain valid without per-operation correctness checks.
+  no clocks, throughput, or latency measurements are introduced yet.
+Stage 23 boundary: optimized build established; performance measurement comes later.
+Stage 23 optimized-build validation: PASS
+
+Stage 23 validation: PASS
+```
+
+### 3. Optional ordinary compatibility build
+
+The source also remains warning-clean without either build marker:
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -Werror \
+    -std=c11 \
+    ranked_cache.c \
+    -o ranked_cache23
+
+./ranked_cache23
+```
+
+This is a compatibility check, not the Stage 23 target configuration.
+
+---
+
+## Stage 23 Complexity
+
+Stage 23 changes no cache data-structure complexity.
+
+The optimized build changes compiler configuration only.
+
+The Stage 23 workload removes Stage 22's per-operation debug validation from the optimized execution path, but no performance claim is made in this stage.
+
+No throughput, latency, speedup, or operations-per-second result is reported.
+
+---
+
+### Stage 23 boundary
+
+Stage 23 deliberately does **not** add:
+
+- `clock_gettime()`,
+- CPU-cycle counters,
+- throughput calculations,
+- latency measurements,
+- warmup loops,
+- benchmark repetitions,
+- statistical timing summaries,
+- `-march=native`,
+- LTO,
+- PGO,
+- algorithm changes,
+- cache-policy changes.
+
+It establishes the optimized binary only after the correctness binary is already validated.
+
+---
+
 ## Build Environment
 
 Current target environment:
@@ -6265,7 +6638,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -Werror -std=c11 -O0 -g3 -fno-omit-frame-pointer -DRANKED_CACHE_CORRECTNESS_BUILD=1 -fsanitize=address,undefined ranked_cache.c -o ranked_cache22_correctness
+gcc -Wall -Wextra -Wpedantic -Werror -std=c11 -O3 -DNDEBUG -DRANKED_CACHE_OPTIMIZED_BUILD=1 ranked_cache.c -o ranked_cache23_optimized
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -6281,22 +6654,22 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache22_correctness
+./ranked_cache23_optimized
 ```
 
 ### Expected result
 
-The active Stage 22 correctness test suite must end with:
+The active Stage 23 optimized test suite must end with:
 
 ```text
-Stage 22 validation: PASS
+Stage 23 validation: PASS
 ```
 
 The Stage 10 Part 1 path combines the hash table and min-heap while preserving the earlier linear cache as a regression/reference implementation.
 
 ### Validation result
 
-Stages 0 through 22 have been validated successfully. Stage 22 passes the warning-as-error compatibility build and the dedicated correctness build with assertions, ASan, UBSan, deterministic replay, and invariant checks after every operation.
+Stages 0 through 23 have been validated successfully. The Stage 22 correctness build still passes with assertions and ASan/UBSan, and the Stage 23 optimized build passes with -O3, NDEBUG, deterministic golden equivalence, and final invariant validation.
 
 ---
 
@@ -6380,7 +6753,12 @@ At this commit, the program can:
 - run deterministic Part 2 workloads with invariant validation after every operation,
 - enforce a correctness build with assertions, `-Werror`, `-O0`, debug symbols, and frame pointers,
 - validate deterministic checked replay across multiple fixed seeds, and
-- verify controlled structural corruption is detected before performance work begins.
+- verify controlled structural corruption is detected before performance work begins,
+- compile a separate optimized target only after the correctness gate,
+- enforce mutually exclusive correctness/optimized build markers,
+- keep the optimized build warning-clean under `-O3 -DNDEBUG -Werror`,
+- validate optimized output against a correctness-baseline golden outcome, and
+- replay deterministic optimized workloads without per-operation debug validation.
 
 At this commit, the program intentionally does **not** implement:
 
@@ -6481,6 +6859,10 @@ timing or alter any cache data-structure complexity.
 Stage 22 changes no production asymptotic complexity. Its per-operation integrated
 validator is intentionally correctness-oriented debug overhead and must be excluded
 from later performance measurements.
+
+Stage 23 changes compiler configuration only. The optimized workload path omits the
+Stage 22 per-operation debug validator and verifies final state instead, but this stage
+still reports no timing or performance result.
 
 ---
 
@@ -6840,4 +7222,21 @@ CONTROLLED-CORRUPTION DETECTION PASS
 ASAN PASS
 UBSAN PASS
 NO TIMING/OPTIMIZATION INTRODUCED
+
+
+Stage 23
+Optimized build second
+COMPLETE
+CORRECTNESS BUILD REGRESSION PASS
+OPTIMIZED -O3 BUILD PASS
+NDEBUG BUILD PASS
+-WERROR OPTIMIZED BUILD PASS
+BUILD-MARKER EXCLUSION PASS
+OPTIMIZATION-MARKER PASS
+GOLDEN-STATS EQUIVALENCE PASS
+GOLDEN-RESIDENT-STATE PASS
+GOLDEN-HEAP-MINIMUM PASS
+OPTIMIZED REPLAY PASS
+FINAL INVARIANT VALIDATION PASS
+NO TIMING/BENCHMARK INTRODUCED
 ```
