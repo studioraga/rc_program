@@ -4867,6 +4867,504 @@ int stage20_run_statistics_tests(void)
     return passed;
 }
 
+
+
+/* ---------- Stage 21: add deterministic workload generation ---------- */
+
+/*
+ * Stage 21 adds a reproducible workload stream for future correctness and
+ * performance experiments. It deliberately does not add timing or benchmarking.
+ *
+ * The generator uses a fixed 64-bit linear congruential generator (LCG) with
+ * unsigned wraparound semantics defined by C. Given the same seed, key-space,
+ * and operation count, it produces the same sequence on every conforming
+ * implementation with uint64_t.
+ */
+
+typedef struct {
+    uint64_t initial_seed;
+    uint64_t state;
+    CacheKey key_space;
+} WorkloadGenerator;
+
+typedef struct {
+    CacheKey key;
+    Part2RankScenario scenario;
+} WorkloadOp;
+
+int workload_generator_init(WorkloadGenerator *generator,
+                            uint64_t seed,
+                            CacheKey key_space)
+{
+    if (generator == NULL || key_space == 0ULL) {
+        return 0;
+    }
+
+    generator->initial_seed = seed;
+    generator->state = seed;
+    generator->key_space = key_space;
+    return 1;
+}
+
+void workload_generator_reset(WorkloadGenerator *generator)
+{
+    if (generator == NULL) {
+        return;
+    }
+
+    generator->state = generator->initial_seed;
+}
+
+uint64_t workload_generator_next_u64(WorkloadGenerator *generator)
+{
+    if (generator == NULL) {
+        return 0U;
+    }
+
+    /*
+     * PCG-family LCG constants. Stage 21 uses only the deterministic LCG
+     * state transition; no platform-dependent rand()/random() API is used.
+     */
+    generator->state =
+        generator->state * UINT64_C(6364136223846793005) +
+        UINT64_C(1442695040888963407);
+
+    return generator->state;
+}
+
+int workload_generator_next(WorkloadGenerator *generator,
+                            WorkloadOp *operation)
+{
+    uint64_t key_bits;
+    uint64_t scenario_bits;
+
+    if (generator == NULL ||
+        operation == NULL ||
+        generator->key_space == 0ULL) {
+        return 0;
+    }
+
+    key_bits = workload_generator_next_u64(generator);
+    scenario_bits = workload_generator_next_u64(generator);
+
+    operation->key =
+        (CacheKey)(key_bits % (uint64_t)generator->key_space) + 1ULL;
+    operation->scenario =
+        (Part2RankScenario)(scenario_bits % 3U);
+
+    return 1;
+}
+
+int workload_generate(WorkloadGenerator *generator,
+                      WorkloadOp operations[],
+                      size_t count)
+{
+    size_t i;
+
+    if (generator == NULL ||
+        (operations == NULL && count != 0U)) {
+        return 0;
+    }
+
+    for (i = 0U; i < count; ++i) {
+        if (!workload_generator_next(generator, &operations[i])) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+int workload_operation_equal(const WorkloadOp *a,
+                             const WorkloadOp *b)
+{
+    return a != NULL &&
+           b != NULL &&
+           a->key == b->key &&
+           a->scenario == b->scenario;
+}
+
+/*
+ * Test-only executor used to prove that deterministic generation produces
+ * deterministic cache behavior and Stage 20 statistics.
+ *
+ * This is not a benchmark runner: it records no wall-clock time.
+ */
+int stage21_execute_generated_workload(Part1Cache *cache,
+                                       uint64_t seed,
+                                       CacheKey key_space,
+                                       size_t operation_count)
+{
+    WorkloadGenerator generator;
+    Stage19RankContext rank_context;
+    WorkloadOp operation;
+    size_t i;
+
+    if (cache == NULL ||
+        !workload_generator_init(&generator, seed, key_space)) {
+        return 0;
+    }
+
+    for (i = 0U; i < operation_count; ++i) {
+        if (!workload_generator_next(&generator, &operation)) {
+            return 0;
+        }
+
+        rank_context.scenario = operation.scenario;
+        rank_context.calls = 0U;
+
+        if (part2_cache_get(cache,
+                            operation.key,
+                            stage19_rank_provider,
+                            &rank_context) == NULL) {
+            return 0;
+        }
+    }
+
+    return part1_cache_validate(cache);
+}
+
+int stage21_stats_equal(CacheStats a, CacheStats b)
+{
+    return a.accesses == b.accesses &&
+           a.hits == b.hits &&
+           a.misses == b.misses &&
+           a.db_reads == b.db_reads &&
+           a.insertions == b.insertions &&
+           a.evictions == b.evictions &&
+           a.rank_provider_calls == b.rank_provider_calls &&
+           a.rank_updates == b.rank_updates &&
+           a.rank_decreases == b.rank_decreases &&
+           a.rank_unchanged == b.rank_unchanged &&
+           a.rank_increases == b.rank_increases;
+}
+
+int stage21_cache_logical_state_equal(const Part1Cache *a,
+                                      const Part1Cache *b,
+                                      CacheKey key_space)
+{
+    CacheKey key;
+
+    if (a == NULL ||
+        b == NULL ||
+        a->size != b->size ||
+        a->capacity != b->capacity ||
+        a->min_heap.size != b->min_heap.size) {
+        return 0;
+    }
+
+    for (key = 1ULL; key <= key_space; ++key) {
+        CacheEntry *entry_a = part1_cache_lookup(a, key);
+        CacheEntry *entry_b = part1_cache_lookup(b, key);
+
+        if ((entry_a == NULL) != (entry_b == NULL)) {
+            return 0;
+        }
+
+        if (entry_a != NULL &&
+            (entry_a->key != entry_b->key ||
+             entry_a->value != entry_b->value ||
+             entry_a->rank != entry_b->rank)) {
+            return 0;
+        }
+    }
+
+    if (a->min_heap.size != 0U) {
+        CacheEntry *min_a = min_heap_peek(&a->min_heap);
+        CacheEntry *min_b = min_heap_peek(&b->min_heap);
+
+        if (min_a == NULL ||
+            min_b == NULL ||
+            min_a->key != min_b->key ||
+            min_a->rank != min_b->rank) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+int stage21_test_golden_sequence(void)
+{
+    static const WorkloadOp expected[] = {
+        {16ULL, PART2_RANK_UNCHANGED},
+        {10ULL, PART2_RANK_INCREASE},
+        {4ULL,  PART2_RANK_UNCHANGED},
+        {14ULL, PART2_RANK_INCREASE},
+        {8ULL,  PART2_RANK_UNCHANGED},
+        {2ULL,  PART2_RANK_INCREASE},
+        {12ULL, PART2_RANK_DECREASE},
+        {6ULL,  PART2_RANK_INCREASE}
+    };
+    WorkloadGenerator generator;
+    WorkloadOp actual[sizeof(expected) / sizeof(expected[0])];
+    size_t i;
+    int passed = 1;
+
+    printf("\n[Stage 21] fixed-seed golden workload sequence\n");
+
+    passed &= check(workload_generator_init(
+                        &generator,
+                        UINT64_C(0x123456789abcdef0),
+                        16ULL),
+                    "initialize golden workload generator");
+
+    passed &= check(workload_generate(
+                        &generator,
+                        actual,
+                        sizeof(actual) / sizeof(actual[0])),
+                    "generate golden workload operations");
+
+    for (i = 0U; i < sizeof(expected) / sizeof(expected[0]); ++i) {
+        passed &= check(workload_operation_equal(&actual[i], &expected[i]),
+                        "generated operation matches golden sequence");
+    }
+
+    return passed;
+}
+
+int stage21_test_same_seed_replay(void)
+{
+    WorkloadGenerator a;
+    WorkloadGenerator b;
+    WorkloadOp ops_a[64];
+    WorkloadOp ops_b[64];
+    size_t i;
+    int passed = 1;
+
+    printf("\n[Stage 21] same seed reproduces the same workload\n");
+
+    passed &= check(workload_generator_init(
+                        &a, UINT64_C(0xfeedface12345678), 32ULL),
+                    "initialize first same-seed generator");
+    passed &= check(workload_generator_init(
+                        &b, UINT64_C(0xfeedface12345678), 32ULL),
+                    "initialize second same-seed generator");
+
+    passed &= check(workload_generate(&a, ops_a, 64U),
+                    "generate first same-seed stream");
+    passed &= check(workload_generate(&b, ops_b, 64U),
+                    "generate second same-seed stream");
+
+    for (i = 0U; i < 64U; ++i) {
+        passed &= check(workload_operation_equal(&ops_a[i], &ops_b[i]),
+                        "same seed produces identical operation");
+    }
+
+    return passed;
+}
+
+int stage21_test_different_seeds_diverge(void)
+{
+    WorkloadGenerator a;
+    WorkloadGenerator b;
+    WorkloadOp op_a;
+    WorkloadOp op_b;
+    size_t i;
+    int difference_seen = 0;
+    int passed = 1;
+
+    printf("\n[Stage 21] different seeds diverge\n");
+
+    passed &= check(workload_generator_init(&a, UINT64_C(1), 64ULL),
+                    "initialize seed-1 generator");
+    passed &= check(workload_generator_init(&b, UINT64_C(2), 64ULL),
+                    "initialize seed-2 generator");
+
+    for (i = 0U; i < 32U; ++i) {
+        passed &= check(workload_generator_next(&a, &op_a) &&
+                        workload_generator_next(&b, &op_b),
+                        "generate different-seed operations");
+
+        if (!workload_operation_equal(&op_a, &op_b)) {
+            difference_seen = 1;
+        }
+    }
+
+    passed &= check(difference_seen,
+                    "different seeds produce a different workload stream");
+
+    return passed;
+}
+
+int stage21_test_bounds_and_scenarios(void)
+{
+    WorkloadGenerator generator;
+    WorkloadOp operation;
+    size_t i;
+    uint64_t scenario_counts[3] = {0U, 0U, 0U};
+    int passed = 1;
+
+    printf("\n[Stage 21] generated keys and scenarios stay in bounds\n");
+
+    passed &= check(workload_generator_init(
+                        &generator,
+                        UINT64_C(0x1020304050607080),
+                        17ULL),
+                    "initialize bounded generator");
+
+    for (i = 0U; i < 1000U; ++i) {
+        passed &= check(workload_generator_next(&generator, &operation),
+                        "generate bounded workload operation");
+
+        passed &= check(operation.key >= 1ULL &&
+                        operation.key <= 17ULL,
+                        "generated key is within configured key space");
+
+        passed &= check(operation.scenario >= PART2_RANK_DECREASE &&
+                        operation.scenario <= PART2_RANK_INCREASE,
+                        "generated rank scenario is valid");
+
+        if (operation.scenario >= PART2_RANK_DECREASE &&
+            operation.scenario <= PART2_RANK_INCREASE) {
+            ++scenario_counts[(size_t)operation.scenario];
+        }
+    }
+
+    passed &= check(scenario_counts[PART2_RANK_DECREASE] > 0U &&
+                    scenario_counts[PART2_RANK_UNCHANGED] > 0U &&
+                    scenario_counts[PART2_RANK_INCREASE] > 0U,
+                    "bounded stream exercises all three rank scenarios");
+
+    return passed;
+}
+
+int stage21_test_reset_replays_stream(void)
+{
+    WorkloadGenerator generator;
+    WorkloadOp first[32];
+    WorkloadOp replay[32];
+    size_t i;
+    int passed = 1;
+
+    printf("\n[Stage 21] reset replays the original stream\n");
+
+    passed &= check(workload_generator_init(
+                        &generator,
+                        UINT64_C(0x0ddc0ffeebadf00d),
+                        25ULL),
+                    "initialize reset/replay generator");
+
+    passed &= check(workload_generate(&generator, first, 32U),
+                    "generate pre-reset stream");
+
+    workload_generator_reset(&generator);
+
+    passed &= check(workload_generate(&generator, replay, 32U),
+                    "generate post-reset stream");
+
+    for (i = 0U; i < 32U; ++i) {
+        passed &= check(workload_operation_equal(&first[i], &replay[i]),
+                        "reset reproduces original operation");
+    }
+
+    return passed;
+}
+
+int stage21_test_invalid_generator_arguments(void)
+{
+    WorkloadGenerator generator;
+    WorkloadOp operation;
+    int passed = 1;
+
+    printf("\n[Stage 21] invalid generator arguments are rejected\n");
+
+    passed &= check(!workload_generator_init(NULL, 1U, 8ULL),
+                    "NULL generator initialization is rejected");
+    passed &= check(!workload_generator_init(&generator, 1U, 0ULL),
+                    "zero key space is rejected");
+
+    passed &= check(workload_generator_init(&generator, 1U, 8ULL),
+                    "initialize valid argument-test generator");
+
+    passed &= check(!workload_generator_next(NULL, &operation),
+                    "NULL generator next operation is rejected");
+    passed &= check(!workload_generator_next(&generator, NULL),
+                    "NULL operation output is rejected");
+
+    passed &= check(workload_generate(&generator, NULL, 0U),
+                    "zero-count generation accepts NULL output");
+    passed &= check(!workload_generate(&generator, NULL, 1U),
+                    "nonzero generation rejects NULL output");
+
+    return passed;
+}
+
+int stage21_test_deterministic_execution_and_statistics(void)
+{
+    Part1Cache first;
+    Part1Cache second;
+    CacheStats first_stats;
+    CacheStats second_stats;
+    const uint64_t seed = UINT64_C(0x3141592653589793);
+    const CacheKey key_space = 16ULL;
+    const size_t operation_count = 200U;
+    int passed = 1;
+
+    printf("\n[Stage 21] deterministic workload reproduces cache state and statistics\n");
+
+    passed &= check(part1_cache_init(&first, 8U),
+                    "initialize first workload-execution cache");
+    passed &= check(part1_cache_init(&second, 8U),
+                    "initialize second workload-execution cache");
+
+    passed &= check(stage21_execute_generated_workload(
+                        &first, seed, key_space, operation_count),
+                    "execute first deterministic workload");
+    passed &= check(stage21_execute_generated_workload(
+                        &second, seed, key_space, operation_count),
+                    "execute replayed deterministic workload");
+
+    first_stats = part1_cache_stats_snapshot(&first);
+    second_stats = part1_cache_stats_snapshot(&second);
+
+    passed &= check(stage21_stats_equal(first_stats, second_stats),
+                    "replayed workload produces identical statistics");
+
+    passed &= check(first_stats.accesses == operation_count &&
+                    second_stats.accesses == operation_count,
+                    "workload statistics record exact operation count");
+
+    passed &= check(stage21_cache_logical_state_equal(
+                        &first, &second, key_space),
+                    "replayed workload produces identical logical cache state");
+
+    passed &= check(part1_cache_validate(&first) &&
+                    part1_cache_validate(&second),
+                    "both replayed caches satisfy integrated invariants");
+
+    return passed;
+}
+
+int stage21_run_deterministic_workload_tests(void)
+{
+    int passed = 1;
+
+    printf("\n=== Stage 21: add deterministic workload generation ===\n");
+
+    passed &= stage21_test_golden_sequence();
+    passed &= stage21_test_same_seed_replay();
+    passed &= stage21_test_different_seeds_diverge();
+    passed &= stage21_test_bounds_and_scenarios();
+    passed &= stage21_test_reset_replays_stream();
+    passed &= stage21_test_invalid_generator_arguments();
+    passed &= stage21_test_deterministic_execution_and_statistics();
+
+    printf("\nStage 21 findings:\n");
+    printf("  workload generation uses a fixed 64-bit LCG, not platform rand().\n");
+    printf("  the same seed/key-space/count reproduces the same operation stream.\n");
+    printf("  a fixed seed is protected by an explicit golden operation sequence.\n");
+    printf("  generated keys stay inside the configured key space.\n");
+    printf("  generated operations cover decrease/equal/increase rank scenarios.\n");
+    printf("  reset replays the stream from its original seed.\n");
+    printf("  replayed workloads reproduce cache statistics and logical cache state.\n");
+    printf("Stage 21 boundary: generation is deterministic; no timing benchmark is added.\n");
+    printf("Stage 21 deterministic-workload validation: %s\n",
+           passed ? "PASS" : "FAIL");
+
+    return passed;
+}
+
 int main(void)
 {
     Cache cache;
@@ -5040,7 +5538,12 @@ int main(void)
 
     all_passed &= stage20_run_statistics_tests();
 
-    printf("\nStage 20 validation: %s\n",
+    printf("\nStage 20 regression validation: %s\n",
+           all_passed ? "PASS" : "FAIL");
+
+    all_passed &= stage21_run_deterministic_workload_tests();
+
+    printf("\nStage 21 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;

@@ -5586,6 +5586,346 @@ It adds deterministic counters and snapshot/reset APIs only.
 
 ---
 
+## Stage 21 — Add Deterministic Workload Generation
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 21 adds a reproducible workload generator for future correctness and performance experiments.
+
+It deliberately does **not** add timing or benchmarking.
+
+The generator produces two fields per operation:
+
+```c
+typedef struct {
+    CacheKey key;
+    Part2RankScenario scenario;
+} WorkloadOp;
+```
+
+The key is bounded to a configured key space:
+
+```text
+1 .. key_space
+```
+
+and the scenario is one of:
+
+```text
+PART2_RANK_DECREASE
+PART2_RANK_UNCHANGED
+PART2_RANK_INCREASE
+```
+
+### Generator state
+
+```c
+typedef struct {
+    uint64_t initial_seed;
+    uint64_t state;
+    CacheKey key_space;
+} WorkloadGenerator;
+```
+
+Stage 21 uses a fixed 64-bit linear congruential generator rather than `rand()` or another platform library PRNG.
+
+The state transition is:
+
+```c
+state =
+    state * UINT64_C(6364136223846793005) +
+    UINT64_C(1442695040888963407);
+```
+
+Unsigned 64-bit wraparound is defined by C, so the same initial state produces the same state sequence on conforming implementations.
+
+Each `WorkloadOp` consumes two generator outputs:
+
+```text
+first output  -> key
+second output -> Part 2 rank scenario
+```
+
+The key mapping is:
+
+```c
+key = (random_value % key_space) + 1;
+```
+
+The scenario mapping is:
+
+```c
+scenario = random_value % 3;
+```
+
+### Generator APIs
+
+Stage 21 adds:
+
+```c
+workload_generator_init()
+workload_generator_reset()
+workload_generator_next_u64()
+workload_generator_next()
+workload_generate()
+```
+
+`workload_generator_reset()` restores the original seed so the same generator can replay the exact original stream.
+
+---
+
+## Golden deterministic sequence
+
+For:
+
+```text
+seed      = 0x123456789abcdef0
+key_space = 16
+count     = 8
+```
+
+the required golden sequence is:
+
+```text
+operation  key  scenario
+
+1          16   UNCHANGED
+2          10   INCREASE
+3           4   UNCHANGED
+4          14   INCREASE
+5           8   UNCHANGED
+6           2   INCREASE
+7          12   DECREASE
+8           6   INCREASE
+```
+
+This exact sequence is checked in the Stage 21 tests.
+
+The golden sequence protects the generator contract from accidental future changes to:
+
+- PRNG constants,
+- number of PRNG draws per operation,
+- key mapping,
+- scenario mapping.
+
+---
+
+## Stage 21 Validation
+
+### Test 1 — fixed-seed golden sequence
+
+Generate the first eight operations with the golden seed and compare every operation against the fixed expected vector.
+
+### Test 2 — same seed produces the same stream
+
+Two independent generators are initialized with:
+
+```text
+seed      = 0xfeedface12345678
+key_space = 32
+```
+
+Both generate 64 operations.
+
+Every corresponding `WorkloadOp` must be identical.
+
+### Test 3 — different seeds diverge
+
+Generators initialized with seed `1` and seed `2` produce 32 operations.
+
+At least one operation must differ.
+
+### Test 4 — bounded keys and valid scenarios
+
+Generate 1000 operations with:
+
+```text
+key_space = 17
+```
+
+Every key must satisfy:
+
+```text
+1 <= key <= 17
+```
+
+Every scenario must be one of the three valid Part 2 scenarios.
+
+The test also verifies that the generated sample contains all three scenario classes.
+
+### Test 5 — reset and replay
+
+Generate 32 operations, reset the generator, and generate 32 more.
+
+The two streams must match operation-for-operation.
+
+### Test 6 — invalid arguments
+
+Stage 21 rejects:
+
+```text
+NULL generator initialization
+zero key space
+NULL generator for next operation
+NULL operation output
+NULL output with nonzero bulk-generation count
+```
+
+A zero-count bulk generation with a `NULL` output pointer is accepted because no output storage is required.
+
+### Test 7 — deterministic execution and statistics
+
+Two independent integrated caches are initialized identically.
+
+Each executes:
+
+```text
+seed            = 0x3141592653589793
+key_space       = 16
+operation_count = 200
+cache capacity  = 8
+```
+
+using the generated Part 2 operations.
+
+The two runs must produce:
+
+```text
+identical CacheStats
+identical access count = 200
+identical resident key/rank state
+identical heap minimum
+valid integrated cache invariants
+```
+
+This validates that deterministic workload generation reproduces not only the operation stream but also the observable cache outcome.
+
+No wall-clock time is captured.
+
+---
+
+## Stage 21 Complexity
+
+Per generated operation:
+
+```text
+two fixed-width integer state transitions
+two modulo operations
+one WorkloadOp write
+```
+
+Therefore:
+
+```text
+workload_generator_next()    O(1)
+generate N operations        O(N)
+generator reset              O(1)
+```
+
+Memory use is:
+
+```text
+O(1)
+```
+
+for streaming generation, or:
+
+```text
+O(N)
+```
+
+only when the caller chooses to store N generated operations.
+
+---
+
+## Stage 21 Build and Validation
+
+### Normal build
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    ranked_cache.c \
+    -o ranked_cache21
+
+./ranked_cache21
+```
+
+Expected Stage 21 ending:
+
+```text
+Stage 21 findings:
+  workload generation uses a fixed 64-bit LCG, not platform rand().
+  the same seed/key-space/count reproduces the same operation stream.
+  a fixed seed is protected by an explicit golden operation sequence.
+  generated keys stay inside the configured key space.
+  generated operations cover decrease/equal/increase rank scenarios.
+  reset replays the stream from its original seed.
+  replayed workloads reproduce cache statistics and logical cache state.
+Stage 21 boundary: generation is deterministic; no timing benchmark is added.
+Stage 21 deterministic-workload validation: PASS
+
+Stage 21 validation: PASS
+```
+
+### UndefinedBehaviorSanitizer
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fsanitize=undefined \
+    ranked_cache.c \
+    -o ranked_cache21_ubsan
+
+./ranked_cache21_ubsan
+```
+
+### AddressSanitizer + UndefinedBehaviorSanitizer
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fsanitize=address,undefined \
+    ranked_cache.c \
+    -o ranked_cache21_san
+
+./ranked_cache21_san
+```
+
+Both sanitizer builds pass.
+
+---
+
+### Stage 21 boundary
+
+Stage 21 deliberately does **not** add:
+
+- wall-clock timing,
+- throughput calculations,
+- latency calculations,
+- benchmark warmup,
+- randomized nondeterministic seeds,
+- workload persistence,
+- command-line workload configuration,
+- concurrency.
+
+It adds deterministic workload generation and replay only.
+
+---
+
 ## Build Environment
 
 Current target environment:
@@ -5597,7 +5937,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache20
+gcc -Wall -Wextra -Wpedantic -std=c11 ranked_cache.c -o ranked_cache21
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -5613,22 +5953,22 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache20
+./ranked_cache21
 ```
 
 ### Expected result
 
-The active Stage 20 test suite must end with:
+The active Stage 21 test suite must end with:
 
 ```text
-Stage 20 validation: PASS
+Stage 21 validation: PASS
 ```
 
 The Stage 10 Part 1 path combines the hash table and min-heap while preserving the earlier linear cache as a regression/reference implementation.
 
 ### Validation result
 
-Stages 0 through 20 have been validated successfully. The normal build, UBSan build, and combined ASan/UBSan build all pass for Stage 20.
+Stages 0 through 21 have been validated successfully. The normal build, UBSan build, and combined ASan/UBSan build all pass for Stage 21.
 
 ---
 
@@ -5703,7 +6043,12 @@ At this commit, the program can:
 - expose Part 2 rank-provider and rank-direction counters,
 - reset statistics without changing cache state,
 - snapshot statistics without mutating counters, and
-- verify Part 2 delegated misses are counted exactly once.
+- verify Part 2 delegated misses are counted exactly once,
+- generate reproducible key/scenario workload operations from a fixed seed,
+- replay an identical workload by resetting or reusing the same seed,
+- validate a fixed golden operation sequence,
+- verify generated key/scenario bounds, and
+- reproduce identical cache statistics and logical state from identical workloads.
 
 At this commit, the program intentionally does **not** implement:
 
@@ -5797,6 +6142,9 @@ and dynamic hit repair is O(log N) worst case, excluding the external rank-provi
 
 Stage 20 adds only O(1) counter updates around those existing operation boundaries.
 It does not change any lookup, heap, insertion, or eviction asymptotic complexity.
+
+Stage 21 adds O(1) deterministic generation work per operation. It does not add
+timing or alter any cache data-structure complexity.
 
 ---
 
@@ -6116,6 +6464,25 @@ RANK-PROVIDER COUNTER PASS
 RANK-DIRECTION COUNTERS PASS
 PART2 MISS SINGLE-COUNT PASS
 SNAPSHOT NON-MUTATING PASS
+INTEGRATED VALIDATOR PASS
+UBSAN PASS
+ASAN/UBSAN PASS
+
+
+Stage 21
+Add deterministic workload generation
+COMPLETE
+BUILD PASS
+RUN PASS
+GOLDEN-SEQUENCE PASS
+SAME-SEED REPLAY PASS
+DIFFERENT-SEED DIVERGENCE PASS
+KEY-BOUND PASS
+SCENARIO-BOUND PASS
+RESET-REPLAY PASS
+INVALID-ARGUMENT PASS
+DETERMINISTIC-STATS PASS
+DETERMINISTIC-CACHE-STATE PASS
 INTEGRATED VALIDATOR PASS
 UBSAN PASS
 ASAN/UBSAN PASS
