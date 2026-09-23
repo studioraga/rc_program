@@ -7513,6 +7513,409 @@ It benchmarks the existing dynamic-rank implementations only.
 
 ---
 
+## Stage 26 — Benchmark Scaling
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 24 benchmarked fixed-rank behavior at one maximum-capacity point.
+
+Stage 25 benchmarked dynamic-rank behavior at one maximum-capacity point.
+
+Stage 26 now measures how both comparisons evolve as cache capacity changes.
+
+No new cache algorithm or optimization is introduced.
+
+The scaling points are:
+
+```text
+capacity = 10
+capacity = 25
+capacity = 50
+capacity = 75
+capacity = 100
+```
+
+For every point:
+
+```text
+key_space = 2 * capacity
+```
+
+This keeps the workload shape comparable while increasing the resident-set size.
+
+Stage 26 runs both:
+
+```text
+fixed rank:
+    linear reference
+    vs.
+    integrated Part1Cache
+
+dynamic rank:
+    linear dynamic reference
+    vs.
+    indexed Part 2
+```
+
+---
+
+## Stage 26 Scaling Configuration
+
+```text
+capacities      = 10, 25, 50, 75, 100
+key space       = 2x capacity
+warmup ops      = 10,000
+measured ops    = 100,000
+repetitions     = 3
+```
+
+Fixed-rank seed:
+
+```text
+0x94d049bb133111eb + capacity
+```
+
+Dynamic-rank seed:
+
+```text
+0x2545f4914f6cdd1d + capacity
+```
+
+Adding capacity to the fixed base seed gives each scale point a deterministic but distinct workload.
+
+---
+
+## Parameterized Benchmark Helpers
+
+Earlier Stage 24/25 workload runners used the single benchmark capacity `100`.
+
+Stage 26 adds parameterized helpers:
+
+```c
+stage26_run_linear_fixed_workload()
+stage26_run_part1_fixed_workload()
+
+stage26_run_linear_dynamic_workload()
+stage26_run_part2_dynamic_workload()
+```
+
+Each helper receives:
+
+```c
+size_t capacity
+```
+
+explicitly.
+
+The production cache algorithms are unchanged.
+
+---
+
+## Scaling Correctness Guards
+
+Before timing is accepted, Stage 26 validates every scale point independently.
+
+### Fixed rank
+
+For capacity:
+
+```text
+10
+25
+50
+75
+100
+```
+
+the linear and Part1 implementations must produce:
+
+```text
+identical checksum
+identical final key/value/rank state
+valid cache invariants
+```
+
+### Dynamic rank
+
+The linear dynamic and indexed Part 2 implementations must produce:
+
+```text
+identical checksum
+identical CacheStats
+identical final key/value/rank state
+valid cache invariants
+```
+
+The dynamic statistics comparison includes:
+
+```text
+accesses
+hits
+misses
+db_reads
+insertions
+evictions
+rank_provider_calls
+rank_updates
+rank_decreases
+rank_unchanged
+rank_increases
+```
+
+The same equivalence checks run in the correctness build before the optimized scaling measurements.
+
+---
+
+## Stage 26 Correctness Build
+
+Re-run the correctness gate:
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -Werror \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fno-omit-frame-pointer \
+    -DRANKED_CACHE_CORRECTNESS_BUILD=1 \
+    -fsanitize=address,undefined \
+    ranked_cache.c \
+    -o ranked_cache26_correctness
+```
+
+Run:
+
+```bash
+ASAN_OPTIONS=detect_leaks=1 \
+UBSAN_OPTIONS=halt_on_error=1 \
+./ranked_cache26_correctness
+```
+
+The Stage 26 semantic-equivalence matrix must pass at every capacity.
+
+The wall-clock scaling benchmark is skipped in the non-optimized correctness build.
+
+---
+
+## Stage 26 Optimized Build
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -Werror \
+    -std=c11 \
+    -O3 \
+    -DNDEBUG \
+    -DRANKED_CACHE_OPTIMIZED_BUILD=1 \
+    ranked_cache.c \
+    -o ranked_cache26_optimized
+```
+
+Run:
+
+```bash
+./ranked_cache26_optimized
+```
+
+The optimized run prints one row per capacity:
+
+```text
+capacity
+key space
+fixed linear median ns/op
+fixed Part1 median ns/op
+dynamic linear median ns/op
+dynamic Part2 median ns/op
+fixed linear/Part1 ratio
+dynamic linear/Part2 ratio
+```
+
+No ratio is used as a PASS/FAIL threshold.
+
+---
+
+## Stage 26 Observed Scaling Result in the Validation Sandbox
+
+One optimized validation run produced:
+
+| Capacity | Key space | Fixed linear ns/op | Fixed Part1 ns/op | Dynamic linear ns/op | Dynamic Part2 ns/op | Fixed ratio | Dynamic ratio |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 20 | 17.07 | 61.15 | 15.09 | 11.64 | 0.279x | 1.297x |
+| 25 | 50 | 33.69 | 99.71 | 17.66 | 11.11 | 0.338x | 1.589x |
+| 50 | 100 | 64.66 | 172.72 | 25.02 | 11.42 | 0.374x | 2.190x |
+| 75 | 150 | 96.28 | 237.85 | 32.88 | 11.32 | 0.405x | 2.906x |
+| 100 | 200 | 135.51 | 307.58 | 37.80 | 11.70 | 0.441x | 3.231x |
+
+Interpretation for this validation host:
+
+### Fixed rank
+
+Within the current maximum:
+
+```text
+N <= 100
+```
+
+the contiguous linear implementation remains faster.
+
+Its cost rises strongly with capacity:
+
+```text
+17.07 ns/op at N=10
+135.51 ns/op at N=100
+```
+
+The integrated Part1 implementation also rises:
+
+```text
+61.15 ns/op at N=10
+307.58 ns/op at N=100
+```
+
+At these small sizes, its additional hashing, pointer chasing, heap work, and metadata overhead still dominate.
+
+Stage 26 therefore does not claim a fixed-rank crossover inside the tested range.
+
+### Dynamic rank
+
+The dynamic result shows a different trend.
+
+Linear dynamic cost grows from:
+
+```text
+15.09 ns/op at N=10
+```
+
+to:
+
+```text
+37.80 ns/op at N=100
+```
+
+while indexed Part 2 remains roughly:
+
+```text
+11-12 ns/op
+```
+
+across the tested range.
+
+The median ratio therefore increases:
+
+```text
+N=10   -> 1.297x
+N=25   -> 1.589x
+N=50   -> 2.190x
+N=75   -> 2.906x
+N=100  -> 3.231x
+```
+
+This validation host therefore shows the indexed dynamic-rank path becoming increasingly favorable as resident capacity grows.
+
+This is consistent with the structural design:
+
+```text
+linear dynamic hit:
+    O(N) lookup
+
+indexed Part 2 hit:
+    expected O(1) hash lookup
+    +
+    O(log N) rank repair worst case
+```
+
+These numbers remain environment-specific observations.
+
+They are not universal crossover points and must be rerun on Node1 for authoritative project evidence.
+
+---
+
+## Stage 26 Measurement Discipline
+
+Stage 26 preserves the benchmark rules established in Stages 24 and 25:
+
+```text
+deterministic pre-generated workloads
+warmup outside measured interval
+fresh caches for each measured repetition
+alternating execution order
+CLOCK_MONOTONIC
+median of repeated runs
+checksum guard
+final-state guard
+statistics guard for dynamic rank
+no performance threshold in correctness PASS/FAIL
+```
+
+The benchmark does not infer complexity from timing alone.
+
+The timing table is interpreted together with the earlier exact-operation and data-structure analysis.
+
+---
+
+## Stage 26 Complexity Context
+
+Expected structural behavior:
+
+```text
+fixed linear lookup:
+    O(N)
+
+fixed integrated lookup:
+    expected O(1)
+
+fixed integrated insertion/eviction:
+    O(log N)
+
+dynamic linear hit:
+    O(N)
+
+dynamic indexed hit:
+    expected O(1) lookup
+    +
+    O(log N) repair worst case
+```
+
+The tested capacity is still bounded by:
+
+```c
+MAX_CACHE_CAPACITY = 100
+```
+
+so Stage 26 does not extrapolate beyond `N=100`.
+
+A larger-scale benchmark would require a later architectural change to the fixed-size maximum and is intentionally outside this stage.
+
+---
+
+### Stage 26 boundary
+
+Stage 26 deliberately does **not** add:
+
+- capacities above `MAX_CACHE_CAPACITY`,
+- new cache algorithms,
+- new hash-table design,
+- heap optimization,
+- CPU affinity,
+- `perf`,
+- hardware counters,
+- `-march=native`,
+- LTO,
+- PGO,
+- multithreading,
+- automatic crossover detection,
+- curve fitting,
+- benchmark-result persistence.
+
+It adds scaling measurements only for the already implemented cache designs.
+
+---
+
 ## Build Environment
 
 Current target environment:
@@ -7524,7 +7927,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -Werror -std=c11 -O3 -DNDEBUG -DRANKED_CACHE_OPTIMIZED_BUILD=1 ranked_cache.c -o ranked_cache25_optimized
+gcc -Wall -Wextra -Wpedantic -Werror -std=c11 -O3 -DNDEBUG -DRANKED_CACHE_OPTIMIZED_BUILD=1 ranked_cache.c -o ranked_cache26_optimized
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -7540,22 +7943,22 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache25_optimized
+./ranked_cache26_optimized
 ```
 
 ### Expected result
 
-The active Stage 25 dynamic-rank benchmark suite must end with:
+The active Stage 26 scaling benchmark suite must end with:
 
 ```text
-Stage 25 validation: PASS
+Stage 26 validation: PASS
 ```
 
 The Stage 10 Part 1 path combines the hash table and min-heap while preserving the earlier linear cache as a regression/reference implementation.
 
 ### Validation result
 
-Stages 0 through 25 have been validated successfully. The Stage 22 correctness build still passes with assertions and ASan/UBSan, the Stage 23 optimized build still passes, Stage 24 fixed-rank benchmarking remains a regression, and Stage 25 adds a deterministic dynamic-rank benchmark with checksum/statistics/state guards and median CLOCK_MONOTONIC timing.
+Stages 0 through 26 have been validated successfully. The Stage 22 correctness build still passes with assertions and ASan/UBSan, the Stage 23 optimized build still passes, Stage 24 and Stage 25 benchmarks remain regressions, and Stage 26 adds deterministic fixed/dynamic scaling measurements across capacities 10, 25, 50, 75, and 100.
 
 ---
 
@@ -7654,7 +8057,11 @@ At this commit, the program can:
 - use the same pre-generated key/scenario stream for both dynamic implementations,
 - require dynamic benchmark checksum, CacheStats, final-state, and invariant equivalence,
 - alternate dynamic benchmark execution order across five repetitions, and
-- report median dynamic-rank nanoseconds per operation without using speed as a PASS threshold.
+- report median dynamic-rank nanoseconds per operation without using speed as a PASS threshold,
+- benchmark fixed-rank and dynamic-rank behavior across capacities 10, 25, 50, 75, and 100,
+- hold key space at 2x capacity for each scaling point,
+- require semantic equivalence independently at every capacity, and
+- report median scaling tables without treating any crossover or ratio as correctness criteria.
 
 At this commit, the program intentionally does **not** implement:
 
@@ -7766,6 +8173,10 @@ Measured values are observational only and never determine correctness PASS/FAIL
 Stage 25 extends the same timing discipline to dynamic rank. It compares a linear
 dynamic reference against the existing indexed Part 2 path while requiring exact
 statistics and logical-state equivalence before accepting each timing sample.
+
+Stage 26 varies resident capacity while preserving deterministic workload shape. It
+does not change asymptotic complexity; it measures how observed constant factors and
+growth trends evolve from capacity 10 through the current maximum of 100.
 
 ---
 
@@ -8177,4 +8588,25 @@ WARMUP-OUTSIDE-MEASUREMENT PASS
 5-REPEAT DYNAMIC BENCHMARK PASS
 MEDIAN NS/OP REPORT PASS
 NO FURTHER OPTIMIZATION INTRODUCED
+
+
+Stage 26
+Benchmark scaling
+COMPLETE
+ORDINARY -WERROR BUILD PASS
+CORRECTNESS BUILD PASS
+ASAN PASS
+UBSAN PASS
+OPTIMIZED BUILD PASS
+CAPACITY-10 EQUIVALENCE PASS
+CAPACITY-25 EQUIVALENCE PASS
+CAPACITY-50 EQUIVALENCE PASS
+CAPACITY-75 EQUIVALENCE PASS
+CAPACITY-100 EQUIVALENCE PASS
+FIXED SCALING CHECKSUM/STATE PASS
+DYNAMIC SCALING CHECKSUM/STATS/STATE PASS
+CLOCK_MONOTONIC SCALING PASS
+WARMUP-OUTSIDE-MEASUREMENT PASS
+3-REPEAT MEDIAN TABLE PASS
+NO NEW OPTIMIZATION INTRODUCED
 ```

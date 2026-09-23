@@ -31,6 +31,7 @@
  *   Stage 23 - add optimized build configuration after correctness gate
  *   Stage 24 - benchmark fixed-rank reference versus optimized Part 1
  *   Stage 25 - benchmark dynamic-rank linear reference versus indexed Part 2
+ *   Stage 26 - benchmark fixed/dynamic scaling across cache capacities
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
@@ -6901,6 +6902,679 @@ int stage25_run_dynamic_rank_benchmark_tests(void)
     return passed;
 }
 
+
+
+/* ---------- Stage 26: benchmark scaling ---------- */
+
+#define STAGE26_SCALE_COUNT 5U
+#define STAGE26_WARMUP_OPS 10000U
+#define STAGE26_MEASURED_OPS 100000U
+#define STAGE26_REPEATS 3U
+#define STAGE26_FIXED_SEED UINT64_C(0x94d049bb133111eb)
+#define STAGE26_DYNAMIC_SEED UINT64_C(0x2545f4914f6cdd1d)
+
+typedef struct {
+    size_t capacity;
+    CacheKey key_space;
+    double linear_fixed_median_ns;
+    double part1_fixed_median_ns;
+    double linear_dynamic_median_ns;
+    double part2_dynamic_median_ns;
+} Stage26ScaleResult;
+
+static const size_t g_stage26_capacities[STAGE26_SCALE_COUNT] = {
+    10U, 25U, 50U, 75U, 100U
+};
+
+int stage26_run_linear_fixed_workload(const CacheKey keys[],
+                                      size_t count,
+                                      size_t capacity,
+                                      Stage24Timing *timing,
+                                      Cache *final_cache)
+{
+    CacheEntry *entry;
+    struct timespec start;
+    struct timespec end;
+    uint64_t checksum = 0U;
+    size_t i;
+
+    if (keys == NULL ||
+        timing == NULL ||
+        final_cache == NULL ||
+        !cache_init(final_cache, capacity)) {
+        return 0;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        return 0;
+    }
+
+    for (i = 0U; i < count; ++i) {
+        entry = cache_get(final_cache, keys[i]);
+        if (entry == NULL) {
+            return 0;
+        }
+
+        checksum ^= (uint64_t)entry->key;
+        checksum += (uint64_t)entry->value;
+        checksum ^= (uint64_t)entry->rank;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+        return 0;
+    }
+
+    timing->seconds = stage24_elapsed_seconds(&start, &end);
+    timing->ns_per_op = count == 0U
+        ? 0.0
+        : (timing->seconds * 1000000000.0) / (double)count;
+    timing->checksum = checksum;
+
+    g_stage24_checksum_sink ^= checksum;
+    return 1;
+}
+
+int stage26_run_part1_fixed_workload(const CacheKey keys[],
+                                     size_t count,
+                                     size_t capacity,
+                                     Stage24Timing *timing,
+                                     Part1Cache *final_cache)
+{
+    CacheEntry *entry;
+    struct timespec start;
+    struct timespec end;
+    uint64_t checksum = 0U;
+    size_t i;
+
+    if (keys == NULL ||
+        timing == NULL ||
+        final_cache == NULL ||
+        !part1_cache_init(final_cache, capacity)) {
+        return 0;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        return 0;
+    }
+
+    for (i = 0U; i < count; ++i) {
+        entry = part1_cache_get(final_cache, keys[i]);
+        if (entry == NULL) {
+            return 0;
+        }
+
+        checksum ^= (uint64_t)entry->key;
+        checksum += (uint64_t)entry->value;
+        checksum ^= (uint64_t)entry->rank;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+        return 0;
+    }
+
+    timing->seconds = stage24_elapsed_seconds(&start, &end);
+    timing->ns_per_op = count == 0U
+        ? 0.0
+        : (timing->seconds * 1000000000.0) / (double)count;
+    timing->checksum = checksum;
+
+    g_stage24_checksum_sink ^= checksum;
+    return 1;
+}
+
+int stage26_run_linear_dynamic_workload(const WorkloadOp operations[],
+                                        size_t count,
+                                        size_t capacity,
+                                        Stage24Timing *timing,
+                                        Cache *final_cache,
+                                        CacheStats *final_stats)
+{
+    CacheEntry *entry;
+    CacheStats stats = {0};
+    struct timespec start;
+    struct timespec end;
+    uint64_t checksum = 0U;
+    size_t i;
+
+    if (operations == NULL ||
+        timing == NULL ||
+        final_cache == NULL ||
+        final_stats == NULL ||
+        !cache_init(final_cache, capacity)) {
+        return 0;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        return 0;
+    }
+
+    for (i = 0U; i < count; ++i) {
+        if (!stage25_linear_dynamic_get(final_cache,
+                                        operations[i].key,
+                                        operations[i].scenario,
+                                        &stats,
+                                        &entry)) {
+            return 0;
+        }
+
+        checksum ^= (uint64_t)entry->key;
+        checksum += (uint64_t)entry->value;
+        checksum ^= (uint64_t)entry->rank;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+        return 0;
+    }
+
+    timing->seconds = stage24_elapsed_seconds(&start, &end);
+    timing->ns_per_op = count == 0U
+        ? 0.0
+        : (timing->seconds * 1000000000.0) / (double)count;
+    timing->checksum = checksum;
+    *final_stats = stats;
+
+    g_stage25_checksum_sink ^= checksum;
+    return 1;
+}
+
+int stage26_run_part2_dynamic_workload(const WorkloadOp operations[],
+                                       size_t count,
+                                       size_t capacity,
+                                       Stage24Timing *timing,
+                                       Part1Cache *final_cache,
+                                       CacheStats *final_stats)
+{
+    Stage19RankContext context;
+    CacheEntry *entry;
+    struct timespec start;
+    struct timespec end;
+    uint64_t checksum = 0U;
+    size_t i;
+
+    if (operations == NULL ||
+        timing == NULL ||
+        final_cache == NULL ||
+        final_stats == NULL ||
+        !part1_cache_init(final_cache, capacity)) {
+        return 0;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        return 0;
+    }
+
+    for (i = 0U; i < count; ++i) {
+        context.scenario = operations[i].scenario;
+        context.calls = 0U;
+
+        entry = part2_cache_get(final_cache,
+                                operations[i].key,
+                                stage19_rank_provider,
+                                &context);
+        if (entry == NULL) {
+            return 0;
+        }
+
+        checksum ^= (uint64_t)entry->key;
+        checksum += (uint64_t)entry->value;
+        checksum ^= (uint64_t)entry->rank;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+        return 0;
+    }
+
+    timing->seconds = stage24_elapsed_seconds(&start, &end);
+    timing->ns_per_op = count == 0U
+        ? 0.0
+        : (timing->seconds * 1000000000.0) / (double)count;
+    timing->checksum = checksum;
+    *final_stats = part1_cache_stats_snapshot(final_cache);
+
+    g_stage25_checksum_sink ^= checksum;
+    return 1;
+}
+
+double stage26_median_ns_per_op(const Stage24Timing timings[],
+                                size_t count)
+{
+    double values[STAGE26_REPEATS];
+    size_t i;
+    size_t j;
+
+    if (timings == NULL || count == 0U || count > STAGE26_REPEATS) {
+        return 0.0;
+    }
+
+    for (i = 0U; i < count; ++i) {
+        values[i] = timings[i].ns_per_op;
+    }
+
+    for (i = 1U; i < count; ++i) {
+        double current = values[i];
+        j = i;
+
+        while (j > 0U && values[j - 1U] > current) {
+            values[j] = values[j - 1U];
+            --j;
+        }
+
+        values[j] = current;
+    }
+
+    return values[count / 2U];
+}
+
+int stage26_test_scaling_semantics(void)
+{
+    size_t scale_index;
+    int passed = 1;
+
+    printf("\n[Stage 26] scaling semantic equivalence\n");
+
+    for (scale_index = 0U; scale_index < STAGE26_SCALE_COUNT; ++scale_index) {
+        const size_t capacity = g_stage26_capacities[scale_index];
+        const CacheKey key_space = (CacheKey)(capacity * 2U);
+        CacheKey fixed_keys[2000];
+        WorkloadOp dynamic_ops[2000];
+        Cache linear_fixed;
+        Part1Cache part1_fixed;
+        Cache linear_dynamic;
+        Part1Cache part2_dynamic;
+        CacheStats linear_stats = {0};
+        CacheStats part2_stats = {0};
+        Stage24Timing linear_fixed_timing = {0.0, 0.0, 0U};
+        Stage24Timing part1_fixed_timing = {0.0, 0.0, 0U};
+        Stage24Timing linear_dynamic_timing = {0.0, 0.0, 0U};
+        Stage24Timing part2_dynamic_timing = {0.0, 0.0, 0U};
+
+        passed &= check(stage24_generate_fixed_keys(
+                            fixed_keys,
+                            sizeof(fixed_keys) / sizeof(fixed_keys[0]),
+                            STAGE26_FIXED_SEED + (uint64_t)capacity,
+                            key_space),
+                        "generate fixed scaling semantics workload");
+
+        passed &= check(stage25_generate_dynamic_operations(
+                            dynamic_ops,
+                            sizeof(dynamic_ops) / sizeof(dynamic_ops[0]),
+                            STAGE26_DYNAMIC_SEED + (uint64_t)capacity,
+                            key_space),
+                        "generate dynamic scaling semantics workload");
+
+        passed &= check(stage26_run_linear_fixed_workload(
+                            fixed_keys,
+                            sizeof(fixed_keys) / sizeof(fixed_keys[0]),
+                            capacity,
+                            &linear_fixed_timing,
+                            &linear_fixed),
+                        "run linear fixed scaling semantics");
+
+        passed &= check(stage26_run_part1_fixed_workload(
+                            fixed_keys,
+                            sizeof(fixed_keys) / sizeof(fixed_keys[0]),
+                            capacity,
+                            &part1_fixed_timing,
+                            &part1_fixed),
+                        "run Part1 fixed scaling semantics");
+
+        passed &= check(linear_fixed_timing.checksum ==
+                        part1_fixed_timing.checksum,
+                        "fixed scaling implementations match checksum");
+
+        passed &= check(stage24_fixed_caches_logically_equal(
+                            &linear_fixed,
+                            &part1_fixed,
+                            key_space),
+                        "fixed scaling implementations match final state");
+
+        passed &= check(cache_validate(&linear_fixed) &&
+                        part1_cache_validate(&part1_fixed),
+                        "fixed scaling implementations satisfy invariants");
+
+        passed &= check(stage26_run_linear_dynamic_workload(
+                            dynamic_ops,
+                            sizeof(dynamic_ops) / sizeof(dynamic_ops[0]),
+                            capacity,
+                            &linear_dynamic_timing,
+                            &linear_dynamic,
+                            &linear_stats),
+                        "run linear dynamic scaling semantics");
+
+        passed &= check(stage26_run_part2_dynamic_workload(
+                            dynamic_ops,
+                            sizeof(dynamic_ops) / sizeof(dynamic_ops[0]),
+                            capacity,
+                            &part2_dynamic_timing,
+                            &part2_dynamic,
+                            &part2_stats),
+                        "run Part2 dynamic scaling semantics");
+
+        passed &= check(linear_dynamic_timing.checksum ==
+                        part2_dynamic_timing.checksum,
+                        "dynamic scaling implementations match checksum");
+
+        passed &= check(stage21_stats_equal(linear_stats, part2_stats),
+                        "dynamic scaling implementations match statistics");
+
+        passed &= check(stage24_fixed_caches_logically_equal(
+                            &linear_dynamic,
+                            &part2_dynamic,
+                            key_space),
+                        "dynamic scaling implementations match final state");
+
+        passed &= check(cache_validate(&linear_dynamic) &&
+                        part1_cache_validate(&part2_dynamic),
+                        "dynamic scaling implementations satisfy invariants");
+    }
+
+    return passed;
+}
+
+int stage26_run_scaling_benchmark(void)
+{
+#ifdef RANKED_CACHE_OPTIMIZED_BUILD
+    size_t scale_index;
+    Stage26ScaleResult results[STAGE26_SCALE_COUNT] = {{0}};
+    int passed = 1;
+
+    printf("\n[Stage 26] optimized benchmark scaling\n");
+    printf("  warmup_ops=%u measured_ops=%u repeats=%u\n",
+           STAGE26_WARMUP_OPS,
+           STAGE26_MEASURED_OPS,
+           STAGE26_REPEATS);
+
+    for (scale_index = 0U; scale_index < STAGE26_SCALE_COUNT; ++scale_index) {
+        const size_t capacity = g_stage26_capacities[scale_index];
+        const CacheKey key_space = (CacheKey)(capacity * 2U);
+        const size_t total_ops =
+            STAGE26_WARMUP_OPS + STAGE26_MEASURED_OPS;
+        CacheKey *fixed_keys =
+            (CacheKey *)malloc(total_ops * sizeof(*fixed_keys));
+        WorkloadOp *dynamic_ops =
+            (WorkloadOp *)malloc(total_ops * sizeof(*dynamic_ops));
+        Stage24Timing linear_fixed_timings[STAGE26_REPEATS] = {{0}};
+        Stage24Timing part1_fixed_timings[STAGE26_REPEATS] = {{0}};
+        Stage24Timing linear_dynamic_timings[STAGE26_REPEATS] = {{0}};
+        Stage24Timing part2_dynamic_timings[STAGE26_REPEATS] = {{0}};
+        Stage24Timing warm_linear_fixed = {0.0, 0.0, 0U};
+        Stage24Timing warm_part1_fixed = {0.0, 0.0, 0U};
+        Stage24Timing warm_linear_dynamic = {0.0, 0.0, 0U};
+        Stage24Timing warm_part2_dynamic = {0.0, 0.0, 0U};
+        Cache warm_linear_fixed_cache;
+        Part1Cache warm_part1_fixed_cache;
+        Cache warm_linear_dynamic_cache;
+        Part1Cache warm_part2_dynamic_cache;
+        CacheStats warm_linear_stats = {0};
+        CacheStats warm_part2_stats = {0};
+        size_t repeat;
+
+        passed &= check(fixed_keys != NULL && dynamic_ops != NULL,
+                        "allocate scaling benchmark workloads");
+
+        if (fixed_keys == NULL || dynamic_ops == NULL) {
+            free(fixed_keys);
+            free(dynamic_ops);
+            return 0;
+        }
+
+        passed &= check(stage24_generate_fixed_keys(
+                            fixed_keys,
+                            total_ops,
+                            STAGE26_FIXED_SEED + (uint64_t)capacity,
+                            key_space),
+                        "generate fixed scaling benchmark workload");
+
+        passed &= check(stage25_generate_dynamic_operations(
+                            dynamic_ops,
+                            total_ops,
+                            STAGE26_DYNAMIC_SEED + (uint64_t)capacity,
+                            key_space),
+                        "generate dynamic scaling benchmark workload");
+
+        passed &= check(stage26_run_linear_fixed_workload(
+                            fixed_keys,
+                            STAGE26_WARMUP_OPS,
+                            capacity,
+                            &warm_linear_fixed,
+                            &warm_linear_fixed_cache),
+                        "warm linear fixed scaling path");
+
+        passed &= check(stage26_run_part1_fixed_workload(
+                            fixed_keys,
+                            STAGE26_WARMUP_OPS,
+                            capacity,
+                            &warm_part1_fixed,
+                            &warm_part1_fixed_cache),
+                        "warm Part1 fixed scaling path");
+
+        passed &= check(warm_linear_fixed.checksum ==
+                        warm_part1_fixed.checksum &&
+                        stage24_fixed_caches_logically_equal(
+                            &warm_linear_fixed_cache,
+                            &warm_part1_fixed_cache,
+                            key_space),
+                        "fixed scaling warmup remains equivalent");
+
+        passed &= check(stage26_run_linear_dynamic_workload(
+                            dynamic_ops,
+                            STAGE26_WARMUP_OPS,
+                            capacity,
+                            &warm_linear_dynamic,
+                            &warm_linear_dynamic_cache,
+                            &warm_linear_stats),
+                        "warm linear dynamic scaling path");
+
+        passed &= check(stage26_run_part2_dynamic_workload(
+                            dynamic_ops,
+                            STAGE26_WARMUP_OPS,
+                            capacity,
+                            &warm_part2_dynamic,
+                            &warm_part2_dynamic_cache,
+                            &warm_part2_stats),
+                        "warm Part2 dynamic scaling path");
+
+        passed &= check(warm_linear_dynamic.checksum ==
+                        warm_part2_dynamic.checksum &&
+                        stage21_stats_equal(warm_linear_stats, warm_part2_stats) &&
+                        stage24_fixed_caches_logically_equal(
+                            &warm_linear_dynamic_cache,
+                            &warm_part2_dynamic_cache,
+                            key_space),
+                        "dynamic scaling warmup remains equivalent");
+
+        for (repeat = 0U; repeat < STAGE26_REPEATS; ++repeat) {
+            const CacheKey *measured_fixed =
+                fixed_keys + STAGE26_WARMUP_OPS;
+            const WorkloadOp *measured_dynamic =
+                dynamic_ops + STAGE26_WARMUP_OPS;
+            Cache linear_fixed_cache;
+            Part1Cache part1_fixed_cache;
+            Cache linear_dynamic_cache;
+            Part1Cache part2_dynamic_cache;
+            CacheStats linear_stats = {0};
+            CacheStats part2_stats = {0};
+
+            if ((repeat % 2U) == 0U) {
+                passed &= check(stage26_run_linear_fixed_workload(
+                                    measured_fixed,
+                                    STAGE26_MEASURED_OPS,
+                                    capacity,
+                                    &linear_fixed_timings[repeat],
+                                    &linear_fixed_cache),
+                                "measure linear fixed scaling path");
+                passed &= check(stage26_run_part1_fixed_workload(
+                                    measured_fixed,
+                                    STAGE26_MEASURED_OPS,
+                                    capacity,
+                                    &part1_fixed_timings[repeat],
+                                    &part1_fixed_cache),
+                                "measure Part1 fixed scaling path");
+                passed &= check(stage26_run_linear_dynamic_workload(
+                                    measured_dynamic,
+                                    STAGE26_MEASURED_OPS,
+                                    capacity,
+                                    &linear_dynamic_timings[repeat],
+                                    &linear_dynamic_cache,
+                                    &linear_stats),
+                                "measure linear dynamic scaling path");
+                passed &= check(stage26_run_part2_dynamic_workload(
+                                    measured_dynamic,
+                                    STAGE26_MEASURED_OPS,
+                                    capacity,
+                                    &part2_dynamic_timings[repeat],
+                                    &part2_dynamic_cache,
+                                    &part2_stats),
+                                "measure Part2 dynamic scaling path");
+            } else {
+                passed &= check(stage26_run_part2_dynamic_workload(
+                                    measured_dynamic,
+                                    STAGE26_MEASURED_OPS,
+                                    capacity,
+                                    &part2_dynamic_timings[repeat],
+                                    &part2_dynamic_cache,
+                                    &part2_stats),
+                                "measure Part2 dynamic scaling path");
+                passed &= check(stage26_run_linear_dynamic_workload(
+                                    measured_dynamic,
+                                    STAGE26_MEASURED_OPS,
+                                    capacity,
+                                    &linear_dynamic_timings[repeat],
+                                    &linear_dynamic_cache,
+                                    &linear_stats),
+                                "measure linear dynamic scaling path");
+                passed &= check(stage26_run_part1_fixed_workload(
+                                    measured_fixed,
+                                    STAGE26_MEASURED_OPS,
+                                    capacity,
+                                    &part1_fixed_timings[repeat],
+                                    &part1_fixed_cache),
+                                "measure Part1 fixed scaling path");
+                passed &= check(stage26_run_linear_fixed_workload(
+                                    measured_fixed,
+                                    STAGE26_MEASURED_OPS,
+                                    capacity,
+                                    &linear_fixed_timings[repeat],
+                                    &linear_fixed_cache),
+                                "measure linear fixed scaling path");
+            }
+
+            passed &= check(linear_fixed_timings[repeat].checksum ==
+                            part1_fixed_timings[repeat].checksum,
+                            "fixed scaling measured checksum equivalence");
+
+            passed &= check(stage24_fixed_caches_logically_equal(
+                                &linear_fixed_cache,
+                                &part1_fixed_cache,
+                                key_space),
+                            "fixed scaling measured state equivalence");
+
+            passed &= check(cache_validate(&linear_fixed_cache) &&
+                            part1_cache_validate(&part1_fixed_cache),
+                            "fixed scaling measured invariants");
+
+            passed &= check(linear_dynamic_timings[repeat].checksum ==
+                            part2_dynamic_timings[repeat].checksum,
+                            "dynamic scaling measured checksum equivalence");
+
+            passed &= check(stage21_stats_equal(
+                                linear_stats, part2_stats),
+                            "dynamic scaling measured statistics equivalence");
+
+            passed &= check(stage24_fixed_caches_logically_equal(
+                                &linear_dynamic_cache,
+                                &part2_dynamic_cache,
+                                key_space),
+                            "dynamic scaling measured state equivalence");
+
+            passed &= check(cache_validate(&linear_dynamic_cache) &&
+                            part1_cache_validate(&part2_dynamic_cache),
+                            "dynamic scaling measured invariants");
+        }
+
+        results[scale_index].capacity = capacity;
+        results[scale_index].key_space = key_space;
+        results[scale_index].linear_fixed_median_ns =
+            stage26_median_ns_per_op(
+                linear_fixed_timings, STAGE26_REPEATS);
+        results[scale_index].part1_fixed_median_ns =
+            stage26_median_ns_per_op(
+                part1_fixed_timings, STAGE26_REPEATS);
+        results[scale_index].linear_dynamic_median_ns =
+            stage26_median_ns_per_op(
+                linear_dynamic_timings, STAGE26_REPEATS);
+        results[scale_index].part2_dynamic_median_ns =
+            stage26_median_ns_per_op(
+                part2_dynamic_timings, STAGE26_REPEATS);
+
+        passed &= check(results[scale_index].linear_fixed_median_ns > 0.0 &&
+                        results[scale_index].part1_fixed_median_ns > 0.0 &&
+                        results[scale_index].linear_dynamic_median_ns > 0.0 &&
+                        results[scale_index].part2_dynamic_median_ns > 0.0,
+                        "scaling benchmark records positive medians");
+
+        free(fixed_keys);
+        free(dynamic_ops);
+    }
+
+    printf("\n  capacity  keyspace  fixed-linear  fixed-Part1  "
+           "dynamic-linear  dynamic-Part2  fixed-ratio  dynamic-ratio\n");
+
+    for (scale_index = 0U; scale_index < STAGE26_SCALE_COUNT; ++scale_index) {
+        const Stage26ScaleResult *r = &results[scale_index];
+        const double fixed_ratio =
+            r->part1_fixed_median_ns > 0.0
+            ? r->linear_fixed_median_ns / r->part1_fixed_median_ns
+            : 0.0;
+        const double dynamic_ratio =
+            r->part2_dynamic_median_ns > 0.0
+            ? r->linear_dynamic_median_ns / r->part2_dynamic_median_ns
+            : 0.0;
+
+        printf("  %8zu  %8llu  %12.2f  %11.2f  %14.2f  %13.2f  "
+               "%11.3f  %13.3f\n",
+               r->capacity,
+               (unsigned long long)r->key_space,
+               r->linear_fixed_median_ns,
+               r->part1_fixed_median_ns,
+               r->linear_dynamic_median_ns,
+               r->part2_dynamic_median_ns,
+               fixed_ratio,
+               dynamic_ratio);
+    }
+
+    return passed;
+#else
+    printf("\n[Stage 26] scaling benchmark timing skipped in non-optimized build\n");
+    printf("[INFO] Build with RANKED_CACHE_OPTIMIZED_BUILD=1 and -O3 -DNDEBUG.\n");
+    return 1;
+#endif
+}
+
+int stage26_run_scaling_benchmark_tests(void)
+{
+    int passed = 1;
+
+    printf("\n=== Stage 26: benchmark scaling ===\n");
+
+    passed &= stage26_test_scaling_semantics();
+    passed &= stage26_run_scaling_benchmark();
+
+    printf("\nStage 26 findings:\n");
+    printf("  scaling covers capacities 10, 25, 50, 75, and 100.\n");
+    printf("  key space is held at 2x capacity for every scaling point.\n");
+    printf("  fixed-rank and dynamic-rank comparisons use deterministic workloads.\n");
+    printf("  checksum/state guards protect fixed-rank timing at every capacity.\n");
+    printf("  checksum/CacheStats/state guards protect dynamic-rank timing at every capacity.\n");
+    printf("  medians report how constant factors and asymptotic behavior evolve with N.\n");
+    printf("  scaling timings remain observational and are not correctness thresholds.\n");
+    printf("Stage 26 boundary: scaling benchmark only; no new optimization is added.\n");
+    printf("Stage 26 scaling-benchmark validation: %s\n",
+           passed ? "PASS" : "FAIL");
+
+    return passed;
+}
+
 int main(void)
 {
     Cache cache;
@@ -7099,7 +7773,12 @@ int main(void)
 
     all_passed &= stage25_run_dynamic_rank_benchmark_tests();
 
-    printf("\nStage 25 validation: %s\n",
+    printf("\nStage 25 regression validation: %s\n",
+           all_passed ? "PASS" : "FAIL");
+
+    all_passed &= stage26_run_scaling_benchmark_tests();
+
+    printf("\nStage 26 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;
