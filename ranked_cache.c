@@ -32,6 +32,7 @@
  *   Stage 24 - benchmark fixed-rank reference versus optimized Part 1
  *   Stage 25 - benchmark dynamic-rank linear reference versus indexed Part 2
  *   Stage 26 - benchmark fixed/dynamic scaling across cache capacities
+ *   Stage 27 - measure process CPU behavior for existing benchmark paths
  *
  * Stage 2 intentionally uses linear scanning for:
  *   - lookup
@@ -94,6 +95,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <time.h>
+#include <sys/resource.h>
 
 #if defined(RANKED_CACHE_CORRECTNESS_BUILD) && defined(RANKED_CACHE_OPTIMIZED_BUILD)
 #error "correctness and optimized build markers are mutually exclusive"
@@ -7575,6 +7577,616 @@ int stage26_run_scaling_benchmark_tests(void)
     return passed;
 }
 
+
+
+/* ---------- Stage 27: measure CPU behavior ---------- */
+
+#define STAGE27_CAPACITY 100U
+#define STAGE27_KEY_SPACE 200ULL
+#define STAGE27_WARMUP_OPS 50000U
+#define STAGE27_MEASURED_OPS 1000000U
+#define STAGE27_REPEATS 3U
+#define STAGE27_FIXED_SEED UINT64_C(0x7f4a7c159e3779b9)
+#define STAGE27_DYNAMIC_SEED UINT64_C(0x94d049bb133111eb)
+
+typedef struct {
+    double wall_seconds;
+    double process_cpu_seconds;
+    double user_cpu_seconds;
+    double system_cpu_seconds;
+    double wall_ns_per_op;
+    double cpu_ns_per_op;
+    double cpu_utilization_percent;
+    long voluntary_context_switches;
+    long involuntary_context_switches;
+    uint64_t checksum;
+} Stage27CpuSample;
+
+typedef struct {
+    struct timespec wall_start;
+    struct timespec cpu_start;
+    struct rusage usage_start;
+} Stage27CpuStart;
+
+double stage27_timeval_seconds(const struct timeval *value)
+{
+    if (value == NULL) {
+        return 0.0;
+    }
+
+    return (double)value->tv_sec + ((double)value->tv_usec / 1000000.0);
+}
+
+int stage27_cpu_sample_begin(Stage27CpuStart *start)
+{
+    if (start == NULL) {
+        return 0;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &start->wall_start) != 0) {
+        return 0;
+    }
+
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start->cpu_start) != 0) {
+        return 0;
+    }
+
+    if (getrusage(RUSAGE_SELF, &start->usage_start) != 0) {
+        return 0;
+    }
+
+    return 1;
+}
+
+int stage27_cpu_sample_end(const Stage27CpuStart *start,
+                           size_t operation_count,
+                           uint64_t checksum,
+                           Stage27CpuSample *sample)
+{
+    struct timespec wall_end;
+    struct timespec cpu_end;
+    struct rusage usage_end;
+    double start_user;
+    double end_user;
+    double start_system;
+    double end_system;
+
+    if (start == NULL || sample == NULL) {
+        return 0;
+    }
+
+    if (getrusage(RUSAGE_SELF, &usage_end) != 0 ||
+        clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_end) != 0 ||
+        clock_gettime(CLOCK_MONOTONIC, &wall_end) != 0) {
+        return 0;
+    }
+
+    sample->wall_seconds = stage24_elapsed_seconds(&start->wall_start, &wall_end);
+    sample->process_cpu_seconds = stage24_elapsed_seconds(&start->cpu_start, &cpu_end);
+
+    start_user = stage27_timeval_seconds(&start->usage_start.ru_utime);
+    end_user = stage27_timeval_seconds(&usage_end.ru_utime);
+    start_system = stage27_timeval_seconds(&start->usage_start.ru_stime);
+    end_system = stage27_timeval_seconds(&usage_end.ru_stime);
+
+    sample->user_cpu_seconds = end_user - start_user;
+    sample->system_cpu_seconds = end_system - start_system;
+    sample->wall_ns_per_op = operation_count == 0U
+        ? 0.0
+        : sample->wall_seconds * 1000000000.0 / (double)operation_count;
+    sample->cpu_ns_per_op = operation_count == 0U
+        ? 0.0
+        : sample->process_cpu_seconds * 1000000000.0 / (double)operation_count;
+    sample->cpu_utilization_percent = sample->wall_seconds <= 0.0
+        ? 0.0
+        : (sample->process_cpu_seconds / sample->wall_seconds) * 100.0;
+    sample->voluntary_context_switches =
+        usage_end.ru_nvcsw - start->usage_start.ru_nvcsw;
+    sample->involuntary_context_switches =
+        usage_end.ru_nivcsw - start->usage_start.ru_nivcsw;
+    sample->checksum = checksum;
+
+    return sample->wall_seconds >= 0.0 &&
+           sample->process_cpu_seconds >= 0.0 &&
+           sample->user_cpu_seconds >= 0.0 &&
+           sample->system_cpu_seconds >= 0.0 &&
+           sample->voluntary_context_switches >= 0 &&
+           sample->involuntary_context_switches >= 0;
+}
+
+int stage27_run_linear_fixed_cpu(const CacheKey keys[],
+                                 size_t count,
+                                 Stage27CpuSample *sample,
+                                 Cache *final_cache)
+{
+    Stage27CpuStart start;
+    CacheEntry *entry;
+    uint64_t checksum = 0U;
+    size_t i;
+
+    if (keys == NULL || sample == NULL || final_cache == NULL ||
+        !cache_init(final_cache, STAGE27_CAPACITY) ||
+        !stage27_cpu_sample_begin(&start)) {
+        return 0;
+    }
+
+    for (i = 0U; i < count; ++i) {
+        entry = cache_get(final_cache, keys[i]);
+        if (entry == NULL) {
+            return 0;
+        }
+        checksum ^= (uint64_t)entry->key;
+        checksum += (uint64_t)entry->value;
+        checksum ^= (uint64_t)entry->rank;
+    }
+
+    g_stage24_checksum_sink ^= checksum;
+    return stage27_cpu_sample_end(&start, count, checksum, sample);
+}
+
+int stage27_run_part1_fixed_cpu(const CacheKey keys[],
+                                size_t count,
+                                Stage27CpuSample *sample,
+                                Part1Cache *final_cache)
+{
+    Stage27CpuStart start;
+    CacheEntry *entry;
+    uint64_t checksum = 0U;
+    size_t i;
+
+    if (keys == NULL || sample == NULL || final_cache == NULL ||
+        !part1_cache_init(final_cache, STAGE27_CAPACITY) ||
+        !stage27_cpu_sample_begin(&start)) {
+        return 0;
+    }
+
+    for (i = 0U; i < count; ++i) {
+        entry = part1_cache_get(final_cache, keys[i]);
+        if (entry == NULL) {
+            return 0;
+        }
+        checksum ^= (uint64_t)entry->key;
+        checksum += (uint64_t)entry->value;
+        checksum ^= (uint64_t)entry->rank;
+    }
+
+    g_stage24_checksum_sink ^= checksum;
+    return stage27_cpu_sample_end(&start, count, checksum, sample);
+}
+
+int stage27_run_linear_dynamic_cpu(const WorkloadOp operations[],
+                                   size_t count,
+                                   Stage27CpuSample *sample,
+                                   Cache *final_cache,
+                                   CacheStats *final_stats)
+{
+    Stage27CpuStart start;
+    CacheStats stats = {0};
+    CacheEntry *entry;
+    uint64_t checksum = 0U;
+    size_t i;
+
+    if (operations == NULL || sample == NULL || final_cache == NULL ||
+        final_stats == NULL || !cache_init(final_cache, STAGE27_CAPACITY) ||
+        !stage27_cpu_sample_begin(&start)) {
+        return 0;
+    }
+
+    for (i = 0U; i < count; ++i) {
+        if (!stage25_linear_dynamic_get(final_cache,
+                                        operations[i].key,
+                                        operations[i].scenario,
+                                        &stats,
+                                        &entry)) {
+            return 0;
+        }
+        checksum ^= (uint64_t)entry->key;
+        checksum += (uint64_t)entry->value;
+        checksum ^= (uint64_t)entry->rank;
+    }
+
+    *final_stats = stats;
+    g_stage25_checksum_sink ^= checksum;
+    return stage27_cpu_sample_end(&start, count, checksum, sample);
+}
+
+int stage27_run_part2_dynamic_cpu(const WorkloadOp operations[],
+                                  size_t count,
+                                  Stage27CpuSample *sample,
+                                  Part1Cache *final_cache,
+                                  CacheStats *final_stats)
+{
+    Stage27CpuStart start;
+    Stage19RankContext context;
+    CacheEntry *entry;
+    uint64_t checksum = 0U;
+    size_t i;
+
+    if (operations == NULL || sample == NULL || final_cache == NULL ||
+        final_stats == NULL || !part1_cache_init(final_cache, STAGE27_CAPACITY) ||
+        !stage27_cpu_sample_begin(&start)) {
+        return 0;
+    }
+
+    for (i = 0U; i < count; ++i) {
+        context.scenario = operations[i].scenario;
+        context.calls = 0U;
+        entry = part2_cache_get(final_cache,
+                                operations[i].key,
+                                stage19_rank_provider,
+                                &context);
+        if (entry == NULL) {
+            return 0;
+        }
+        checksum ^= (uint64_t)entry->key;
+        checksum += (uint64_t)entry->value;
+        checksum ^= (uint64_t)entry->rank;
+    }
+
+    *final_stats = part1_cache_stats_snapshot(final_cache);
+    g_stage25_checksum_sink ^= checksum;
+    return stage27_cpu_sample_end(&start, count, checksum, sample);
+}
+
+double stage27_median_double(const double values[], size_t count)
+{
+    double sorted[STAGE27_REPEATS];
+    double tmp;
+    size_t i;
+    size_t j;
+
+    if (values == NULL || count == 0U || count > STAGE27_REPEATS) {
+        return 0.0;
+    }
+
+    for (i = 0U; i < count; ++i) {
+        sorted[i] = values[i];
+    }
+
+    for (i = 0U; i < count; ++i) {
+        for (j = i + 1U; j < count; ++j) {
+            if (sorted[j] < sorted[i]) {
+                tmp = sorted[i];
+                sorted[i] = sorted[j];
+                sorted[j] = tmp;
+            }
+        }
+    }
+
+    return sorted[count / 2U];
+}
+
+int stage27_test_cpu_measurement_helpers(void)
+{
+    Stage27CpuStart start;
+    Stage27CpuSample sample;
+    volatile uint64_t spin = 0U;
+    size_t i;
+    int passed = 1;
+
+    printf("\n[Stage 27] CPU measurement helper validation\n");
+
+    passed &= check(stage27_cpu_sample_begin(&start),
+                    "capture CPU behavior start sample");
+
+    for (i = 0U; i < 100000U; ++i) {
+        spin += (uint64_t)i;
+    }
+
+    passed &= check(stage27_cpu_sample_end(&start, 100000U,
+                                           (uint64_t)spin, &sample),
+                    "capture CPU behavior end sample");
+    passed &= check(sample.wall_seconds > 0.0,
+                    "CPU behavior sample records positive wall time");
+    passed &= check(sample.process_cpu_seconds > 0.0,
+                    "CPU behavior sample records positive process CPU time");
+    passed &= check(sample.wall_ns_per_op > 0.0 &&
+                    sample.cpu_ns_per_op > 0.0,
+                    "CPU behavior sample derives positive per-operation times");
+    passed &= check(sample.cpu_utilization_percent > 0.0,
+                    "CPU behavior sample derives positive CPU/wall utilization");
+
+    return passed;
+}
+
+int stage27_run_cpu_behavior_benchmark(void)
+{
+#ifdef RANKED_CACHE_OPTIMIZED_BUILD
+    CacheKey *warmup_fixed = NULL;
+    CacheKey *measured_fixed = NULL;
+    WorkloadOp *warmup_dynamic = NULL;
+    WorkloadOp *measured_dynamic = NULL;
+    double fixed_linear_cpu[STAGE27_REPEATS];
+    double fixed_part1_cpu[STAGE27_REPEATS];
+    double dynamic_linear_cpu[STAGE27_REPEATS];
+    double dynamic_part2_cpu[STAGE27_REPEATS];
+    double fixed_linear_util[STAGE27_REPEATS];
+    double fixed_part1_util[STAGE27_REPEATS];
+    double dynamic_linear_util[STAGE27_REPEATS];
+    double dynamic_part2_util[STAGE27_REPEATS];
+    double fixed_linear_user_ns[STAGE27_REPEATS];
+    double fixed_linear_system_ns[STAGE27_REPEATS];
+    double fixed_part1_user_ns[STAGE27_REPEATS];
+    double fixed_part1_system_ns[STAGE27_REPEATS];
+    double dynamic_linear_user_ns[STAGE27_REPEATS];
+    double dynamic_linear_system_ns[STAGE27_REPEATS];
+    double dynamic_part2_user_ns[STAGE27_REPEATS];
+    double dynamic_part2_system_ns[STAGE27_REPEATS];
+    long fixed_linear_vcsw = 0;
+    long fixed_linear_ivcsw = 0;
+    long fixed_part1_vcsw = 0;
+    long fixed_part1_ivcsw = 0;
+    long dynamic_linear_vcsw = 0;
+    long dynamic_linear_ivcsw = 0;
+    long dynamic_part2_vcsw = 0;
+    long dynamic_part2_ivcsw = 0;
+    size_t repeat;
+    int passed = 1;
+
+    printf("\n[Stage 27] optimized CPU-behavior benchmark\n");
+
+    warmup_fixed = malloc(STAGE27_WARMUP_OPS * sizeof(*warmup_fixed));
+    measured_fixed = malloc(STAGE27_MEASURED_OPS * sizeof(*measured_fixed));
+    warmup_dynamic = malloc(STAGE27_WARMUP_OPS * sizeof(*warmup_dynamic));
+    measured_dynamic = malloc(STAGE27_MEASURED_OPS * sizeof(*measured_dynamic));
+
+    passed &= check(warmup_fixed != NULL && measured_fixed != NULL &&
+                    warmup_dynamic != NULL && measured_dynamic != NULL,
+                    "allocate Stage 27 CPU behavior workloads");
+    if (!passed) {
+        free(warmup_fixed);
+        free(measured_fixed);
+        free(warmup_dynamic);
+        free(measured_dynamic);
+        return 0;
+    }
+
+    passed &= check(stage24_generate_fixed_keys(
+                        warmup_fixed,
+                        STAGE27_WARMUP_OPS,
+                        STAGE27_FIXED_SEED,
+                        STAGE27_KEY_SPACE),
+                    "generate fixed CPU warmup workload");
+    passed &= check(stage24_generate_fixed_keys(
+                        measured_fixed,
+                        STAGE27_MEASURED_OPS,
+                        STAGE27_FIXED_SEED + UINT64_C(1),
+                        STAGE27_KEY_SPACE),
+                    "generate fixed CPU measured workload");
+    passed &= check(stage25_generate_dynamic_operations(
+                        warmup_dynamic,
+                        STAGE27_WARMUP_OPS,
+                        STAGE27_DYNAMIC_SEED,
+                        STAGE27_KEY_SPACE),
+                    "generate dynamic CPU warmup workload");
+    passed &= check(stage25_generate_dynamic_operations(
+                        measured_dynamic,
+                        STAGE27_MEASURED_OPS,
+                        STAGE27_DYNAMIC_SEED + UINT64_C(1),
+                        STAGE27_KEY_SPACE),
+                    "generate dynamic CPU measured workload");
+
+    /* Warmup is deliberately excluded from reported CPU behavior. */
+    {
+        Stage27CpuSample sample;
+        Cache linear_fixed;
+        Part1Cache part1_fixed;
+        Cache linear_dynamic;
+        Part1Cache part2_dynamic;
+        CacheStats linear_stats;
+        CacheStats part2_stats;
+
+        passed &= check(stage27_run_linear_fixed_cpu(
+                            warmup_fixed, STAGE27_WARMUP_OPS,
+                            &sample, &linear_fixed),
+                        "warm linear fixed CPU path");
+        passed &= check(stage27_run_part1_fixed_cpu(
+                            warmup_fixed, STAGE27_WARMUP_OPS,
+                            &sample, &part1_fixed),
+                        "warm Part1 fixed CPU path");
+        passed &= check(stage27_run_linear_dynamic_cpu(
+                            warmup_dynamic, STAGE27_WARMUP_OPS,
+                            &sample, &linear_dynamic, &linear_stats),
+                        "warm linear dynamic CPU path");
+        passed &= check(stage27_run_part2_dynamic_cpu(
+                            warmup_dynamic, STAGE27_WARMUP_OPS,
+                            &sample, &part2_dynamic, &part2_stats),
+                        "warm Part2 dynamic CPU path");
+    }
+
+    for (repeat = 0U; repeat < STAGE27_REPEATS; ++repeat) {
+        Stage27CpuSample linear_fixed_sample;
+        Stage27CpuSample part1_fixed_sample;
+        Stage27CpuSample linear_dynamic_sample;
+        Stage27CpuSample part2_dynamic_sample;
+        Cache linear_fixed_cache;
+        Part1Cache part1_fixed_cache;
+        Cache linear_dynamic_cache;
+        Part1Cache part2_dynamic_cache;
+        CacheStats linear_stats;
+        CacheStats part2_stats;
+
+        if ((repeat % 2U) == 0U) {
+            passed &= check(stage27_run_linear_fixed_cpu(
+                                measured_fixed, STAGE27_MEASURED_OPS,
+                                &linear_fixed_sample, &linear_fixed_cache),
+                            "measure linear fixed CPU behavior");
+            passed &= check(stage27_run_part1_fixed_cpu(
+                                measured_fixed, STAGE27_MEASURED_OPS,
+                                &part1_fixed_sample, &part1_fixed_cache),
+                            "measure Part1 fixed CPU behavior");
+            passed &= check(stage27_run_linear_dynamic_cpu(
+                                measured_dynamic, STAGE27_MEASURED_OPS,
+                                &linear_dynamic_sample, &linear_dynamic_cache,
+                                &linear_stats),
+                            "measure linear dynamic CPU behavior");
+            passed &= check(stage27_run_part2_dynamic_cpu(
+                                measured_dynamic, STAGE27_MEASURED_OPS,
+                                &part2_dynamic_sample, &part2_dynamic_cache,
+                                &part2_stats),
+                            "measure Part2 dynamic CPU behavior");
+        } else {
+            passed &= check(stage27_run_part2_dynamic_cpu(
+                                measured_dynamic, STAGE27_MEASURED_OPS,
+                                &part2_dynamic_sample, &part2_dynamic_cache,
+                                &part2_stats),
+                            "measure Part2 dynamic CPU behavior first");
+            passed &= check(stage27_run_linear_dynamic_cpu(
+                                measured_dynamic, STAGE27_MEASURED_OPS,
+                                &linear_dynamic_sample, &linear_dynamic_cache,
+                                &linear_stats),
+                            "measure linear dynamic CPU behavior second");
+            passed &= check(stage27_run_part1_fixed_cpu(
+                                measured_fixed, STAGE27_MEASURED_OPS,
+                                &part1_fixed_sample, &part1_fixed_cache),
+                            "measure Part1 fixed CPU behavior second");
+            passed &= check(stage27_run_linear_fixed_cpu(
+                                measured_fixed, STAGE27_MEASURED_OPS,
+                                &linear_fixed_sample, &linear_fixed_cache),
+                            "measure linear fixed CPU behavior last");
+        }
+
+        passed &= check(linear_fixed_sample.checksum == part1_fixed_sample.checksum,
+                        "fixed CPU benchmark checksum equivalence");
+        passed &= check(stage24_fixed_caches_logically_equal(
+                            &linear_fixed_cache, &part1_fixed_cache,
+                            STAGE27_KEY_SPACE),
+                        "fixed CPU benchmark final-state equivalence");
+        passed &= check(cache_validate(&linear_fixed_cache) &&
+                        part1_cache_validate(&part1_fixed_cache),
+                        "fixed CPU benchmark invariants");
+
+        passed &= check(linear_dynamic_sample.checksum == part2_dynamic_sample.checksum,
+                        "dynamic CPU benchmark checksum equivalence");
+        passed &= check(stage21_stats_equal(linear_stats, part2_stats),
+                        "dynamic CPU benchmark CacheStats equivalence");
+        passed &= check(stage24_fixed_caches_logically_equal(
+                            &linear_dynamic_cache, &part2_dynamic_cache,
+                            STAGE27_KEY_SPACE),
+                        "dynamic CPU benchmark final-state equivalence");
+        passed &= check(cache_validate(&linear_dynamic_cache) &&
+                        part1_cache_validate(&part2_dynamic_cache),
+                        "dynamic CPU benchmark invariants");
+
+        fixed_linear_cpu[repeat] = linear_fixed_sample.cpu_ns_per_op;
+        fixed_part1_cpu[repeat] = part1_fixed_sample.cpu_ns_per_op;
+        dynamic_linear_cpu[repeat] = linear_dynamic_sample.cpu_ns_per_op;
+        dynamic_part2_cpu[repeat] = part2_dynamic_sample.cpu_ns_per_op;
+        fixed_linear_util[repeat] = linear_fixed_sample.cpu_utilization_percent;
+        fixed_part1_util[repeat] = part1_fixed_sample.cpu_utilization_percent;
+        dynamic_linear_util[repeat] = linear_dynamic_sample.cpu_utilization_percent;
+        dynamic_part2_util[repeat] = part2_dynamic_sample.cpu_utilization_percent;
+        fixed_linear_user_ns[repeat] =
+            linear_fixed_sample.user_cpu_seconds * 1000000000.0 / (double)STAGE27_MEASURED_OPS;
+        fixed_linear_system_ns[repeat] =
+            linear_fixed_sample.system_cpu_seconds * 1000000000.0 / (double)STAGE27_MEASURED_OPS;
+        fixed_part1_user_ns[repeat] =
+            part1_fixed_sample.user_cpu_seconds * 1000000000.0 / (double)STAGE27_MEASURED_OPS;
+        fixed_part1_system_ns[repeat] =
+            part1_fixed_sample.system_cpu_seconds * 1000000000.0 / (double)STAGE27_MEASURED_OPS;
+        dynamic_linear_user_ns[repeat] =
+            linear_dynamic_sample.user_cpu_seconds * 1000000000.0 / (double)STAGE27_MEASURED_OPS;
+        dynamic_linear_system_ns[repeat] =
+            linear_dynamic_sample.system_cpu_seconds * 1000000000.0 / (double)STAGE27_MEASURED_OPS;
+        dynamic_part2_user_ns[repeat] =
+            part2_dynamic_sample.user_cpu_seconds * 1000000000.0 / (double)STAGE27_MEASURED_OPS;
+        dynamic_part2_system_ns[repeat] =
+            part2_dynamic_sample.system_cpu_seconds * 1000000000.0 / (double)STAGE27_MEASURED_OPS;
+
+        fixed_linear_vcsw += linear_fixed_sample.voluntary_context_switches;
+        fixed_linear_ivcsw += linear_fixed_sample.involuntary_context_switches;
+        fixed_part1_vcsw += part1_fixed_sample.voluntary_context_switches;
+        fixed_part1_ivcsw += part1_fixed_sample.involuntary_context_switches;
+        dynamic_linear_vcsw += linear_dynamic_sample.voluntary_context_switches;
+        dynamic_linear_ivcsw += linear_dynamic_sample.involuntary_context_switches;
+        dynamic_part2_vcsw += part2_dynamic_sample.voluntary_context_switches;
+        dynamic_part2_ivcsw += part2_dynamic_sample.involuntary_context_switches;
+
+        printf("  repeat %zu: fixed-linear cpu=%.2f ns/op util=%.1f%%  "
+               "fixed-Part1 cpu=%.2f ns/op util=%.1f%%\n",
+               repeat + 1U,
+               linear_fixed_sample.cpu_ns_per_op,
+               linear_fixed_sample.cpu_utilization_percent,
+               part1_fixed_sample.cpu_ns_per_op,
+               part1_fixed_sample.cpu_utilization_percent);
+        printf("            dynamic-linear cpu=%.2f ns/op util=%.1f%%  "
+               "dynamic-Part2 cpu=%.2f ns/op util=%.1f%%\n",
+               linear_dynamic_sample.cpu_ns_per_op,
+               linear_dynamic_sample.cpu_utilization_percent,
+               part2_dynamic_sample.cpu_ns_per_op,
+               part2_dynamic_sample.cpu_utilization_percent);
+    }
+
+    printf("\n  CPU behavior medians at capacity %u / keyspace %llu\n",
+           STAGE27_CAPACITY,
+           (unsigned long long)STAGE27_KEY_SPACE);
+    printf("  fixed-linear:   %.2f CPU ns/op, %.2f user, %.2f system, %.1f%% CPU/wall\n",
+           stage27_median_double(fixed_linear_cpu, STAGE27_REPEATS),
+           stage27_median_double(fixed_linear_user_ns, STAGE27_REPEATS),
+           stage27_median_double(fixed_linear_system_ns, STAGE27_REPEATS),
+           stage27_median_double(fixed_linear_util, STAGE27_REPEATS));
+    printf("  fixed-Part1:    %.2f CPU ns/op, %.2f user, %.2f system, %.1f%% CPU/wall\n",
+           stage27_median_double(fixed_part1_cpu, STAGE27_REPEATS),
+           stage27_median_double(fixed_part1_user_ns, STAGE27_REPEATS),
+           stage27_median_double(fixed_part1_system_ns, STAGE27_REPEATS),
+           stage27_median_double(fixed_part1_util, STAGE27_REPEATS));
+    printf("  dynamic-linear: %.2f CPU ns/op, %.2f user, %.2f system, %.1f%% CPU/wall\n",
+           stage27_median_double(dynamic_linear_cpu, STAGE27_REPEATS),
+           stage27_median_double(dynamic_linear_user_ns, STAGE27_REPEATS),
+           stage27_median_double(dynamic_linear_system_ns, STAGE27_REPEATS),
+           stage27_median_double(dynamic_linear_util, STAGE27_REPEATS));
+    printf("  dynamic-Part2:  %.2f CPU ns/op, %.2f user, %.2f system, %.1f%% CPU/wall\n",
+           stage27_median_double(dynamic_part2_cpu, STAGE27_REPEATS),
+           stage27_median_double(dynamic_part2_user_ns, STAGE27_REPEATS),
+           stage27_median_double(dynamic_part2_system_ns, STAGE27_REPEATS),
+           stage27_median_double(dynamic_part2_util, STAGE27_REPEATS));
+
+    printf("  context switches across %u repeats:\n", STAGE27_REPEATS);
+    printf("    fixed-linear   voluntary=%ld involuntary=%ld\n",
+           fixed_linear_vcsw, fixed_linear_ivcsw);
+    printf("    fixed-Part1    voluntary=%ld involuntary=%ld\n",
+           fixed_part1_vcsw, fixed_part1_ivcsw);
+    printf("    dynamic-linear voluntary=%ld involuntary=%ld\n",
+           dynamic_linear_vcsw, dynamic_linear_ivcsw);
+    printf("    dynamic-Part2  voluntary=%ld involuntary=%ld\n",
+           dynamic_part2_vcsw, dynamic_part2_ivcsw);
+
+    free(warmup_fixed);
+    free(measured_fixed);
+    free(warmup_dynamic);
+    free(measured_dynamic);
+
+    return passed;
+#else
+    printf("\n[Stage 27] CPU behavior timing skipped in non-optimized build\n");
+    printf("[INFO] Build with RANKED_CACHE_OPTIMIZED_BUILD=1 and -O3 -DNDEBUG.\n");
+    return 1;
+#endif
+}
+
+int stage27_run_cpu_behavior_tests(void)
+{
+    int passed = 1;
+
+    printf("\n=== Stage 27: measure CPU behavior ===\n");
+
+    passed &= stage27_test_cpu_measurement_helpers();
+    passed &= stage27_run_cpu_behavior_benchmark();
+
+    printf("\nStage 27 findings:\n");
+    printf("  process CPU time is measured independently from wall-clock time.\n");
+    printf("  getrusage splits CPU time into user/system behavior and context switches.\n");
+    printf("  fixed and dynamic paths use the same deterministic correctness guards as prior benchmarks.\n");
+    printf("  warmup remains outside reported CPU-behavior measurements.\n");
+    printf("  CPU/wall utilization and context switches are observational, not PASS thresholds.\n");
+    printf("  no hardware performance counters or new cache optimization are introduced.\n");
+    printf("Stage 27 boundary: process-level CPU behavior only; hardware counters come later.\n");
+    printf("Stage 27 CPU-behavior validation: %s\n",
+           passed ? "PASS" : "FAIL");
+
+    return passed;
+}
+
 int main(void)
 {
     Cache cache;
@@ -7778,7 +8390,12 @@ int main(void)
 
     all_passed &= stage26_run_scaling_benchmark_tests();
 
-    printf("\nStage 26 validation: %s\n",
+    printf("\nStage 26 regression validation: %s\n",
+           all_passed ? "PASS" : "FAIL");
+
+    all_passed &= stage27_run_cpu_behavior_tests();
+
+    printf("\nStage 27 validation: %s\n",
            all_passed ? "PASS" : "FAIL");
 
     return all_passed ? 0 : 1;

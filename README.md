@@ -7916,6 +7916,388 @@ It adds scaling measurements only for the already implemented cache designs.
 
 ---
 
+## Stage 27 — Measure CPU Behavior
+
+**Status: COMPLETE AND VALIDATED**
+
+Stage 24 measured fixed-rank wall-clock latency.
+
+Stage 25 measured dynamic-rank wall-clock latency.
+
+Stage 26 measured how both comparisons scale with cache capacity.
+
+Stage 27 adds **process-level CPU behavior measurement** around the existing benchmark paths.
+
+It does not change cache algorithms.
+
+It does not add hardware performance counters.
+
+The Stage 27 measurements use:
+
+```text
+CLOCK_MONOTONIC
+    wall-clock elapsed time
+
+CLOCK_PROCESS_CPUTIME_ID
+    CPU time consumed by the process
+
+getrusage(RUSAGE_SELF)
+    user CPU time
+    system CPU time
+    voluntary context switches
+    involuntary context switches
+```
+
+The purpose is to distinguish:
+
+```text
+elapsed wall time
+```
+
+from:
+
+```text
+actual CPU time consumed by the process
+```
+
+and to show whether benchmark time is primarily:
+
+```text
+user-space execution
+system/kernel work
+scheduler interruption
+```
+
+---
+
+## Stage 27 Measurement Structure
+
+Stage 27 adds:
+
+```c
+typedef struct {
+    double wall_seconds;
+    double process_cpu_seconds;
+    double user_cpu_seconds;
+    double system_cpu_seconds;
+    double wall_ns_per_op;
+    double cpu_ns_per_op;
+    double cpu_utilization_percent;
+    long voluntary_context_switches;
+    long involuntary_context_switches;
+    uint64_t checksum;
+} Stage27CpuSample;
+```
+
+`cpu_utilization_percent` is calculated as:
+
+```text
+process CPU seconds
+------------------- * 100
+wall seconds
+```
+
+For this single-threaded benchmark, values close to 100% indicate that the process spent most of its elapsed time actively executing on a CPU rather than blocked or descheduled.
+
+This is an observation only.
+
+No CPU-utilization threshold is used for PASS/FAIL.
+
+---
+
+## Stage 27 Benchmark Scope
+
+Stage 27 measures the same four implementations already validated by earlier benchmark stages:
+
+```text
+fixed rank:
+    linear reference
+    integrated Part1Cache
+
+dynamic rank:
+    linear dynamic reference
+    indexed Part 2
+```
+
+Configuration:
+
+```text
+capacity        = 100
+key space       = 200
+warmup ops      = 50,000
+measured ops    = 1,000,000
+repetitions     = 3
+```
+
+Deterministic workload seeds:
+
+```text
+fixed:
+0x7f4a7c159e3779b9
+
+dynamic:
+0x94d049bb133111eb
+```
+
+Warmup remains outside the reported CPU-behavior measurements.
+
+Execution order alternates between repetitions, preserving the anti-order-bias discipline introduced in Stages 24–26.
+
+---
+
+## Stage 27 Correctness Guards
+
+CPU measurements are accepted only after the existing semantics still match.
+
+### Fixed rank
+
+Each measured repetition requires:
+
+```text
+linear checksum == Part1 checksum
+final logical cache state equal
+linear cache validator passes
+Part1 integrated validator passes
+```
+
+### Dynamic rank
+
+Each measured repetition requires:
+
+```text
+linear dynamic checksum == Part2 checksum
+complete CacheStats equality
+final logical cache state equal
+linear cache validator passes
+Part2 integrated validator passes
+```
+
+The CPU measurements therefore do not replace the earlier correctness checks.
+
+They are added after them.
+
+---
+
+## Stage 27 CPU Measurement Helpers
+
+Stage 27 adds:
+
+```c
+stage27_cpu_sample_begin()
+stage27_cpu_sample_end()
+stage27_timeval_seconds()
+```
+
+The measurement interval captures:
+
+```text
+wall clock start/end
+process CPU clock start/end
+getrusage start/end
+```
+
+and derives:
+
+```text
+wall ns/op
+CPU ns/op
+user CPU ns/op
+system CPU ns/op
+CPU/wall utilization
+voluntary context-switch delta
+involuntary context-switch delta
+```
+
+A standalone helper test verifies that the measurement layer records positive wall and CPU time before the cache benchmark is run.
+
+---
+
+## Stage 27 Builds
+
+### Ordinary warning-clean compatibility build
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -Werror \
+    -std=c11 \
+    ranked_cache.c \
+    -o ranked_cache27
+
+./ranked_cache27
+```
+
+The CPU benchmark itself is skipped because this is not the optimized benchmark configuration.
+
+### Correctness build
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -Werror \
+    -std=c11 \
+    -O0 \
+    -g3 \
+    -fno-omit-frame-pointer \
+    -DRANKED_CACHE_CORRECTNESS_BUILD=1 \
+    -fsanitize=address,undefined \
+    ranked_cache.c \
+    -o ranked_cache27_correctness
+```
+
+Run:
+
+```bash
+ASAN_OPTIONS=detect_leaks=1 \
+UBSAN_OPTIONS=halt_on_error=1 \
+./ranked_cache27_correctness
+```
+
+The CPU measurement helper runs here, while the optimized CPU benchmark is intentionally skipped.
+
+### Optimized CPU-behavior build
+
+```bash
+gcc \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -Werror \
+    -std=c11 \
+    -O3 \
+    -DNDEBUG \
+    -DRANKED_CACHE_OPTIMIZED_BUILD=1 \
+    ranked_cache.c \
+    -o ranked_cache27_optimized
+```
+
+Run:
+
+```bash
+./ranked_cache27_optimized
+```
+
+---
+
+## Stage 27 Observed Result in the Validation Sandbox
+
+One optimized validation run produced the following median CPU behavior at:
+
+```text
+capacity = 100
+keyspace = 200
+```
+
+```text
+fixed-linear:
+    127.42 CPU ns/op
+    127.41 user ns/op
+      0.00 system ns/op
+     99.9% CPU/wall
+
+fixed-Part1:
+    311.75 CPU ns/op
+    311.74 user ns/op
+      0.00 system ns/op
+     99.9% CPU/wall
+
+dynamic-linear:
+     47.67 CPU ns/op
+     47.65 user ns/op
+      0.02 system ns/op
+    100.0% CPU/wall
+
+dynamic-Part2:
+     13.65 CPU ns/op
+     13.65 user ns/op
+      0.00 system ns/op
+     99.9% CPU/wall
+```
+
+Across three measured repetitions, context-switch totals were:
+
+```text
+fixed-linear:
+    voluntary   = 0
+    involuntary = 5
+
+fixed-Part1:
+    voluntary   = 0
+    involuntary = 8
+
+dynamic-linear:
+    voluntary   = 0
+    involuntary = 2
+
+dynamic-Part2:
+    voluntary   = 0
+    involuntary = 2
+```
+
+### Interpretation
+
+On this validation host:
+
+```text
+CPU time ~= wall time
+```
+
+for all four benchmark paths.
+
+The measured work is therefore predominantly CPU-bound user-space execution rather than waiting on system calls or blocking I/O.
+
+System CPU time is negligible.
+
+Context-switch counts are also very small relative to:
+
+```text
+1,000,000 operations per repetition
+```
+
+The relative CPU cost follows the same broad behavior already seen in the wall-clock benchmarks:
+
+```text
+fixed rank:
+    linear reference consumes less CPU/op than Part1 at N=100
+
+dynamic rank:
+    indexed Part2 consumes substantially less CPU/op than linear dynamic
+```
+
+These values are environment-specific.
+
+The Node1 optimized run should be treated as the authoritative local CPU-behavior evidence.
+
+No particular CPU percentage or CPU-time ratio is a Stage 27 PASS requirement.
+
+---
+
+## Stage 27 Boundary
+
+Stage 27 deliberately does **not** add:
+
+- `perf stat`,
+- hardware cycle counters,
+- retired-instruction counts,
+- branch-miss counts,
+- cache-miss counts,
+- CPU affinity,
+- scheduler policy changes,
+- frequency locking,
+- `-march=native`,
+- LTO,
+- PGO,
+- multithreading,
+- new cache algorithms.
+
+It measures process-level CPU behavior only.
+
+---
+
 ## Build Environment
 
 Current target environment:
@@ -7927,7 +8309,7 @@ Current target environment:
 ### Build command
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -Werror -std=c11 -O3 -DNDEBUG -DRANKED_CACHE_OPTIMIZED_BUILD=1 ranked_cache.c -o ranked_cache26_optimized
+gcc -Wall -Wextra -Wpedantic -Werror -std=c11 -O3 -DNDEBUG -DRANKED_CACHE_OPTIMIZED_BUILD=1 ranked_cache.c -o ranked_cache27_optimized
 ```
 
 The warning flags are intentionally enabled from the first stage:
@@ -7943,22 +8325,22 @@ This helps catch implementation mistakes early as the program becomes more compl
 ## Run
 
 ```bash
-./ranked_cache26_optimized
+./ranked_cache27_optimized
 ```
 
 ### Expected result
 
-The active Stage 26 scaling benchmark suite must end with:
+The active Stage 27 CPU-behavior suite must end with:
 
 ```text
-Stage 26 validation: PASS
+Stage 27 validation: PASS
 ```
 
 The Stage 10 Part 1 path combines the hash table and min-heap while preserving the earlier linear cache as a regression/reference implementation.
 
 ### Validation result
 
-Stages 0 through 26 have been validated successfully. The Stage 22 correctness build still passes with assertions and ASan/UBSan, the Stage 23 optimized build still passes, Stage 24 and Stage 25 benchmarks remain regressions, and Stage 26 adds deterministic fixed/dynamic scaling measurements across capacities 10, 25, 50, 75, and 100.
+Stages 0 through 27 have been validated successfully. The Stage 22 correctness build still passes with assertions and ASan/UBSan, the Stage 23 optimized build still passes, Stage 24 and Stage 25 benchmarks remain regressions, and Stage 26 adds deterministic fixed/dynamic scaling measurements across capacities 10, 25, 50, 75, and 100.
 
 ---
 
@@ -8609,4 +8991,23 @@ CLOCK_MONOTONIC SCALING PASS
 WARMUP-OUTSIDE-MEASUREMENT PASS
 3-REPEAT MEDIAN TABLE PASS
 NO NEW OPTIMIZATION INTRODUCED
+
+
+Stage 27
+Measure CPU behavior
+COMPLETE
+ORDINARY -WERROR BUILD PASS
+CORRECTNESS BUILD REGRESSION PASS
+ASAN PASS
+UBSAN PASS
+OPTIMIZED BUILD REGRESSION PASS
+CPU MEASUREMENT HELPER PASS
+CLOCK_PROCESS_CPUTIME_ID PASS
+GETRUSAGE USER/SYSTEM PASS
+CONTEXT-SWITCH DELTA PASS
+FIXED CHECKSUM/STATE GUARDS PASS
+DYNAMIC CHECKSUM/CACHESTATS/STATE GUARDS PASS
+WARMUP-OUTSIDE-MEASUREMENT PASS
+3-REPEAT CPU-BEHAVIOR RUN PASS
+NO HARDWARE COUNTERS INTRODUCED
 ```
